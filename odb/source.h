@@ -274,6 +274,13 @@ struct odb_source *odb_source_new(struct object_database *odb,
 				  bool local);
 
 /*
+ * Look up the ODB storage format by name. Returns
+ * ODB_STORAGE_FORMAT_UNKNOWN if the name is not recognized.
+ */
+enum odb_storage_format odb_storage_format_by_name(const char *name);
+const char *odb_storage_format_to_name(enum odb_storage_format format);
+
+/*
  * Initialize the source for the given object database located at `path`.
  * `local` indicates whether or not the source is the local and thus primary
  * object source of the object database.

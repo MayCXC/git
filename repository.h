@@ -159,6 +159,9 @@ struct repository {
 
 	/* Repository's reference storage format, as serialized on disk. */
 	enum ref_storage_format ref_storage_format;
+
+	/* Repository's object storage format, as serialized on disk. */
+	enum odb_storage_format odb_storage_format;
 	/*
 	 * Reference storage information as needed for the backend. This contains
 	 * only the payload from the reference URI without the schema.

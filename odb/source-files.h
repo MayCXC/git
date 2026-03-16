@@ -21,6 +21,13 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 					      const char *path,
 					      bool local);
 
+/* Wrapper returning the base odb_source pointer, for use in dispatch tables. */
+static inline struct odb_source *odb_source_files_new_base(
+	struct object_database *odb, const char *path, bool local)
+{
+	return &odb_source_files_new(odb, path, local)->base;
+}
+
 /*
  * Cast the given object database source to the files backend. This will cause
  * a BUG in case the source doesn't use this backend.
