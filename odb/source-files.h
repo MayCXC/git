@@ -1,5 +1,5 @@
-#ifndef ODB_SOURCE_FILES_H
-#define ODB_SOURCE_FILES_H
+#ifndef ODB_STORAGE_FORMAT_FILES_H
+#define ODB_STORAGE_FORMAT_FILES_H
 
 #include "odb/source.h"
 
@@ -27,7 +27,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
  */
 static inline struct odb_source_files *odb_source_files_downcast(struct odb_source *source)
 {
-	if (source->type != ODB_SOURCE_FILES)
+	if (source->type != ODB_STORAGE_FORMAT_FILES)
 		BUG("trying to downcast source of type '%d' to files", source->type);
 	return container_of(source, struct odb_source_files, base);
 }
@@ -41,7 +41,7 @@ static inline struct odb_source_files *odb_source_files_downcast(struct odb_sour
  */
 static inline struct odb_source_files *odb_source_files_try(struct odb_source *source)
 {
-	if (source->type != ODB_SOURCE_FILES)
+	if (source->type != ODB_STORAGE_FORMAT_FILES)
 		return NULL;
 	return container_of(source, struct odb_source_files, base);
 }

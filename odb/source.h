@@ -2,17 +2,7 @@
 #define ODB_SOURCE_H
 
 #include "object.h"
-
-enum odb_source_type {
-	/*
-	 * The "unknown" type, which should never be in use. This type mostly
-	 * exists to catch cases where the type field remains zeroed out.
-	 */
-	ODB_SOURCE_UNKNOWN,
-
-	/* The "files" backend that uses loose objects and packfiles. */
-	ODB_SOURCE_FILES,
-};
+#include "repository.h"
 
 /* Flags that can be passed to `odb_read_object_info_extended()`. */
 enum object_info_flags {
@@ -88,7 +78,7 @@ struct odb_source {
 	struct object_database *odb;
 
 	/* The type used by this source. */
-	enum odb_source_type type;
+	enum odb_storage_format type;
 
 	/*
 	 * Figure out whether this is the local source of the owning
@@ -293,7 +283,7 @@ struct odb_source *odb_source_new(struct object_database *odb,
  */
 void odb_source_init(struct odb_source *source,
 		     struct object_database *odb,
-		     enum odb_source_type type,
+		     enum odb_storage_format type,
 		     const char *path,
 		     bool local);
 

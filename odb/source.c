@@ -13,7 +13,7 @@ struct odb_source *odb_source_new(struct object_database *odb,
 
 void odb_source_init(struct odb_source *source,
 		     struct object_database *odb,
-		     enum odb_source_type type,
+		     enum odb_storage_format type,
 		     const char *path,
 		     bool local)
 {

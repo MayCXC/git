@@ -15,6 +15,11 @@ struct submodule_cache;
 struct promisor_remote_config;
 struct remote_state;
 
+enum odb_storage_format {
+	ODB_STORAGE_FORMAT_UNKNOWN,
+	ODB_STORAGE_FORMAT_FILES,
+};
+
 enum ref_storage_format {
 	REF_STORAGE_FORMAT_UNKNOWN,
 	REF_STORAGE_FORMAT_FILES,
