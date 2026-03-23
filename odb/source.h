@@ -2,17 +2,7 @@
 #define ODB_SOURCE_H
 
 #include "object.h"
-
-enum odb_source_type {
-	/*
-	 * The "unknown" type, which should never be in use. This type mostly
-	 * exists to catch cases where the type field remains zeroed out.
-	 */
-	ODB_SOURCE_UNKNOWN,
-
-	/* The "files" backend that uses loose objects and packfiles. */
-	ODB_SOURCE_FILES,
-};
+#include "odb/source-type.h"
 
 /* Flags that can be passed to `odb_read_object_info_extended()`. */
 enum object_info_flags {
@@ -323,11 +313,20 @@ struct odb_source {
 /*
  * Allocate and initialize a new source for the given object database located
  * at `path`. `local` indicates whether or not the source is the local and thus
- * primary object source of the object database.
+ * primary object source of the object database. The source type is determined
+ * by the repository's odb_source_type configuration.
  */
 struct odb_source *odb_source_new(struct object_database *odb,
 				  const char *path,
 				  bool local);
+
+/*
+ * Allocate and initialize a new source of the specified type.
+ */
+struct odb_source *odb_source_new_for_type(struct object_database *odb,
+					   enum odb_source_type type,
+					   const char *path,
+					   bool local);
 
 /*
  * Initialize the source for the given object database located at `path`.
@@ -509,18 +508,6 @@ static inline int odb_source_begin_transaction(struct odb_source *source,
 					       struct odb_transaction **out)
 {
 	return source->begin_transaction(source, out);
-}
-
-/*
- * Ingest a completed packfile into the source's storage. Small packs (where
- * `nr_objects` is at or below the unpack limit) or packs without index-pack
- * args are loosened into individual objects. Larger packs are indexed and
- * stored as packfiles.
- *
- * Returns 0 on success, a negative error code otherwise.
- */
-{
-		return 0;
 }
 
 static inline int odb_source_write_packfile(struct odb_source *source,

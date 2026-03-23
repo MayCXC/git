@@ -10,6 +10,7 @@
 #include "hex.h"
 #include "object-file.h"
 #include "object-name.h"
+#include "odb/source.h"
 #include "refs.h"
 #include "replace-object.h"
 #include "repository.h"
@@ -703,6 +704,17 @@ static enum extension_result handle_extension(const char *var,
 			return error(_("invalid value for '%s': '%s'"),
 				     "extensions.refstorage", value);
 		data->ref_storage_format = format;
+		return EXTENSION_OK;
+	} else if (!strcmp(ext, "objectstorage")) {
+		if (!value)
+			return config_error_nonbool(var);
+		if (!strcmp(value, "files"))
+			data->odb_source_type = ODB_SOURCE_FILES;
+		else if (starts_with(value, "helper://"))
+			data->odb_source_type = ODB_SOURCE_HELPER;
+		else
+			return error(_("invalid value for '%s': '%s'"),
+				     "extensions.objectStorage", value);
 		return EXTENSION_OK;
 	} else if (!strcmp(ext, "relativeworktrees")) {
 		data->relative_worktrees = git_config_bool(var, value);
@@ -1995,6 +2007,8 @@ const char *setup_git_directory_gently(int *nongit_ok)
 			repo_set_ref_storage_format(the_repository,
 						    repo_fmt.ref_storage_format,
 						    repo_fmt.ref_storage_payload);
+			the_repository->odb_source_type =
+				repo_fmt.odb_source_type;
 			the_repository->repository_format_worktree_config =
 				repo_fmt.worktree_config;
 			the_repository->repository_format_relative_worktrees =

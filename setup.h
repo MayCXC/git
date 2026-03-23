@@ -3,6 +3,7 @@
 
 #include "refs.h"
 #include "string-list.h"
+#include "odb/source-type.h"
 
 int is_inside_git_dir(void);
 int is_inside_work_tree(void);
@@ -175,6 +176,7 @@ struct repository_format {
 	int compat_hash_algo;
 	enum ref_storage_format ref_storage_format;
 	char *ref_storage_payload;
+	enum odb_source_type odb_source_type;
 	int sparse_index;
 	char *work_tree;
 	struct string_list unknown_extensions;

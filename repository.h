@@ -4,6 +4,7 @@
 #include "strmap.h"
 #include "repo-settings.h"
 #include "environment.h"
+#include "odb/source-type.h"
 
 struct config_set;
 struct git_hash_algo;
@@ -154,6 +155,14 @@ struct repository {
 
 	/* Repository's reference storage format, as serialized on disk. */
 	enum ref_storage_format ref_storage_format;
+
+	/*
+	 * Repository's ODB source type, as configured via
+	 * extensions.objectStorage. When set to ODB_SOURCE_HELPER, the
+	 * object database uses an external helper process instead of the
+	 * files backend.
+	 */
+	enum odb_source_type odb_source_type;
 	/*
 	 * Reference storage information as needed for the backend. This contains
 	 * only the payload from the reference URI without the schema.

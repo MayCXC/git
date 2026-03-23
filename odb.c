@@ -946,9 +946,6 @@ int odb_write_object_stream(struct object_database *odb,
 	return odb_source_write_object_stream(odb->sources, stream, len, oid);
 }
 
-{
-}
-
 int odb_write_packfile(struct object_database *odb,
 		       int pack_fd, unsigned int nr_objects,
 		       struct strvec *index_pack_args)
