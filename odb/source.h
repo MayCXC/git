@@ -272,6 +272,52 @@ struct odb_source {
 	 */
 	int (*write_alternate)(struct odb_source *source,
 			       const char *alternate);
+
+	/*
+	 * Return non-zero if this backend requires incoming packs to be
+	 * unpacked into individual objects rather than stored as pack
+	 * files. The files backend leaves this NULL (packs are native
+	 * storage). Non-files backends return 1 since index-pack writes
+	 * directly to the filesystem, bypassing the ODB source chain.
+	 */
+
+	/*
+	 * This callback is expected to ingest a completed packfile into the
+	 * backend's storage. The pack data is read from `pack_fd`.
+	 *
+	 * When `nr_objects` is less than or equal to the configured unpack
+	 * limit, or when `index_pack_args` is NULL, the pack should be
+	 * loosened into individual objects. Otherwise the pack should be
+	 * indexed and stored as a packfile.
+	 *
+	 * The callback is expected to return 0 on success, a negative error
+	 * code otherwise.
+	 */
+	int (*write_packfile)(struct odb_source *source,
+			      int pack_fd, unsigned int nr_objects,
+			      struct strvec *index_pack_args);
+
+	/*
+	 * This callback is expected to iterate over all objects whose
+	 * object ID starts with the given prefix. This is used for
+	 * object name disambiguation.
+	 *
+	 * The callback is expected to return 0 on success, a negative
+	 * error code in case iteration has failed, or a non-zero value
+	 * returned from the callback.
+	 */
+	int (*for_each_unique_abbrev)(struct odb_source *source,
+				      const struct object_id *oid_prefix,
+				      unsigned int prefix_len,
+				      odb_for_each_object_cb cb,
+				      void *cb_data);
+
+	/*
+	 * This callback is expected to return an approximate count of
+	 * objects stored in this source. The count does not need to be
+	 * exact and may ignore loose objects for performance.
+	 */
+	unsigned long (*approximate_object_count)(struct odb_source *source);
 };
 
 /*
@@ -463,6 +509,54 @@ static inline int odb_source_begin_transaction(struct odb_source *source,
 					       struct odb_transaction **out)
 {
 	return source->begin_transaction(source, out);
+}
+
+/*
+ * Ingest a completed packfile into the source's storage. Small packs (where
+ * `nr_objects` is at or below the unpack limit) or packs without index-pack
+ * args are loosened into individual objects. Larger packs are indexed and
+ * stored as packfiles.
+ *
+ * Returns 0 on success, a negative error code otherwise.
+ */
+{
+		return 0;
+}
+
+static inline int odb_source_write_packfile(struct odb_source *source,
+					    int pack_fd,
+					    unsigned int nr_objects,
+					    struct strvec *index_pack_args)
+{
+	return source->write_packfile(source, pack_fd, nr_objects,
+				      index_pack_args);
+}
+
+/*
+ * Iterate over all objects in the source whose object ID starts with the
+ * given prefix. This is used for object name disambiguation.
+ *
+ * Returns 0 on success, a negative error code in case iteration has failed,
+ * or a non-zero value returned from the callback.
+ */
+static inline int odb_source_for_each_unique_abbrev(struct odb_source *source,
+						    const struct object_id *oid_prefix,
+						    unsigned int prefix_len,
+						    odb_for_each_object_cb cb,
+						    void *cb_data)
+{
+	return source->for_each_unique_abbrev(source, oid_prefix, prefix_len,
+					      cb, cb_data);
+}
+
+/*
+ * Return an approximate count of objects stored in the given source. The
+ * count does not need to be exact and may ignore loose objects for performance.
+ */
+static inline unsigned long odb_source_approximate_object_count(
+	struct odb_source *source)
+{
+	return source->approximate_object_count(source);
 }
 
 #endif

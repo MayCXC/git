@@ -505,4 +505,39 @@ void parse_alternates(const char *string,
 		      const char *relative_base,
 		      struct strvec *out);
 
+/*
+ * Returns non-zero if the primary source requires incoming packs to be
+ * unpacked into individual objects rather than stored as pack files.
+ */
+
+/*
+ * Ingest a completed packfile into the primary source of the object database.
+ * Small packs are loosened into individual objects, large packs are indexed
+ * and stored as packfiles.
+ *
+ * Returns 0 on success, a negative error code otherwise.
+ */
+int odb_write_packfile(struct object_database *odb,
+		       int pack_fd, unsigned int nr_objects,
+		       struct strvec *index_pack_args);
+
+/*
+ * Iterate over all objects across all sources whose object ID starts with
+ * the given prefix. This is used for object name disambiguation.
+ *
+ * Returns 0 on success, a negative error code in case iteration has failed,
+ * or a non-zero value returned from the callback.
+ */
+int odb_for_each_unique_abbrev(struct object_database *odb,
+			       const struct object_id *oid_prefix,
+			       unsigned int prefix_len,
+			       odb_for_each_object_cb cb,
+			       void *cb_data);
+
+/*
+ * Return an approximate count of objects across all sources in the object
+ * database. The count does not need to be exact.
+ */
+unsigned long odb_approximate_object_count(struct object_database *odb);
+
 #endif /* ODB_H */
