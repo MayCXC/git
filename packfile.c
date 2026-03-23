@@ -2263,18 +2263,7 @@ struct packed_git **packfile_store_get_kept_pack_cache(struct packfile_store *st
 
 int has_object_pack(struct repository *r, const struct object_id *oid)
 {
-	struct odb_source *source;
-	struct pack_entry e;
-
-	odb_prepare_alternates(r->objects);
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		int ret = find_pack_entry(files->packed, oid, &e);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return odb_has_object(r->objects, oid, 0);
 }
 
 int has_object_kept_pack(struct repository *r, const struct object_id *oid,
