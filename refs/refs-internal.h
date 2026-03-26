@@ -40,6 +40,13 @@ struct ref_transaction;
 #define REF_LOG_ONLY (1 << 7)
 
 /*
+ * Set on a synthetic ref update created by split_symref_update() when
+ * the original update was for HEAD. Prevents split_head_update() from
+ * adding a duplicate HEAD reflog entry when the referent is processed.
+ */
+#define REF_UPDATE_VIA_HEAD (1 << 8)
+
+/*
  * Return the length of time to retry acquiring a loose reference lock
  * before giving up, in milliseconds:
  */
@@ -172,6 +179,34 @@ struct ref_update *ref_transaction_add_update(
 		const char *new_target, const char *old_target,
 		const char *committer_info,
 		const char *msg);
+
+/*
+ * Split a symref update into two: the original becomes REF_LOG_ONLY
+ * (records the symref change in the reflog) and a new update for the
+ * referent branch is added to the transaction. Returns 0 on success,
+ * negative on conflict (referent already in transaction).
+ *
+ * This is generic transaction logic shared by backends that do not
+ * intertwine symref splitting with locking (reftable, helper). The
+ * files backend has its own split_symref_update() intertwined with
+ * lock_ref_for_update().
+ */
+int refs_transaction_split_symref_update(struct ref_update *update,
+					 const char *referent,
+					 struct ref_transaction *transaction,
+					 struct strbuf *err);
+
+/*
+ * If HEAD is a symref pointing at head_ref, and this update modifies
+ * head_ref, add a log-only update for HEAD so that its reflog records
+ * the change. Returns 0 on success, negative on conflict.
+ *
+ * Same sharing rationale as refs_transaction_split_symref_update().
+ */
+int refs_transaction_split_head_update(struct ref_update *update,
+				       struct ref_transaction *transaction,
+				       const char *head_ref,
+				       struct strbuf *err);
 
 /*
  * Transaction states.

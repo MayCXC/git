@@ -985,6 +985,73 @@ enum ref_worktree_type parse_worktree_ref(const char *maybe_worktree_ref,
 	return REF_WORKTREE_SHARED;
 }
 
+/*
+ * Generic symref splitting for backends that do not intertwine splitting
+ * with locking. The files backend has its own version in lock_ref_for_update()
+ * because it needs to hold locks while splitting. Reftable and helper
+ * backends can use these shared implementations.
+ */
+int refs_transaction_split_symref_update(struct ref_update *update,
+					 const char *referent,
+					 struct ref_transaction *transaction,
+					 struct strbuf *err)
+{
+	struct ref_update *new_update;
+	unsigned int new_flags;
+
+	if (string_list_has_string(&transaction->refnames, referent)) {
+		strbuf_addf(err,
+			    _("multiple updates for '%s' (including one "
+			      "via symref '%s') are not allowed"),
+			    referent, update->refname);
+		return -1;
+	}
+
+	new_flags = update->flags;
+	if (!strcmp(update->refname, "HEAD"))
+		new_flags |= REF_UPDATE_VIA_HEAD;
+
+	new_update = ref_transaction_add_update(
+			transaction, referent, new_flags,
+			update->new_target ? NULL : &update->new_oid,
+			update->old_target ? NULL : &update->old_oid,
+			update->new_target, update->old_target,
+			NULL, update->msg);
+	new_update->parent_update = update;
+
+	update->flags |= REF_LOG_ONLY | REF_NO_DEREF;
+	return 0;
+}
+
+int refs_transaction_split_head_update(struct ref_update *update,
+				       struct ref_transaction *transaction,
+				       const char *head_ref,
+				       struct strbuf *err)
+{
+	if ((update->flags & REF_LOG_ONLY) ||
+	    (update->flags & REF_UPDATE_VIA_HEAD))
+		return 0;
+
+	if (strcmp(update->refname, head_ref))
+		return 0;
+
+	if (string_list_has_string(&transaction->refnames, "HEAD")) {
+		strbuf_addf(err,
+			    _("multiple updates for 'HEAD' (including one "
+			      "via its referent '%s') are not allowed"),
+			    update->refname);
+		return -1;
+	}
+
+	ref_transaction_add_update(
+		transaction, "HEAD",
+		update->flags | REF_LOG_ONLY | REF_NO_DEREF,
+		&update->new_oid, &update->old_oid,
+		NULL, NULL, NULL, update->msg);
+
+	return 0;
+}
+
 long get_files_ref_lock_timeout_ms(void)
 {
 	static int configured = 0;

@@ -56,12 +56,6 @@
 #define REF_NEEDS_COMMIT (1 << 6)
 
 /*
- * Used as a flag in ref_update::flags when the ref_update was via an
- * update to HEAD.
- */
-#define REF_UPDATE_VIA_HEAD (1 << 8)
-
-/*
  * Used as a flag in ref_update::flags when a reference has been
  * deleted and the ref's parent directories may need cleanup.
  */

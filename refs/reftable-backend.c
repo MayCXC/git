@@ -30,12 +30,6 @@
 #include "../write-or-die.h"
 #include "refs-internal.h"
 
-/*
- * Used as a flag in ref_update::flags when the ref_update was via an
- * update to HEAD.
- */
-#define REF_UPDATE_VIA_HEAD (1 << 8)
-
 struct reftable_backend {
 	struct reftable_stack *stack;
 	struct reftable_iterator it;
@@ -1112,28 +1106,10 @@ static enum ref_transaction_error prepare_single_update(struct reftable_ref_stor
 	 * updated accordingly.
 	 */
 	if (head_type == REF_ISSYMREF &&
-	    !(u->flags & REF_LOG_ONLY) &&
-	    !(u->flags & REF_UPDATE_VIA_HEAD) &&
 	    !strcmp(rewritten_ref, head_referent->buf)) {
-		/*
-		 * First make sure that HEAD is not already in the
-		 * transaction. This check is O(lg N) in the transaction
-		 * size, but it happens at most once per transaction.
-		 */
-		if (string_list_has_string(&transaction->refnames, "HEAD")) {
-			/* An entry already existed */
-			strbuf_addf(err,
-				    _("multiple updates for 'HEAD' (including one "
-				      "via its referent '%s') are not allowed"),
-				    u->refname);
+		if (refs_transaction_split_head_update(u, transaction,
+						       head_referent->buf, err))
 			return REF_TRANSACTION_ERROR_NAME_CONFLICT;
-		}
-
-		ref_transaction_add_update(
-			transaction, "HEAD",
-			u->flags | REF_LOG_ONLY | REF_NO_DEREF,
-			&u->new_oid, &u->old_oid, NULL, NULL, NULL,
-			u->msg);
 	}
 
 	ret = reftable_backend_read_ref(be, rewritten_ref,
@@ -1211,9 +1187,10 @@ static enum ref_transaction_error prepare_single_update(struct reftable_ref_stor
 			 * If we are updating a symref (eg. HEAD), we should also
 			 * update the branch that the symref points to.
 			 *
-			 * This is generic functionality, and would be better
-			 * done in refs.c, but the current implementation is
-			 * intertwined with the locking in files-backend.c.
+			 * The generic refs_transaction_split_symref_update()
+			 * handles the common case. This inline version remains
+			 * because it is intertwined with reftable stack locking,
+			 * REF_NO_DEREF handling, and committer_info propagation.
 			 */
 			new_update = ref_transaction_add_update(
 				transaction, referent->buf, new_flags,
