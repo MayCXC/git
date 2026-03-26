@@ -1185,7 +1185,7 @@ int cmd_clone(int argc,
 	 * their on-disk data structures.
 	 */
 	init_db(git_dir, real_git_dir, option_template, GIT_HASH_UNKNOWN,
-		ref_storage_format, NULL,
+		ref_storage_format, ODB_SOURCE_UNKNOWN, NULL, NULL,
 		do_not_override_repo_unix_permissions, INIT_DB_QUIET | INIT_DB_SKIP_REFDB);
 
 	if (real_git_dir) {

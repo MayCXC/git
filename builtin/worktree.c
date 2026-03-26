@@ -3,6 +3,7 @@
 
 #include "builtin.h"
 #include "abspath.h"
+#include "helper.h"
 #include "advice.h"
 #include "checkout.h"
 #include "config.h"
@@ -964,6 +965,14 @@ static int add(int ac, const char **av, const char *prefix,
 			strvec_push(&cp.args, opt_track);
 		if (run_command(&cp))
 			return -1;
+		/*
+		 * For helper backends, the subprocess created the branch
+		 * via its own helper process. Send refresh to the parent's
+		 * helper so it sees the new ref. For files backends this
+		 * is a no-op since refs are read from disk directly.
+		 */
+		if (the_repository->local_helper)
+			helper_process_refresh(the_repository->local_helper);
 		branch = new_branch;
 	} else if (opt_track) {
 		die(_("--[no-]track can only be used if a new branch is created"));

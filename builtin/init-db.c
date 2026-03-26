@@ -57,7 +57,8 @@ static int shared_callback(const struct option *opt, const char *arg, int unset)
 static const char *const init_db_usage[] = {
 	N_("git init [-q | --quiet] [--bare] [--template=<template-directory>]\n"
 	   "         [--separate-git-dir <git-dir>] [--object-format=<format>]\n"
-	   "         [--ref-format=<format>]\n"
+	   "         [--ref-format=<format>] [--object-storage=<backend>]\n"
+	   "         [--local-helper=<name>]\n"
 	   "         [-b <branch-name> | --initial-branch=<branch-name>]\n"
 	   "         [--shared[=<permissions>]] [<directory>]"),
 	NULL
@@ -83,9 +84,12 @@ int cmd_init_db(int argc,
 	unsigned int flags = 0;
 	const char *object_format = NULL;
 	const char *ref_format = NULL;
+	const char *object_storage = NULL;
+	const char *local_helper = NULL;
 	const char *initial_branch = NULL;
 	int hash_algo = GIT_HASH_UNKNOWN;
 	enum ref_storage_format ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN;
+	enum odb_source_type odb_type = ODB_SOURCE_UNKNOWN;
 	int init_shared_repository = -1;
 	const struct option init_db_options[] = {
 		OPT_STRING(0, "template", &template_dir, N_("template-directory"),
@@ -110,6 +114,10 @@ int cmd_init_db(int argc,
 			   N_("specify the hash algorithm to use")),
 		OPT_STRING(0, "ref-format", &ref_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "object-storage", &object_storage, N_("backend"),
+			   N_("specify the object storage backend")),
+		OPT_STRING(0, "local-helper", &local_helper, N_("name"),
+			   N_("use a local helper for object and ref storage")),
 		OPT_END()
 	};
 	int ret;
@@ -176,6 +184,27 @@ int cmd_init_db(int argc,
 		ref_storage_format = ref_storage_format_by_name(ref_format);
 		if (ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
 			die(_("unknown ref storage format '%s'"), ref_format);
+	}
+
+	if (object_storage) {
+		if (!strcmp(object_storage, "files")) {
+			odb_type = ODB_SOURCE_FILES;
+		} else if (!strcmp(object_storage, "helper")) {
+			odb_type = ODB_SOURCE_HELPER;
+		} else {
+			die(_("unknown object storage backend '%s'"), object_storage);
+		}
+	}
+
+	/*
+	 * When --local-helper is given, default both backends to "helper"
+	 * unless explicitly overridden by --ref-format or --object-storage.
+	 */
+	if (local_helper) {
+		if (!ref_format)
+			ref_storage_format = REF_STORAGE_FORMAT_HELPER;
+		if (!object_storage)
+			odb_type = ODB_SOURCE_HELPER;
 	}
 
 	if (init_shared_repository != -1)
@@ -253,8 +282,8 @@ int cmd_init_db(int argc,
 
 	flags |= INIT_DB_EXIST_OK;
 	ret = init_db(git_dir, real_git_dir, template_dir, hash_algo,
-		      ref_storage_format, initial_branch,
-		      init_shared_repository, flags);
+		      ref_storage_format, odb_type, local_helper,
+		      initial_branch, init_shared_repository, flags);
 
 	free(template_dir_to_free);
 	free(real_git_dir_to_free);

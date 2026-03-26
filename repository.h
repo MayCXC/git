@@ -4,9 +4,11 @@
 #include "strmap.h"
 #include "repo-settings.h"
 #include "environment.h"
+#include "odb/source-type.h"
 
 struct config_set;
 struct git_hash_algo;
+struct helper_process;
 struct index_state;
 struct lock_file;
 struct pathspec;
@@ -19,6 +21,7 @@ enum ref_storage_format {
 	REF_STORAGE_FORMAT_UNKNOWN,
 	REF_STORAGE_FORMAT_FILES,
 	REF_STORAGE_FORMAT_REFTABLE,
+	REF_STORAGE_FORMAT_HELPER,
 };
 
 #ifdef WITH_BREAKING_CHANGES /* Git 3.0 */
@@ -154,6 +157,28 @@ struct repository {
 
 	/* Repository's reference storage format, as serialized on disk. */
 	enum ref_storage_format ref_storage_format;
+
+	/*
+	 * Repository's ODB source type, as configured via
+	 * extensions.objectStorage. When set to ODB_SOURCE_HELPER, the
+	 * object database uses an external helper process instead of the
+	 * files backend.
+	 */
+	enum odb_source_type odb_source_type;
+
+	/*
+	 * ODB storage backend-specific payload, analogous to
+	 * ref_storage_payload. Contains only the payload from a
+	 * URI-style configuration, without the scheme.
+	 */
+	char *odb_storage_payload;
+
+	/*
+	 * Shared helper process for delegating storage to an external
+	 * "git-local-<name>" binary. Used by both the ODB helper source
+	 * and the ref helper backend.
+	 */
+	struct helper_process *local_helper;
 	/*
 	 * Reference storage information as needed for the backend. This contains
 	 * only the payload from the reference URI without the schema.
@@ -225,6 +250,9 @@ void repo_set_compat_hash_algo(struct repository *repo, uint32_t compat_algo);
 void repo_set_ref_storage_format(struct repository *repo,
 				 enum ref_storage_format format,
 				 const char *payload);
+void repo_set_odb_source_type(struct repository *repo,
+			      enum odb_source_type type,
+			      const char *payload);
 void initialize_repository(struct repository *repo);
 RESULT_MUST_BE_USED
 int repo_init(struct repository *r, const char *gitdir, const char *worktree);

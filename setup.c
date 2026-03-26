@@ -7,9 +7,11 @@
 #include "environment.h"
 #include "exec-cmd.h"
 #include "gettext.h"
+#include "helper.h"
 #include "hex.h"
 #include "object-file.h"
 #include "object-name.h"
+#include "odb/source.h"
 #include "refs.h"
 #include "replace-object.h"
 #include "repository.h"
@@ -688,21 +690,34 @@ static enum extension_result handle_extension(const char *var,
 		return EXTENSION_OK;
 	} else if (!strcmp(ext, "refstorage")) {
 		unsigned int format;
-		char *format_str;
 
 		if (!value)
 			return config_error_nonbool(var);
 
-		parse_reference_uri(value, &format_str,
-				    &data->ref_storage_payload);
-
-		format = ref_storage_format_by_name(format_str);
-		free(format_str);
+		format = ref_storage_format_by_name(value);
 
 		if (format == REF_STORAGE_FORMAT_UNKNOWN)
 			return error(_("invalid value for '%s': '%s'"),
 				     "extensions.refstorage", value);
 		data->ref_storage_format = format;
+		return EXTENSION_OK;
+	} else if (!strcmp(ext, "objectstorage")) {
+		if (!value)
+			return config_error_nonbool(var);
+		if (!strcmp(value, "files")) {
+			data->odb_source_type = ODB_SOURCE_FILES;
+		} else if (!strcmp(value, "helper")) {
+			data->odb_source_type = ODB_SOURCE_HELPER;
+		} else {
+			return error(_("invalid value for '%s': '%s'"),
+				     "extensions.objectStorage", value);
+		}
+		return EXTENSION_OK;
+	} else if (!strcmp(ext, "localhelper")) {
+		if (!value)
+			return config_error_nonbool(var);
+		free(data->local_helper);
+		data->local_helper = xstrdup(value);
 		return EXTENSION_OK;
 	} else if (!strcmp(ext, "relativeworktrees")) {
 		data->relative_worktrees = git_config_bool(var, value);
@@ -875,6 +890,8 @@ void clear_repository_format(struct repository_format *format)
 	free(format->work_tree);
 	free(format->partial_clone);
 	free(format->ref_storage_payload);
+	free(format->odb_storage_payload);
+	free(format->local_helper);
 	init_repository_format(format);
 }
 
@@ -1144,6 +1161,21 @@ static const char *setup_explicit_git_dir(const char *gitdirenv,
 		return NULL;
 	}
 
+	/*
+	 * Set ODB source type and local helper before set_git_dir()
+	 * creates the object database. The ODB needs to know the
+	 * backend type during initialization.
+	 */
+	repo_set_odb_source_type(the_repository,
+				 repo_fmt->odb_source_type,
+				 repo_fmt->odb_storage_payload);
+	if (repo_fmt->local_helper && !the_repository->local_helper) {
+		the_repository->local_helper =
+			xcalloc(1, sizeof(*the_repository->local_helper));
+		the_repository->local_helper->name =
+			xstrdup(repo_fmt->local_helper);
+	}
+
 	/* #3, #7, #11, #15, #19, #23, #27, #31 (see t1510) */
 	if (work_tree_env)
 		set_git_work_tree(work_tree_env);
@@ -1218,6 +1250,20 @@ static const char *setup_discovered_git_dir(const char *gitdir,
 	if (check_repository_format_gently(gitdir, repo_fmt, nongit_ok))
 		return NULL;
 
+	/*
+	 * Set ODB source type and local helper before set_git_dir()
+	 * creates the object database.
+	 */
+	repo_set_odb_source_type(the_repository,
+				 repo_fmt->odb_source_type,
+				 repo_fmt->odb_storage_payload);
+	if (repo_fmt->local_helper && !the_repository->local_helper) {
+		the_repository->local_helper =
+			xcalloc(1, sizeof(*the_repository->local_helper));
+		the_repository->local_helper->name =
+			xstrdup(repo_fmt->local_helper);
+	}
+
 	/* --work-tree is set without --git-dir; use discovered one */
 	if (getenv(GIT_WORK_TREE_ENVIRONMENT) || git_work_tree_cfg) {
 		char *to_free = NULL;
@@ -1266,6 +1312,16 @@ static const char *setup_bare_git_dir(struct strbuf *cwd, int offset,
 
 	if (check_repository_format_gently(".", repo_fmt, nongit_ok))
 		return NULL;
+
+	repo_set_odb_source_type(the_repository,
+				 repo_fmt->odb_source_type,
+				 repo_fmt->odb_storage_payload);
+	if (repo_fmt->local_helper && !the_repository->local_helper) {
+		the_repository->local_helper =
+			xcalloc(1, sizeof(*the_repository->local_helper));
+		the_repository->local_helper->name =
+			xstrdup(repo_fmt->local_helper);
+	}
 
 	setenv(GIT_IMPLICIT_WORK_TREE_ENVIRONMENT, "0", 1);
 
@@ -1986,6 +2042,23 @@ const char *setup_git_directory_gently(int *nongit_ok)
 			const char *gitdir = getenv(GIT_DIR_ENVIRONMENT);
 			if (!gitdir)
 				gitdir = DEFAULT_GIT_DIR_ENVIRONMENT;
+			/*
+			 * Set the ODB source type before creating the
+			 * object database so that odb_source_new() can
+			 * select the correct backend.
+			 */
+			if (startup_info->have_repository) {
+				repo_set_odb_source_type(the_repository,
+					repo_fmt.odb_source_type,
+					repo_fmt.odb_storage_payload);
+				if (repo_fmt.local_helper &&
+				    !the_repository->local_helper) {
+					the_repository->local_helper =
+						xcalloc(1, sizeof(*the_repository->local_helper));
+					the_repository->local_helper->name =
+						xstrdup(repo_fmt.local_helper);
+				}
+			}
 			setup_git_env(gitdir);
 		}
 		if (startup_info->have_repository) {
@@ -2117,6 +2190,15 @@ void check_repository_format(struct repository_format *fmt)
 	repo_set_ref_storage_format(the_repository,
 				    fmt->ref_storage_format,
 				    fmt->ref_storage_payload);
+	repo_set_odb_source_type(the_repository,
+				fmt->odb_source_type,
+				fmt->odb_storage_payload);
+	if (fmt->local_helper && !the_repository->local_helper) {
+		the_repository->local_helper =
+			xcalloc(1, sizeof(*the_repository->local_helper));
+		the_repository->local_helper->name =
+			xstrdup(fmt->local_helper);
+	}
 	the_repository->repository_format_worktree_config =
 		fmt->worktree_config;
 	the_repository->repository_format_submodule_path_cfg =
@@ -2390,7 +2472,8 @@ void initialize_repository_version(int hash_algo,
 	 */
 	if (hash_algo != GIT_HASH_SHA1_LEGACY ||
 	    ref_storage_format != REF_STORAGE_FORMAT_FILES ||
-	    the_repository->ref_storage_payload)
+	    the_repository->ref_storage_payload ||
+	    the_repository->odb_source_type == ODB_SOURCE_HELPER)
 		target_version = GIT_REPO_VERSION_READ;
 
 	if (hash_algo != GIT_HASH_SHA1_LEGACY && hash_algo != GIT_HASH_UNKNOWN)
@@ -2399,19 +2482,24 @@ void initialize_repository_version(int hash_algo,
 	else if (reinit)
 		repo_config_set_gently(the_repository, "extensions.objectformat", NULL);
 
-	if (the_repository->ref_storage_payload) {
-		struct strbuf ref_uri = STRBUF_INIT;
-
-		strbuf_addf(&ref_uri, "%s://%s",
-			    ref_storage_format_to_name(ref_storage_format),
-			    the_repository->ref_storage_payload);
-		repo_config_set(the_repository, "extensions.refstorage", ref_uri.buf);
-		strbuf_release(&ref_uri);
-	} else if (ref_storage_format != REF_STORAGE_FORMAT_FILES) {
+	if (ref_storage_format != REF_STORAGE_FORMAT_FILES) {
 		repo_config_set(the_repository, "extensions.refstorage",
 				ref_storage_format_to_name(ref_storage_format));
 	} else if (reinit) {
 		repo_config_set_gently(the_repository, "extensions.refstorage", NULL);
+	}
+
+	if (the_repository->odb_source_type == ODB_SOURCE_HELPER) {
+		repo_config_set(the_repository, "extensions.objectstorage", "helper");
+	} else if (the_repository->odb_source_type == ODB_SOURCE_FILES && reinit) {
+		repo_config_set_gently(the_repository, "extensions.objectstorage", NULL);
+	}
+
+	if (the_repository->local_helper) {
+		repo_config_set(the_repository, "extensions.localhelper",
+				the_repository->local_helper->name);
+	} else if (reinit) {
+		repo_config_set_gently(the_repository, "extensions.localhelper", NULL);
 	}
 
 	if (reinit) {
@@ -2683,7 +2771,9 @@ out:
 }
 
 static void repository_format_configure(struct repository_format *repo_fmt,
-					int hash, enum ref_storage_format ref_format)
+					int hash, enum ref_storage_format ref_format,
+					enum odb_source_type odb_type,
+					const char *local_helper)
 {
 	struct default_format_config cfg = {
 		.hash = GIT_HASH_UNKNOWN,
@@ -2741,7 +2831,6 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 		repo_fmt->ref_storage_format = REF_STORAGE_FORMAT_DEFAULT;
 	}
 
-
 	ref_backend_uri = getenv(GIT_REFERENCE_BACKEND_ENVIRONMENT);
 	if (ref_backend_uri) {
 		char *backend, *payload;
@@ -2753,18 +2842,72 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 			die(_("unknown ref storage format: '%s'"), backend);
 
 		repo_fmt->ref_storage_format = format;
-		repo_fmt->ref_storage_payload = payload;
+		if (format == REF_STORAGE_FORMAT_HELPER) {
+			free(repo_fmt->local_helper);
+			repo_fmt->local_helper = payload;
+		} else {
+			free(repo_fmt->ref_storage_payload);
+			repo_fmt->ref_storage_payload = payload;
+		}
 
 		free(backend);
 	}
 
+	/*
+	 * Set local_helper from the CLI flag. This provides the helper
+	 * binary name for both the ref and odb backends.
+	 */
+	if (local_helper) {
+		free(repo_fmt->local_helper);
+		repo_fmt->local_helper = xstrdup(local_helper);
+	}
+
 	repo_set_ref_storage_format(the_repository, repo_fmt->ref_storage_format,
 				    repo_fmt->ref_storage_payload);
+
+	/*
+	 * Object storage format: CLI takes precedence, then env var fallback.
+	 * On reinit, refuse to change the format.
+	 */
+	if (repo_fmt->version >= 0 &&
+	    odb_type != ODB_SOURCE_UNKNOWN &&
+	    odb_type != repo_fmt->odb_source_type)
+		die(_("attempt to reinitialize repository with different object storage"));
+	else if (odb_type != ODB_SOURCE_UNKNOWN) {
+		repo_fmt->odb_source_type = odb_type;
+	} else {
+		const char *odb_env = getenv("GIT_DEFAULT_OBJECT_STORAGE");
+		if (odb_env) {
+			if (!strcmp(odb_env, "helper")) {
+				if (repo_fmt->version < 0 ||
+				    repo_fmt->odb_source_type == ODB_SOURCE_UNKNOWN)
+					repo_fmt->odb_source_type = ODB_SOURCE_HELPER;
+			} else if (!strcmp(odb_env, "files")) {
+				if (repo_fmt->version < 0 ||
+				    repo_fmt->odb_source_type == ODB_SOURCE_UNKNOWN)
+					repo_fmt->odb_source_type = ODB_SOURCE_FILES;
+			} else {
+				die(_("unknown object storage backend '%s'"), odb_env);
+			}
+		}
+	}
+
+	repo_set_odb_source_type(the_repository,
+				repo_fmt->odb_source_type,
+				repo_fmt->odb_storage_payload);
+	if (repo_fmt->local_helper && !the_repository->local_helper) {
+		the_repository->local_helper =
+			xcalloc(1, sizeof(*the_repository->local_helper));
+		the_repository->local_helper->name =
+			xstrdup(repo_fmt->local_helper);
+	}
 }
 
 int init_db(const char *git_dir, const char *real_git_dir,
 	    const char *template_dir, int hash,
 	    enum ref_storage_format ref_storage_format,
+	    enum odb_source_type odb_type,
+	    const char *local_helper,
 	    const char *initial_branch,
 	    int init_shared_repository, unsigned int flags)
 {
@@ -2800,7 +2943,8 @@ int init_db(const char *git_dir, const char *real_git_dir,
 	 */
 	check_repository_format(&repo_fmt);
 
-	repository_format_configure(&repo_fmt, hash, ref_storage_format);
+	repository_format_configure(&repo_fmt, hash, ref_storage_format,
+				    odb_type, local_helper);
 
 	/*
 	 * Ensure `core.hidedotfiles` is processed. This must happen after we

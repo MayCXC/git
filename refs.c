@@ -31,6 +31,7 @@
 #include "wildmatch.h"
 #include "ident.h"
 #include "fsck.h"
+#include "refs/helper-backend.h"
 
 /*
  * List of all available backends
@@ -38,6 +39,7 @@
 static const struct ref_storage_be *refs_backends[] = {
 	[REF_STORAGE_FORMAT_FILES] = &refs_be_files,
 	[REF_STORAGE_FORMAT_REFTABLE] = &refs_be_reftable,
+	[REF_STORAGE_FORMAT_HELPER] = &refs_be_helper,
 };
 
 static const struct ref_storage_be *find_ref_storage_backend(

@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "repository.h"
+#include "helper.h"
 #include "hook.h"
 #include "odb.h"
 #include "odb/source.h"
@@ -223,6 +224,15 @@ void repo_set_ref_storage_format(struct repository *repo,
 	repo->ref_storage_payload = xstrdup_or_null(payload);
 }
 
+void repo_set_odb_source_type(struct repository *repo,
+			      enum odb_source_type type,
+			      const char *payload)
+{
+	repo->odb_source_type = type;
+	free(repo->odb_storage_payload);
+	repo->odb_storage_payload = xstrdup_or_null(payload);
+}
+
 /*
  * Attempt to resolve and set the provided 'gitdir' for repository 'repo'.
  * Return 0 upon success and a non-zero value upon failure.
@@ -304,6 +314,13 @@ int repo_init(struct repository *repo,
 	repo_set_compat_hash_algo(repo, format.compat_hash_algo);
 	repo_set_ref_storage_format(repo, format.ref_storage_format,
 				    format.ref_storage_payload);
+	repo_set_odb_source_type(repo, format.odb_source_type,
+				format.odb_storage_payload);
+	if (format.local_helper && !repo->local_helper) {
+		repo->local_helper =
+			xcalloc(1, sizeof(*repo->local_helper));
+		repo->local_helper->name = xstrdup(format.local_helper);
+	}
 	repo->repository_format_worktree_config = format.worktree_config;
 	repo->repository_format_relative_worktrees = format.relative_worktrees;
 	repo->repository_format_precious_objects = format.precious_objects;
@@ -397,6 +414,12 @@ void repo_clear(struct repository *repo)
 	FREE_AND_NULL(repo->worktree);
 	FREE_AND_NULL(repo->submodule_prefix);
 	FREE_AND_NULL(repo->ref_storage_payload);
+	FREE_AND_NULL(repo->odb_storage_payload);
+
+	if (repo->local_helper) {
+		helper_process_release(repo->local_helper);
+		FREE_AND_NULL(repo->local_helper);
+	}
 
 	odb_free(repo->objects);
 	repo->objects = NULL;
