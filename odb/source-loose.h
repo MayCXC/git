@@ -44,4 +44,13 @@ static inline struct odb_source_loose *odb_source_loose_downcast(struct odb_sour
 	return container_of(source, struct odb_source_loose, base);
 }
 
+/*
+ * Ensure the object named by OID is stored as a loose object in SOURCE's
+ * files store, reading its content from wherever it currently lives and
+ * stamping the loose file with MTIME. Used by pack-objects to preserve
+ * objects that would otherwise be dropped when their pack is replaced.
+ */
+int force_object_loose(struct odb_source *source,
+		       const struct object_id *oid, time_t mtime);
+
 #endif

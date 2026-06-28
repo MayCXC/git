@@ -21,6 +21,7 @@
 #include "pack-revindex.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/pack-ingest.h"
 #include "odb/streaming.h"
 #include "oid-array.h"
 #include "oidset.h"
@@ -132,8 +133,17 @@ static int nr_ref_deltas;
 static int ref_deltas_alloc;
 static int nr_resolved_deltas;
 static int nr_threads;
+static struct odb_pack_ingest *pack_ingest;
 
 static int from_stdin;
+/*
+ * Set by --re-deltify: this pack was produced by gc/repack running pack-objects
+ * over the primary source's own objects to re-deltify them, so the pack-ingest
+ * session installs in repack mode (objects overwrite their stored
+ * representation in place) rather than keep-existing. Only a source that drives
+ * its repack through index-pack (a helper) passes it.
+ */
+static int re_deltify;
 static int strict;
 static int do_fsck_object;
 static struct fsck_options fsck_options;
@@ -469,7 +479,8 @@ static int is_delta_type(enum object_type type)
 }
 
 static void *unpack_entry_data(off_t offset, size_t size,
-			       enum object_type type, struct object_id *oid)
+			       enum object_type type, struct object_id *oid,
+			       struct odb_pack_ingest *ingest)
 {
 	static char fixed_buf[8192];
 	int status;
@@ -498,10 +509,23 @@ static void *unpack_entry_data(off_t offset, size_t size,
 
 	do {
 		unsigned char *last_out = stream.next_out;
-		stream.next_in = fill(1);
+		unsigned char *comp_in = fill(1);
+		unsigned long comp_used;
+		stream.next_in = comp_in;
 		stream.avail_in = input_len;
 		status = git_inflate(&stream, 0);
-		use(input_len - stream.avail_in);
+		comp_used = input_len - stream.avail_in;
+		use(comp_used);
+		/*
+		 * Capture the consumed compressed bytes (this entry's deflate stream)
+		 * into the session as it inflates: the streaming pass has no readable
+		 * pack to slice from yet. The capture dispatch no-ops for a session
+		 * that keeps the pack, so the common path pays nothing. Skipped for
+		 * delta entries (sliced in the resolve pass) and streamed big blobs
+		 * (fixed_buf), which are never held whole.
+		 */
+		if (ingest && !is_delta_type(type) && buf != fixed_buf)
+			odb_pack_ingest_capture(ingest, comp_in, comp_used);
 		if (oid)
 			git_hash_update(&c, last_out, stream.next_out - last_out);
 		if (buf == fixed_buf) {
@@ -520,7 +544,8 @@ static void *unpack_entry_data(off_t offset, size_t size,
 static void *unpack_raw_entry(struct object_entry *obj,
 			      off_t *ofs_offset,
 			      struct object_id *ref_oid,
-			      struct object_id *oid)
+			      struct object_id *oid,
+			      struct odb_pack_ingest *ingest)
 {
 	unsigned char *p;
 	size_t size, c;
@@ -582,7 +607,15 @@ static void *unpack_raw_entry(struct object_entry *obj,
 	}
 	obj->hdr_size = consumed_bytes - obj->idx.offset;
 
-	data = unpack_entry_data(obj->idx.offset, obj->size, obj->type, oid);
+	/*
+	 * Capture the entry's compressed bytes into the session as it inflates so a
+	 * source that stores git's native form keeps them verbatim; the streaming
+	 * pass has no readable pack to slice from yet. unpack_entry_data skips delta
+	 * entries (sliced from the readable pack in the resolve pass) and the
+	 * capture no-ops for a session that keeps the pack.
+	 */
+	data = unpack_entry_data(obj->idx.offset, obj->size, obj->type, oid,
+				 ingest);
 	obj->idx.crc32 = input_crc32;
 	return data;
 }
@@ -650,6 +683,47 @@ static void *unpack_data(struct object_entry *obj,
 static void *get_data_from_pack(struct object_entry *obj)
 {
 	return unpack_data(obj, NULL, NULL);
+}
+
+/*
+ * Read the object's COMPRESSED pack-entry payload verbatim, without inflating:
+ * the deflate stream from just after the entry header (obj->hdr_size, which spans
+ * the type/size varint and any delta base ref) to the next entry's offset (the
+ * trailing sentinel bounds the last object, as in unpack_data()). For a delta
+ * entry these are the compressed git-format delta bytes, stored as-is so a source
+ * that keeps git's native form neither inflates nor recompresses. Caller frees.
+ * Only valid once the pack is on disk and readable (the second/resolve pass).
+ */
+static void *get_compressed_from_pack(struct object_entry *obj, unsigned long *clen)
+{
+	off_t from = obj[0].idx.offset + obj[0].hdr_size;
+	off_t len = obj[1].idx.offset - from;
+	unsigned char *buf = xmallocz(len), *dst = buf;
+	off_t left = len;
+
+	while (left) {
+		ssize_t n = xpread(get_thread_data()->pack_fd, dst, left, from);
+		if (n < 0)
+			die_errno(_("cannot pread pack file"));
+		if (!n)
+			die(_("premature end of pack file"));
+		dst += n;
+		from += n;
+		left -= n;
+	}
+	*clen = (unsigned long)len;
+	return buf;
+}
+
+/*
+ * slice accessor for odb_pack_ingest_store: in the resolve pass the delta's
+ * compressed bytes are sliced from the now-readable pack per object (thread
+ * safe, a fresh buffer per call). Only a source that stores git's native form
+ * pulls them, so a files keep-the-pack fetch never slices.
+ */
+static const void *resolve_slice_compressed(void *ctx, unsigned long *clen)
+{
+	return get_compressed_from_pack(ctx, clen);
 }
 
 static int compare_ofs_delta_bases(off_t offset1, off_t offset2,
@@ -880,9 +954,72 @@ static void do_record_outgoing_links(struct object *obj)
 	}
 }
 
+/*
+ * Pull-model stream that inflates one object's content straight out of the pack
+ * being indexed, by offset, without ever holding it in memory. The read shape
+ * follows unpack-objects.c's stream_blob()/feed_input_zstream(); the deflated
+ * bytes are read from the pack with xpread() the way unpack_data() does. Used to
+ * ingest a large blob into a non-files backend, which cannot keep the pack.
+ */
+struct pack_blob_stream {
+	git_zstream zstream;
+	off_t from;	/* next deflated byte offset to read from the pack */
+	off_t len;	/* deflated bytes remaining for this object */
+	int status;	/* last git_inflate() status */
+	unsigned char inbuf[64 * 1024];
+};
+
+static ssize_t feed_pack_blob_stream(struct odb_write_stream *stream,
+				     unsigned char *buf, size_t buf_len)
+{
+	struct pack_blob_stream *d = stream->data;
+	git_zstream *zs = &d->zstream;
+
+	if (stream->is_finished)
+		return 0;
+
+	zs->next_out = buf;
+	zs->avail_out = buf_len;
+
+	/*
+	 * Inflate until at least one byte is produced or the object ends. A
+	 * caller that reads 0 treats it as EOF, so we must not return 0 before
+	 * the stream is genuinely finished.
+	 */
+	while (zs->avail_out == buf_len) {
+		if (!zs->avail_in && d->len) {
+			ssize_t n = d->len < (off_t)sizeof(d->inbuf) ?
+				(ssize_t)d->len : (ssize_t)sizeof(d->inbuf);
+			n = xpread(get_thread_data()->pack_fd, d->inbuf, n,
+				   d->from);
+			if (n < 0)
+				die_errno(_("cannot pread pack file"));
+			if (!n)
+				die(_("premature end of pack file"));
+			d->from += n;
+			d->len -= n;
+			zs->next_in = d->inbuf;
+			zs->avail_in = n;
+		}
+
+		d->status = git_inflate(zs, 0);
+		if (d->status != Z_OK) {
+			stream->is_finished = 1;
+			break;
+		}
+		if (!zs->avail_in && !d->len)
+			break;	/* ran out of input before Z_STREAM_END */
+	}
+
+	return buf_len - zs->avail_out;
+}
+
 static void sha1_object(const void *data, struct object_entry *obj_entry,
 			unsigned long size, enum object_type type,
-			const struct object_id *oid)
+			const struct object_id *oid,
+			const struct object_id *delta_base,
+			odb_pack_ingest_slice_fn slice, void *slice_ctx,
+			unsigned long raw_len)
 {
 	void *new_data = NULL;
 	int collision_test_needed = 0;
@@ -975,6 +1112,54 @@ static void sha1_object(const void *data, struct object_entry *obj_entry,
 		read_unlock();
 	}
 
+	/*
+	 * Hand the object to the pack-ingest session, which decides how to store it.
+	 * A source storing git's native form takes the prepared (compressed) entry
+	 * verbatim -- a delta (delta_base set) stays a delta, a whole object stays
+	 * whole, neither inflated nor recompressed -- pulling the bytes from its
+	 * capture buffer (the streaming pass, slice == NULL) or via slice (the
+	 * resolve pass, which slices the now-readable pack per call); any other
+	 * source stores the resolved `data`/`size` (raw_len is its uncompressed
+	 * length); a files keep-the-pack source no-ops, as does no session. A large
+	 * blob was never materialized (data == NULL); stream it from the pack.
+	 *
+	 * Delivery is object-store access, so it runs under read_mutex, the same
+	 * lock this function already takes for its collision-check reads above. A
+	 * source whose store is a single shared connection (a helper over one pipe)
+	 * would otherwise have a worker thread's write interleave with another
+	 * thread's read on that connection during the threaded resolve; serializing
+	 * delivery with the reads keeps the protocol well-framed. For a files or no
+	 * session the lock is uncontended around a no-op.
+	 */
+	read_lock();
+	if (data) {
+		if (odb_pack_ingest_store(pack_ingest, oid, type, raw_len,
+					  delta_base, data, size, slice, slice_ctx) < 0)
+			die(_("unable to ingest %s"), oid_to_hex(oid));
+	} else {
+		struct pack_blob_stream pbs = { 0 };
+		struct odb_write_stream stream = {
+			.read = feed_pack_blob_stream,
+			.data = &pbs,
+		};
+
+		pbs.from = obj_entry[0].idx.offset + obj_entry[0].hdr_size;
+		pbs.len = obj_entry[1].idx.offset - pbs.from;
+		git_inflate_init(&pbs.zstream);
+		if (odb_pack_ingest_object_stream(pack_ingest, oid, type,
+						  &stream, size) < 0)
+			die(_("unable to ingest object %s"), oid_to_hex(oid));
+		/*
+		 * A files source keeps the pack and never reads the stream
+		 * (is_finished stays unset); only validate the inflate when the
+		 * backend actually consumed it.
+		 */
+		if (stream.is_finished && pbs.status != Z_STREAM_END)
+			die(_("serious inflate inconsistency"));
+		git_inflate_end(&pbs.zstream);
+	}
+	read_unlock();
+
 	free(new_data);
 }
 
@@ -1064,13 +1249,24 @@ static struct base_data *resolve_delta(struct object_entry *delta_obj,
 	assert(base->data);
 	result_data = patch_delta(base->data, base->size,
 				  delta_data, delta_obj->size, &result_size);
-	free(delta_data);
-	if (!result_data)
+	if (!result_data) {
+		free(delta_data);
 		bad_object(delta_obj->idx.offset, _("failed to apply delta"));
+	}
 	hash_object_file(the_hash_algo, result_data, result_size,
 			 delta_obj->real_type, &delta_obj->idx.oid);
+	/*
+	 * Hand the resolved delta to the session with its base oid;
+	 * odb_pack_ingest_store slices the delta's compressed bytes from the now-
+	 * readable pack (via resolve_slice_compressed) only for a source that stores
+	 * git's native form, keeping it a compressed delta. delta_obj->size is the
+	 * uncompressed delta length. (delta_data, the inflated delta used above for
+	 * patch_delta, is freed below.)
+	 */
 	sha1_object(result_data, NULL, result_size, delta_obj->real_type,
-		    &delta_obj->idx.oid);
+		    &delta_obj->idx.oid, &base->obj->idx.oid,
+		    resolve_slice_compressed, delta_obj, delta_obj->size);
+	free(delta_data);
 
 	result = make_base(delta_obj, base);
 	result->data = result_data;
@@ -1264,9 +1460,11 @@ static void parse_pack_objects(unsigned char *hash)
 				nr_objects);
 	for (i = 0; i < nr_objects; i++) {
 		struct object_entry *obj = &objects[i];
-		void *data = unpack_raw_entry(obj, &ofs_delta->offset,
-					      &ref_delta_oid,
-					      &obj->idx.oid);
+		void *data;
+
+		data = unpack_raw_entry(obj, &ofs_delta->offset,
+					&ref_delta_oid,
+					&obj->idx.oid, pack_ingest);
 		obj->real_type = obj->type;
 		if (obj->type == OBJ_OFS_DELTA) {
 			nr_ofs_deltas++;
@@ -1282,8 +1480,14 @@ static void parse_pack_objects(unsigned char *hash)
 			obj->real_type = OBJ_BAD;
 			nr_delays++;
 		} else
+			/*
+			 * A whole object: its compressed bytes were captured into the
+			 * session during inflate (the streaming pass has no readable pack
+			 * to slice yet); odb_pack_ingest_store hands them to a source that
+			 * stores git's native form. slice == NULL: use the capture buffer.
+			 */
 			sha1_object(data, NULL, obj->size, obj->type,
-				    &obj->idx.oid);
+				    &obj->idx.oid, NULL, NULL, NULL, obj->size);
 		free(data);
 		display_progress(progress, i+1);
 	}
@@ -1312,7 +1516,7 @@ static void parse_pack_objects(unsigned char *hash)
 			continue;
 		obj->real_type = obj->type;
 		sha1_object(NULL, obj, obj->size, obj->type,
-			    &obj->idx.oid);
+			    &obj->idx.oid, NULL, NULL, NULL, 0);
 		nr_delays--;
 	}
 	if (nr_delays)
@@ -1563,7 +1767,7 @@ static void final(const char *final_pack_name, const char *curr_pack_name,
 	 * install_packfile() leaves *final_index_name pointing into a released
 	 * strbuf when it has to derive the name, so capture whether a stable
 	 * name was supplied before the call and recompute the canonical one from
-	 * the hash otherwise.
+	 * the hash otherwise (see the matching note in files_ingest_commit()).
 	 */
 	index_name_given = !!final_index_name;
 
@@ -1577,9 +1781,15 @@ static void final(const char *final_pack_name, const char *curr_pack_name,
 		struct strbuf idx = STRBUF_INIT;
 		const char *idx_name = index_name_given ? final_index_name :
 			odb_pack_name(the_repository, &idx, hash, "idx");
-		struct odb_source_files *files =
-			odb_source_files_downcast(the_repository->objects->sources);
-		packfile_store_load_pack(files->packed, idx_name, 0);
+		/*
+		 * Make the just-written objects readable for the in-process fsck
+		 * through the source vtable instead of a files-only downcast: the
+		 * files source loads the on-disk pack (a targeted, deduplicated
+		 * load), other backends reprepare so their pack-ingested objects
+		 * become visible.
+		 */
+		odb_source_note_indexed_pack(
+			odb_primary_source(the_repository->objects), idx_name);
 		strbuf_release(&idx);
 	}
 
@@ -1819,7 +2029,7 @@ int cmd_index_pack(int argc,
 		   struct repository *repo UNUSED)
 {
 	int i, fix_thin_pack = 0, verify = 0, stat_only = 0, rev_index;
-	const char *curr_index;
+	const char *curr_index = NULL;
 	char *curr_rev_index = NULL;
 	const char *index_name = NULL, *pack_name = NULL, *rev_index_name = NULL;
 	const char *keep_msg = NULL;
@@ -1865,6 +2075,8 @@ int cmd_index_pack(int argc,
 		if (*arg == '-') {
 			if (!strcmp(arg, "--stdin")) {
 				from_stdin = 1;
+			} else if (!strcmp(arg, "--re-deltify")) {
+				re_deltify = 1;
 			} else if (!strcmp(arg, "--fix-thin")) {
 				fix_thin_pack = 1;
 			} else if (skip_to_optional_arg(arg, "--strict", &arg)) {
@@ -1952,6 +2164,8 @@ int cmd_index_pack(int argc,
 		usage(index_pack_usage);
 	if (fix_thin_pack && !from_stdin)
 		die(_("the option '%s' requires '%s'"), "--fix-thin", "--stdin");
+	if (re_deltify && !from_stdin)
+		die(_("the option '%s' requires '%s'"), "--re-deltify", "--stdin");
 	if (promisor_msg && pack_name)
 		die(_("--promisor cannot be used with a pack name"));
 	if (from_stdin && !startup_info->have_repository)
@@ -2008,6 +2222,20 @@ int cmd_index_pack(int argc,
 			nr_threads = 20; /* hard cap */
 	}
 
+	/*
+	 * A received pack (--stdin) is installed through the primary source's
+	 * pack-ingest session: a files source keeps the pack on disk, other
+	 * backends absorb its resolved objects as they are reconstructed. Delta
+	 * resolution always runs across all worker threads; a session whose backend
+	 * cannot tolerate concurrent writes (e.g. a helper driven over a single
+	 * pipe) serializes the hand-off inside the session, not by clamping threads.
+	 */
+	if (from_stdin) {
+		pack_ingest = odb_source_begin_pack_ingest(the_repository->objects);
+		if (re_deltify)
+			odb_pack_ingest_set_repack(pack_ingest);
+	}
+
 	curr_pack = open_pack_file(pack_name);
 	parse_pack_header();
 	CALLOC_ARRAY(objects, st_add(nr_objects, 1));
@@ -2030,22 +2258,56 @@ int cmd_index_pack(int argc,
 	ALLOC_ARRAY(idx_objects, nr_objects);
 	for (i = 0; i < nr_objects; i++)
 		idx_objects[i] = &objects[i].idx;
-	curr_index = write_idx_file(the_repository, index_name, idx_objects,
-				    nr_objects, &opts, pack_hash);
-	if (rev_index)
-		curr_rev_index = write_rev_file(the_repository, rev_index_name,
-						idx_objects, nr_objects,
-						pack_hash, opts.flags);
-	free(idx_objects);
 
-	if (!verify)
-		final(pack_name, curr_pack,
-		      index_name, curr_index,
-		      rev_index_name, curr_rev_index,
-		      keep_msg, promisor_msg,
-		      pack_hash);
-	else
-		close(input_fd);
+	if (from_stdin) {
+		/*
+		 * Install the received pack through the session: a files source
+		 * keeps it (writing its index from idx_objects), other backends
+		 * have already absorbed the objects during resolution. The
+		 * session produces the report line to emit.
+		 */
+		struct odb_received_pack received_pack = {
+			.pack_tmp_name = curr_pack,
+			.pack_hash = pack_hash,
+			.objects = idx_objects,
+			.nr_objects = nr_objects,
+			.idx_opts = &opts,
+			.pack_name = pack_name,
+			.index_name = index_name,
+			.rev_index_name = rev_index_name,
+			.keep_msg = keep_msg,
+			.promisor_msg = promisor_msg,
+		};
+		struct strbuf report = STRBUF_INIT;
+
+		/* Close the received pack before the session installs/discards it. */
+		fsync_component_or_die(FSYNC_COMPONENT_PACK, output_fd, curr_pack);
+		if (close(output_fd))
+			die_errno(_("error while closing pack file"));
+
+		odb_pack_ingest_commit(pack_ingest, &received_pack, &report);
+
+		write_or_die(1, report.buf, report.len);
+		strbuf_release(&report);
+		/* Pass the trailing input through to the caller. */
+		write_in_full(1, input_buffer + input_offset, input_len);
+	} else {
+		curr_index = write_idx_file(the_repository, index_name, idx_objects,
+					    nr_objects, &opts, pack_hash);
+		if (rev_index)
+			curr_rev_index = write_rev_file(the_repository, rev_index_name,
+							idx_objects, nr_objects,
+							pack_hash, opts.flags);
+		if (!verify)
+			final(pack_name, curr_pack,
+			      index_name, curr_index,
+			      rev_index_name, curr_rev_index,
+			      keep_msg, promisor_msg,
+			      pack_hash);
+		else
+			close(input_fd);
+	}
+	free(idx_objects);
 
 	if (do_fsck_object) {
 		/*

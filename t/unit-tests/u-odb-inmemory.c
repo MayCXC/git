@@ -1,5 +1,6 @@
 #include "unit-test.h"
 #include "hex.h"
+#include "odb/pack-ingest.h"
 #include "odb/source-inmemory.h"
 #include "odb/streaming.h"
 #include "oidset.h"
@@ -310,4 +311,72 @@ void test_odb_inmemory__write_object_stream(void)
 	cl_assert_object_info(source, &written_oid, OBJ_BLOB, "foobar");
 
 	odb_source_free(&source->base);
+}
+
+/*
+ * Pack ingestion. The generic session (used by every non-files source) writes
+ * each resolved object through an odb_transaction. Register the in-memory
+ * source as the primary so the session's odb_write_object_ext() /
+ * odb_write_object_stream() calls target it, then drive begin -> receive ->
+ * commit and read the object back. The object id passed to receive is the one
+ * index-pack resolved; the session recomputes it from the bytes, so it equals
+ * FOOBAR_OID here. (Files-backend ingestion, which keeps the received pack, is
+ * covered by the integration suites t5302/t1050.)
+ */
+static void ingest_register_primary(struct odb_source_inmemory *source)
+{
+	odb->sources = &source->base;
+	odb->sources_tail = &source->base.next;
+	/* The source is now owned by odb->sources and freed by the cleanup. */
+}
+
+void test_odb_inmemory__pack_ingest(void)
+{
+	struct odb_source_inmemory *source = odb_source_inmemory_new(odb);
+	struct odb_received_pack pack = { 0 };
+	struct strbuf report = STRBUF_INIT;
+	struct odb_pack_ingest *ingest;
+	struct object_id oid;
+	const char *end;
+
+	ingest_register_primary(source);
+	cl_must_pass(parse_oid_hex_algop(FOOBAR_OID, &oid, &end, repo.hash_algo));
+
+	ingest = odb_source_begin_pack_ingest(odb);
+	cl_assert(ingest != NULL);
+	cl_must_pass(odb_pack_ingest_object(ingest, &oid, OBJ_BLOB, "foobar", 6));
+	odb_pack_ingest_commit(ingest, &pack, &report);
+
+	cl_assert_object_info(source, &oid, OBJ_BLOB, "foobar");
+
+	strbuf_release(&report);
+}
+
+void test_odb_inmemory__pack_ingest_stream(void)
+{
+	struct odb_source_inmemory *source = odb_source_inmemory_new(odb);
+	struct odb_received_pack pack = { 0 };
+	struct strbuf report = STRBUF_INIT;
+	const char data[] = "foobar";
+	struct membuf_write_stream stream = {
+		.base.read = membuf_write_stream_read,
+		.buf = data,
+		.size = strlen(data),
+	};
+	struct odb_pack_ingest *ingest;
+	struct object_id oid;
+	const char *end;
+
+	ingest_register_primary(source);
+	cl_must_pass(parse_oid_hex_algop(FOOBAR_OID, &oid, &end, repo.hash_algo));
+
+	ingest = odb_source_begin_pack_ingest(odb);
+	cl_assert(ingest != NULL);
+	cl_must_pass(odb_pack_ingest_object_stream(ingest, &oid, OBJ_BLOB,
+						   &stream.base, strlen(data)));
+	odb_pack_ingest_commit(ingest, &pack, &report);
+
+	cl_assert_object_info(source, &oid, OBJ_BLOB, "foobar");
+
+	strbuf_release(&report);
 }

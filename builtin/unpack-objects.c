@@ -11,6 +11,7 @@
 #include "odb.h"
 #include "odb/streaming.h"
 #include "odb/transaction.h"
+#include "odb/pack-ingest.h"
 #include "object.h"
 #include "delta.h"
 #include "pack.h"
@@ -24,6 +25,7 @@
 
 static int dry_run, quiet, recover, has_errors, strict;
 static const char unpack_usage[] = "git unpack-objects [-n] [-q] [-r] [--strict]";
+static struct odb_pack_ingest *pack_ingest;
 
 static unsigned char buffer[DEFAULT_IO_BUFFER_SIZE];
 static unsigned int offset, len;
@@ -269,14 +271,27 @@ static void added_object(unsigned nr, enum object_type type,
  * to be checked at the end.
  */
 static void write_object(unsigned nr, enum object_type type,
-			 void *buf, unsigned long size)
+			 void *buf, unsigned long size, void *delta)
 {
 	if (!strict) {
-		if (odb_write_object(the_repository->objects, buf, size, type,
-				     &obj_list[nr].oid) < 0)
+		int ret;
+
+		/*
+		 * Name the reconstructed object and hand it to the pack-ingest session
+		 * resolved. unpack-objects explodes the pack (the small-fetch path), so
+		 * every object is stored whole -- the analog of the files backend writing
+		 * loose objects; deltas are not kept here (index-pack's keep-pack path
+		 * preserves those). resolve_delta already applied the base.
+		 */
+		hash_object_file(the_hash_algo, buf, size, type,
+				 &obj_list[nr].oid);
+		ret = odb_pack_ingest_object(pack_ingest, &obj_list[nr].oid,
+					     type, buf, size);
+		if (ret < 0)
 			die("failed to write object");
 		added_object(nr, type, buf, size);
 		free(buf);
+		free(delta);
 		obj_list[nr].obj = NULL;
 	} else if (type == OBJ_BLOB) {
 		struct blob *blob;
@@ -285,6 +300,7 @@ static void write_object(unsigned nr, enum object_type type,
 			die("failed to write object");
 		added_object(nr, type, buf, size);
 		free(buf);
+		free(delta);
 
 		blob = lookup_blob(the_repository, &obj_list[nr].oid);
 		if (blob)
@@ -298,6 +314,7 @@ static void write_object(unsigned nr, enum object_type type,
 		hash_object_file(the_hash_algo, buf, size, type,
 				 &obj_list[nr].oid);
 		added_object(nr, type, buf, size);
+		free(delta);
 		obj = parse_object_buffer(the_repository, &obj_list[nr].oid,
 					  type, size, buf,
 					  &eaten);
@@ -321,8 +338,7 @@ static void resolve_delta(unsigned nr, enum object_type type,
 			     &result_size);
 	if (!result)
 		die("failed to apply delta");
-	free(delta);
-	write_object(nr, type, result, result_size);
+	write_object(nr, type, result, result_size, delta);
 }
 
 /*
@@ -355,7 +371,7 @@ static void unpack_non_delta_entry(enum object_type type, unsigned long size,
 	void *buf = get_data(size);
 
 	if (buf)
-		write_object(nr, type, buf, size);
+		write_object(nr, type, buf, size, NULL);
 }
 
 struct input_zstream_data {
@@ -580,7 +596,7 @@ static void unpack_all(void)
 {
 	int i;
 	unsigned char *hdr = fill(sizeof(struct pack_header));
-	struct odb_transaction *transaction;
+	struct odb_received_pack received_pack = { 0 };
 
 	if (get_be32(hdr) != PACK_SIGNATURE)
 		die("bad pack file");
@@ -596,12 +612,12 @@ static void unpack_all(void)
 		progress = start_progress(the_repository,
 					  _("Unpacking objects"), nr_objects);
 	CALLOC_ARRAY(obj_list, nr_objects);
-	transaction = odb_transaction_begin(the_repository->objects);
+	pack_ingest = odb_pack_ingest_begin_generic(odb_primary_source(the_repository->objects));
 	for (i = 0; i < nr_objects; i++) {
 		unpack_one(i);
 		display_progress(progress, i + 1);
 	}
-	odb_transaction_commit(transaction);
+	odb_pack_ingest_commit(pack_ingest, &received_pack, NULL);
 	stop_progress(&progress);
 
 	if (delta_list)

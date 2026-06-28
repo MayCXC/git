@@ -223,6 +223,42 @@ static int odb_source_files_write_object_stream(struct odb_source *source,
 	return odb_source_write_object_stream(&files->loose->base, stream, len, oid);
 }
 
+static int odb_source_files_install_loose_object(struct odb_source *source,
+						 const char *temp_path,
+						 const struct object_id *oid)
+{
+	struct odb_source_files *files = odb_source_files_downcast(source);
+	struct strbuf filename = STRBUF_INIT;
+	int ret;
+
+	/*
+	 * The tempfile is already a complete loose object, so rename it into the
+	 * loose layout (zero-copy). finalize_object_file() does not create the fanout
+	 * directory, so create it first, as write_loose_object() does.
+	 */
+	odb_loose_path(files->loose, &filename, oid);
+	if (safe_create_leading_directories_const(source->odb->repo, filename.buf)) {
+		strbuf_release(&filename);
+		return error(_("unable to create directory for %s"), oid_to_hex(oid));
+	}
+	ret = finalize_object_file(source->odb->repo, temp_path, filename.buf);
+	strbuf_release(&filename);
+	return ret;
+}
+
+static void odb_source_files_note_received_pack(struct odb_source *source,
+						struct packed_git *p)
+{
+	packfile_store_add_pack(odb_source_files_downcast(source)->packed, p);
+}
+
+static void odb_source_files_note_indexed_pack(struct odb_source *source,
+					       const char *idx_path)
+{
+	packfile_store_load_pack(odb_source_files_downcast(source)->packed,
+				 idx_path, 0);
+}
+
 static int odb_source_files_begin_transaction(struct odb_source *source,
 					      struct odb_transaction **out)
 {
@@ -304,6 +340,125 @@ out:
 	return ret;
 }
 
+static int files_ingest_receive_object(struct odb_pack_ingest *ingest UNUSED,
+				       const struct object_id *oid UNUSED,
+				       enum object_type type UNUSED,
+				       const void *data UNUSED,
+				       unsigned long size UNUSED)
+{
+	/*
+	 * The received pack is kept as-is and becomes part of this source's
+	 * storage, so there is nothing to do per object; the pack is installed
+	 * wholesale at commit time.
+	 */
+	return 0;
+}
+
+/*
+ * Explode a received pack into loose objects (used for a small received pack
+ * not worth keeping as a packfile) and return whether unpack-objects succeeded.
+ * unpack-objects writes through the object database, so a non-files primary
+ * never needs this: it explodes the pack via the generic ingest session.
+ */
+static int files_loosen_received_pack(const char *pack_tmp_name)
+{
+	struct child_process unpack = CHILD_PROCESS_INIT;
+	int fd = open(pack_tmp_name, O_RDONLY);
+
+	if (fd < 0)
+		return -1;
+	unpack.in = fd;
+	unpack.git_cmd = 1;
+	strvec_pushl(&unpack.args, "unpack-objects", "-q", NULL);
+	return run_command(&unpack);
+}
+
+static struct packed_git *files_ingest_commit(struct odb_pack_ingest *ingest,
+					      const struct odb_received_pack *pack,
+					      struct strbuf *report)
+{
+	struct odb_source_files *files = odb_source_files_downcast(ingest->source);
+	struct repository *repo = ingest->source->odb->repo;
+	const char *final_pack_name = pack->pack_name;
+	const char *final_index_name = pack->index_name;
+	const char *final_rev_index_name = pack->rev_index_name;
+	const char *curr_index_name;
+	const char *curr_rev_index_name = NULL;
+	const char *report_token;
+	struct packed_git *installed;
+
+	/*
+	 * A small received pack is stored as loose objects rather than kept as a
+	 * packfile, so tiny packs do not accumulate (the caller opts in via
+	 * loosen_if_at_most). The temporary pack is exploded and discarded; no
+	 * packfile is installed. If exploding fails, fall through and keep it.
+	 */
+	if (ingest->loosen_if_at_most &&
+	    pack->nr_objects <= ingest->loosen_if_at_most &&
+	    !files_loosen_received_pack(pack->pack_tmp_name)) {
+		unlink(pack->pack_tmp_name);
+		if (report)
+			strbuf_addf(report, "pack\t%0*d\n",
+				    (int)repo->hash_algo->hexsz, 0);
+		return NULL;
+	}
+
+	curr_index_name = write_idx_file(repo, final_index_name, pack->objects,
+					 pack->nr_objects, pack->idx_opts,
+					 pack->pack_hash);
+	if (pack->idx_opts->flags & WRITE_REV)
+		curr_rev_index_name = write_rev_file(repo, final_rev_index_name,
+						     pack->objects,
+						     pack->nr_objects,
+						     pack->pack_hash,
+						     pack->idx_opts->flags);
+
+	report_token = install_packfile(repo, pack->pack_hash,
+					&final_pack_name, pack->pack_tmp_name,
+					&final_index_name, curr_index_name,
+					&final_rev_index_name, curr_rev_index_name,
+					pack->keep_msg, pack->promisor_msg, 1);
+
+	/*
+	 * install_packfile() only fills *final_index_name with a stable string
+	 * when the caller supplied the name; when it had to derive one it points
+	 * into a strbuf it then released, so it dangles here. Load from the
+	 * caller-stable name, recomputing the canonical one from the hash (the
+	 * same derivation finalize_pack_component() used) when none was given.
+	 */
+	if (pack->index_name) {
+		installed = packfile_store_load_pack(files->packed, pack->index_name, 0);
+	} else {
+		struct strbuf idx = STRBUF_INIT;
+		odb_pack_name(repo, &idx, pack->pack_hash, "idx");
+		installed = packfile_store_load_pack(files->packed, idx.buf, 0);
+		strbuf_release(&idx);
+	}
+
+	if (report)
+		strbuf_addf(report, "%s\t%s\n", report_token,
+			    hash_to_hex_algop(pack->pack_hash, repo->hash_algo));
+
+	/* write_idx_file returns a freshly allocated name when none was given. */
+	if (!pack->index_name)
+		free((char *)curr_index_name);
+	free((char *)curr_rev_index_name);
+
+	return installed;
+}
+
+static struct odb_pack_ingest *odb_source_files_begin_pack_ingest(struct odb_source *source)
+{
+	struct odb_pack_ingest *ingest;
+
+	CALLOC_ARRAY(ingest, 1);
+	ingest->source = source;
+	ingest->receive_object = files_ingest_receive_object;
+	ingest->commit = files_ingest_commit;
+
+	return ingest;
+}
+
 struct odb_source_files *odb_source_files_new(struct object_database *odb,
 					      const char *path,
 					      bool local)
@@ -327,6 +482,10 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.write_object = odb_source_files_write_object;
 	files->base.write_object_stream = odb_source_files_write_object_stream;
 	files->base.begin_transaction = odb_source_files_begin_transaction;
+	files->base.begin_pack_ingest = odb_source_files_begin_pack_ingest;
+	files->base.install_loose_object = odb_source_files_install_loose_object;
+	files->base.note_received_pack = odb_source_files_note_received_pack;
+	files->base.note_indexed_pack = odb_source_files_note_indexed_pack;
 	files->base.read_alternates = odb_source_files_read_alternates;
 	files->base.write_alternate = odb_source_files_write_alternate;
 

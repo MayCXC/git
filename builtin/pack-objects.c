@@ -33,6 +33,7 @@
 #include "packfile.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/source-loose.h"
 #include "odb/streaming.h"
 #include "replace-object.h"
 #include "dir.h"

@@ -25,6 +25,8 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/pack-ingest.h"
+#include "odb/streaming.h"
 #include "mem-pool.h"
 #include "commit-reach.h"
 #include "khash.h"
@@ -208,6 +210,13 @@ static struct pack_idx_option pack_idx_opts;
 static unsigned int pack_id;
 static struct hashfile *pack_file;
 static struct packed_git *pack_data;
+/*
+ * Pack-ingest session for the current pack, begun lazily on the first stored
+ * object so an empty pack needs no session. The primary source installs the
+ * built pack at end_packfile() (files keeps it, a helper explodes the fed
+ * objects), so fast-import stays blind to the backend.
+ */
+static struct odb_pack_ingest *pack_ingest;
 static struct packed_git **all_packs;
 static off_t pack_size;
 
@@ -421,6 +430,7 @@ static void write_crash_report(const char *err)
 
 static void end_packfile(void);
 static void unkeep_all_packs(void);
+static void feed_streamed_blobs(void);
 static void dump_marks(void);
 
 static NORETURN void die_nicely(const char *err, va_list params)
@@ -787,14 +797,17 @@ static void start_packfile(void)
 	all_packs[pack_id] = p;
 }
 
-static const char *create_index(void)
+/*
+ * Build the array of this pack's object index entries. The ingest session
+ * writes the pack index from it (files) or uses it to enumerate the received
+ * objects; the caller frees the returned array.
+ */
+static struct pack_idx_entry **build_idx_objects(void)
 {
-	const char *tmpfile;
 	struct pack_idx_entry **idx, **c, **last;
 	struct object_entry *e;
 	struct object_entry_pool *o;
 
-	/* Build the table of object IDs. */
 	ALLOC_ARRAY(idx, object_count);
 	c = idx;
 	for (o = blocks; o; o = o->next_pool)
@@ -805,36 +818,7 @@ static const char *create_index(void)
 	if (c != last)
 		die(_("internal consistency error creating the index"));
 
-	tmpfile = write_idx_file(the_repository, NULL, idx, object_count,
-				 &pack_idx_opts, pack_data->hash);
-	free(idx);
-	return tmpfile;
-}
-
-static char *keep_pack(const char *curr_index_name)
-{
-	static const char *keep_msg = "fast-import";
-	struct strbuf name = STRBUF_INIT;
-	int keep_fd;
-
-	odb_pack_name(pack_data->repo, &name, pack_data->hash, "keep");
-	keep_fd = safe_create_file_with_leading_directories(pack_data->repo,
-							    name.buf);
-	if (keep_fd < 0)
-		die_errno(_("cannot create keep file"));
-	write_or_die(keep_fd, keep_msg, strlen(keep_msg));
-	if (close(keep_fd))
-		die_errno(_("failed to write keep file"));
-
-	odb_pack_name(pack_data->repo, &name, pack_data->hash, "pack");
-	if (finalize_object_file(pack_data->repo, pack_data->pack_name, name.buf))
-		die(_("cannot store pack file"));
-
-	odb_pack_name(pack_data->repo, &name, pack_data->hash, "idx");
-	if (finalize_object_file(pack_data->repo, curr_index_name, name.buf))
-		die(_("cannot store index file"));
-	free((void *)curr_index_name);
-	return strbuf_detach(&name, NULL);
+	return idx;
 }
 
 static void unkeep_all_packs(void)
@@ -850,23 +834,6 @@ static void unkeep_all_packs(void)
 	strbuf_release(&name);
 }
 
-static int loosen_small_pack(const struct packed_git *p)
-{
-	struct child_process unpack = CHILD_PROCESS_INIT;
-
-	if (lseek(p->pack_fd, 0, SEEK_SET) < 0)
-		die_errno(_("failed seeking to start of '%s'"), p->pack_name);
-
-	unpack.in = p->pack_fd;
-	unpack.git_cmd = 1;
-	unpack.stdout_to_stderr = 1;
-	strvec_push(&unpack.args, "unpack-objects");
-	if (!show_stats)
-		strvec_push(&unpack.args, "-q");
-
-	return run_command(&unpack);
-}
-
 static void end_packfile(void)
 {
 	static int running;
@@ -877,10 +844,10 @@ static void end_packfile(void)
 	running = 1;
 	clear_delta_base_cache();
 	if (object_count) {
-		struct odb_source_files *files = odb_source_files_downcast(pack_data->repo->objects->sources);
 		struct packed_git *new_p;
 		struct object_id cur_pack_oid;
-		char *idx_name;
+		struct pack_idx_entry **idx;
+		struct odb_received_pack received_pack;
 		int i;
 		struct branch *b;
 		struct tag *t;
@@ -892,46 +859,73 @@ static void end_packfile(void)
 					 object_count, cur_pack_oid.hash,
 					 pack_size);
 
-		if (object_count <= unpack_limit) {
-			if (!loosen_small_pack(pack_data)) {
-				invalidate_pack_id(pack_id);
-				goto discard_pack;
-			}
-		}
+		/*
+		 * Stream large blobs to the session (no-op for the files source)
+		 * while the pack fd is still open, before handing it to commit.
+		 */
+		feed_streamed_blobs();
 
 		close(pack_data->pack_fd);
-		idx_name = keep_pack(create_index());
 
-		/* Register the packfile with core git's machinery. */
-		new_p = packfile_store_load_pack(files->packed, idx_name, 1);
-		if (!new_p)
-			die(_("core Git rejected index %s"), idx_name);
-		all_packs[pack_id] = new_p;
-		free(idx_name);
+		/*
+		 * Hand the built pack to the primary source to install: the
+		 * files source keeps it as a packfile (loosening it to loose
+		 * objects when it holds at most unpack_limit objects), while a
+		 * non-files source (e.g. a helper) explodes the objects fed to
+		 * the session during the import. The commit consumes the
+		 * temporary pack (renaming it into place, or discarding it once
+		 * the objects are stored individually), and returns the
+		 * installed packfile, or NULL when nothing was kept as a pack.
+		 */
+		idx = build_idx_objects();
+		received_pack = (struct odb_received_pack){
+			.pack_tmp_name = pack_data->pack_name,
+			.pack_hash = pack_data->hash,
+			.objects = idx,
+			.nr_objects = object_count,
+			.idx_opts = &pack_idx_opts,
+			.keep_msg = "fast-import",
+		};
+		odb_pack_ingest_set_loosen_if_at_most(pack_ingest, unpack_limit);
+		new_p = odb_pack_ingest_commit(pack_ingest, &received_pack, NULL);
+		pack_ingest = NULL;
+		free(idx);
 
-		/* Print the boundary */
-		if (pack_edges) {
-			fprintf(pack_edges, "%s:", new_p->pack_name);
-			for (i = 0; i < branch_table_sz; i++) {
-				for (b = branch_table[i]; b; b = b->table_next_branch) {
-					if (b->pack_id == pack_id)
-						fprintf(pack_edges, " %s",
-							oid_to_hex(&b->oid));
+		if (new_p) {
+			all_packs[pack_id] = new_p;
+
+			/* Print the boundary */
+			if (pack_edges) {
+				fprintf(pack_edges, "%s:", new_p->pack_name);
+				for (i = 0; i < branch_table_sz; i++) {
+					for (b = branch_table[i]; b; b = b->table_next_branch) {
+						if (b->pack_id == pack_id)
+							fprintf(pack_edges, " %s",
+								oid_to_hex(&b->oid));
+					}
 				}
+				for (t = first_tag; t; t = t->next_tag) {
+					if (t->pack_id == pack_id)
+						fprintf(pack_edges, " %s",
+							oid_to_hex(&t->oid));
+				}
+				fputc('\n', pack_edges);
+				fflush(pack_edges);
 			}
-			for (t = first_tag; t; t = t->next_tag) {
-				if (t->pack_id == pack_id)
-					fprintf(pack_edges, " %s",
-						oid_to_hex(&t->oid));
-			}
-			fputc('\n', pack_edges);
-			fflush(pack_edges);
-		}
 
-		pack_id++;
+			pack_id++;
+		} else {
+			/*
+			 * The objects were stored individually (loosened on
+			 * files, or exploded into a non-files backend); no
+			 * packfile was installed, so later reads resolve them
+			 * through the object database. pack_id is not consumed,
+			 * exactly as a loosened small pack was handled before.
+			 */
+			invalidate_pack_id(pack_id);
+		}
 	}
 	else {
-discard_pack:
 		close(pack_data->pack_fd);
 		unlink_or_warn(pack_data->pack_name);
 	}
@@ -957,7 +951,6 @@ static int store_object(
 	struct object_id *oidout,
 	uintmax_t mark)
 {
-	struct odb_source *source;
 	void *out, *delta;
 	struct object_entry *e;
 	unsigned char hdr[96];
@@ -983,11 +976,7 @@ static int store_object(
 		return 1;
 	}
 
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-
-		if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
-			continue;
+	if (has_object_pack(the_repository, &oid)) {
 		e->type = type;
 		e->pack_id = MAX_PACK_ID;
 		e->idx.offset = 1; /* just not zero! */
@@ -1083,6 +1072,17 @@ static int store_object(
 
 	free(out);
 	free(delta);
+
+	/*
+	 * Hand the resolved object to the pack-ingest session (begun lazily):
+	 * the files source ignores it and keeps the pack, a helper writes it
+	 * into its store. Deltas are stored in the pack, but the session is fed
+	 * the full object content.
+	 */
+	if (!pack_ingest)
+		pack_ingest = odb_source_begin_pack_ingest(the_repository->objects);
+	odb_pack_ingest_object(pack_ingest, &oid, type, dat->buf, dat->len);
+
 	if (last) {
 		if (last->no_swap) {
 			last->data = *dat;
@@ -1102,12 +1102,99 @@ static void truncate_pack(struct hashfile_checkpoint *checkpoint)
 	pack_size = checkpoint->offset;
 }
 
+/*
+ * Large blobs are streamed straight into the pack, never held in memory. When a
+ * non-files backend installs the pack by exploding it, those blobs must still
+ * reach the ingest session, so record each one's location in the pack and
+ * stream it back out at end_packfile() (without materializing it). A files
+ * source ignores the stream and keeps the pack whole.
+ */
+struct streamed_blob {
+	struct object_id oid;
+	off_t size;	/* inflated object size */
+	off_t from;	/* deflated data offset in the pack */
+	off_t len;	/* deflated byte length */
+};
+static struct streamed_blob *streamed_blobs;
+static size_t streamed_blobs_nr, streamed_blobs_alloc;
+
+struct streamed_blob_source {
+	git_zstream zstream;
+	off_t from;
+	off_t len;
+	int status;
+	unsigned char inbuf[64 * 1024];
+};
+
+static ssize_t feed_streamed_blob(struct odb_write_stream *stream,
+				  unsigned char *buf, size_t buf_len)
+{
+	struct streamed_blob_source *d = stream->data;
+	git_zstream *zs = &d->zstream;
+
+	if (stream->is_finished)
+		return 0;
+
+	zs->next_out = buf;
+	zs->avail_out = buf_len;
+
+	while (zs->avail_out == buf_len) {
+		if (!zs->avail_in && d->len) {
+			ssize_t n = d->len < (off_t)sizeof(d->inbuf) ?
+				(ssize_t)d->len : (ssize_t)sizeof(d->inbuf);
+			n = xpread(pack_data->pack_fd, d->inbuf, n, d->from);
+			if (n < 0)
+				die_errno(_("cannot pread pack file"));
+			if (!n)
+				die(_("premature end of pack file"));
+			d->from += n;
+			d->len -= n;
+			zs->next_in = d->inbuf;
+			zs->avail_in = n;
+		}
+
+		d->status = git_inflate(zs, 0);
+		if (d->status != Z_OK) {
+			stream->is_finished = 1;
+			break;
+		}
+		if (!zs->avail_in && !d->len)
+			break;
+	}
+
+	return buf_len - zs->avail_out;
+}
+
+/*
+ * Stream the pack's recorded large blobs to the ingest session (a no-op for the
+ * files source). Reads them back out of the finalized pack, so it must run
+ * while the pack file descriptor is still open.
+ */
+static void feed_streamed_blobs(void)
+{
+	size_t i;
+
+	for (i = 0; i < streamed_blobs_nr; i++) {
+		struct streamed_blob *b = &streamed_blobs[i];
+		struct streamed_blob_source d = { .from = b->from, .len = b->len };
+		struct odb_write_stream stream = {
+			.read = feed_streamed_blob,
+			.data = &d,
+		};
+
+		git_inflate_init(&d.zstream);
+		odb_pack_ingest_object_stream(pack_ingest, &b->oid, OBJ_BLOB,
+					      &stream, b->size);
+		git_inflate_end(&d.zstream);
+	}
+	streamed_blobs_nr = 0;
+}
+
 static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 {
 	size_t in_sz = 64 * 1024, out_sz = 64 * 1024;
 	unsigned char *in_buf = xmalloc(in_sz);
 	unsigned char *out_buf = xmalloc(out_sz);
-	struct odb_source *source;
 	struct object_entry *e;
 	struct object_id oid;
 	unsigned long hdrlen;
@@ -1116,6 +1203,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	git_zstream s;
 	struct hashfile_checkpoint checkpoint;
 	int status = Z_OK;
+	off_t orig_len = len;
 
 	/* Determine if we should auto-checkpoint. */
 	if ((max_packsize
@@ -1190,11 +1278,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 		goto out;
 	}
 
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-
-		if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
-			continue;
+	if (has_object_pack(the_repository, &oid)) {
 		e->type = OBJ_BLOB;
 		e->pack_id = MAX_PACK_ID;
 		e->idx.offset = 1; /* just not zero! */
@@ -1210,6 +1294,20 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	e->idx.crc32 = crc32_end(pack_file);
 	object_count++;
 	object_count_by_type[OBJ_BLOB]++;
+
+	/*
+	 * Record the blob so end_packfile() can stream it to a backend that
+	 * explodes the pack (it stays in the pack for the files source). The
+	 * session is begun lazily here too, since a pack may hold only blobs.
+	 */
+	if (!pack_ingest)
+		pack_ingest = odb_source_begin_pack_ingest(the_repository->objects);
+	ALLOC_GROW(streamed_blobs, streamed_blobs_nr + 1, streamed_blobs_alloc);
+	oidcpy(&streamed_blobs[streamed_blobs_nr].oid, &oid);
+	streamed_blobs[streamed_blobs_nr].size = orig_len;
+	streamed_blobs[streamed_blobs_nr].from = offset + hdrlen;
+	streamed_blobs[streamed_blobs_nr].len = pack_size - offset - hdrlen;
+	streamed_blobs_nr++;
 
 out:
 	free(in_buf);
