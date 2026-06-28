@@ -1,0 +1,363 @@
+#!/bin/sh
+#
+# Minimal "git-local-testgit" storage helper for exercising the local helper
+# backends end to end. Speaks the line protocol on stdin/stdout (see helper.h)
+# and handles both object and ref storage in one binary, matching how a real
+# helper does. State is kept as plain files under the
+# directory the helper is spawned with: objects in helper-objects/, refs in
+# helper-refs/, reflogs in helper-reflogs/ (refnames encode '/' as '_').
+
+OBJDIR="$1/helper-objects"
+REFDIR="$1/helper-refs"
+REFLOGDIR="$1/helper-reflogs"
+mkdir -p "$OBJDIR" "$REFDIR" "$REFLOGDIR"
+
+TXUPDATES=
+
+# When set, append every received command line here so a test can assert the
+# wire behavior (e.g. that a missed read is followed by a "refresh" and retry).
+LOG="${GIT_LOCAL_TESTGIT_LOG:-}"
+
+while IFS= read -r line
+do
+	test -n "$LOG" && printf '%s\n' "$line" >>"$LOG"
+	case "$line" in
+	capabilities)
+		printf '%s\n' get put put-stream have info list-objects \
+			promisor refresh optimize verify prune \
+			read list transaction create remove \
+			reflog reflog-read-reverse ""
+		;;
+	info\ *)
+		oid="${line#info }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			cat "$OBJDIR/$oid.meta"
+		else
+			echo missing
+		fi
+		;;
+	get\ *)
+		oid="${line#get }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			cat "$OBJDIR/$oid.meta"
+			cat "$OBJDIR/$oid"
+		else
+			echo missing
+		fi
+		;;
+	put\ *)
+		# put <oid> <type> <size>
+		set -- $line
+		oid="$2" type="$3" size="$4"
+		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		head -c "$size" >"$OBJDIR/$oid"
+		echo "$oid"
+		;;
+	put-stream\ *)
+		# put-stream <type> <size>; the helper hashes the content
+		set -- $line
+		type="$2" size="$3"
+		tmp=$(mktemp "$OBJDIR/tmp.XXXXXX")
+		head -c "$size" >"$tmp"
+		oid=$(git hash-object -t "$type" --stdin <"$tmp")
+		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		mv "$tmp" "$OBJDIR/$oid"
+		echo "$oid"
+		;;
+	have\ *)
+		oid="${line#have }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			echo true
+		else
+			echo false
+		fi
+		;;
+	list-objects | list-objects\ *)
+		# An optional "--promisor-only" restricts the listing to objects
+		# marked by the "promisor" command (see below). An optional trailing
+		# hex prefix (the last non-flag token) scopes the listing to oids
+		# beginning with it, for abbreviation/disambiguation.
+		promisor_only=
+		case "$line" in
+		*--promisor-only*) promisor_only=t ;;
+		esac
+		prefix=
+		for tok in $line
+		do
+			case "$tok" in
+			list-objects | --*) ;;
+			*) prefix=$tok ;;
+			esac
+		done
+		for meta in "$OBJDIR"/*.meta
+		do
+			test -f "$meta" || continue
+			oid=$(basename "$meta" .meta)
+			if test -n "$promisor_only" && ! test -f "$OBJDIR/$oid.promisor"
+			then
+				continue
+			fi
+			case "$oid" in
+			"$prefix"*) ;;
+			*) continue ;;
+			esac
+			read -r type size <"$meta"
+			printf '%s %s %s\n' "$oid" "$type" "$size"
+		done
+		echo ""
+		;;
+	promisor)
+		# Mark each listed object (one OID per line, blank-terminated) as
+		# a promisor object by dropping an "<oid>.promisor" marker.
+		while IFS= read -r oid
+		do
+			test -n "$oid" || break
+			: >"$OBJDIR/$oid.promisor"
+		done
+		echo ok
+		;;
+	optimize)
+		# Optimize the object storage. This file-based helper has nothing
+		# to compact (a real helper compacts its backing store); the
+		# command is logged above so a test can assert it was sent.
+		echo ok
+		;;
+	prune\ *)
+		# prune <dry_run> <expire>: two blank-terminated sections follow, the
+		# live kept-pack hashes then the unreachable candidate oids git found.
+		# git owns reachability and has already filtered the candidates to the
+		# unreachable set. A real helper additionally applies its own recorded
+		# last-used time against <expire> to honor the grace window; this stub
+		# keeps no such timestamp, so it prunes every candidate it is handed (the
+		# tests here prune at --prune=now, where every candidate qualifies, and
+		# grace-window behavior is covered against a real helper). It has no pack
+		# membership either, so it drains the keep section without consulting it.
+		# Pruned oids are echoed one per line, then "ok"; dry_run reports only.
+		set -- $line
+		dry_run="$2"
+		while IFS= read -r keptpack; do test -n "$keptpack" || break; done
+		while IFS= read -r poid
+		do
+			test -n "$poid" || break
+			test -f "$OBJDIR/$poid.meta" || continue
+			test "$dry_run" = 1 ||
+				rm -f "$OBJDIR/$poid" "$OBJDIR/$poid.meta" "$OBJDIR/$poid.promisor"
+			printf '%s\n' "$poid"
+		done
+		echo ok
+		;;
+	verify)
+		# Check the integrity of the backing store: every stored object
+		# must still hash to its name. A real helper does an equivalent
+		# backing-store check (e.g. a database integrity check); here we
+		# re-hash the object files. Reached from "git fsck".
+		rc=ok
+		for meta in "$OBJDIR"/*.meta
+		do
+			test -f "$meta" || continue
+			oid=$(basename "$meta" .meta)
+			read -r type size <"$meta"
+			got=$(git hash-object -t "$type" --stdin <"$OBJDIR/$oid" 2>/dev/null)
+			if test "$got" != "$oid"
+			then
+				rc="error backing-store object $oid is corrupt"
+				break
+			fi
+		done
+		echo "$rc"
+		;;
+	refresh)
+		# Reload any cached read view. This helper reads object and ref
+		# files live on every request, so there is nothing to reload; per
+		# the protocol the command produces no response (the backend sends
+		# it without waiting for one).
+		;;
+	read\ *)
+		refname="${line#read }"
+		file="$REFDIR/$(echo "$refname" | tr / _)"
+		if test -f "$file"
+		then
+			cat "$file"
+		else
+			echo missing
+		fi
+		;;
+	list|list\ *)
+		prefix="${line#list}"
+		prefix="${prefix# }"
+		for f in "$REFDIR"/*
+		do
+			test -f "$f" || continue
+			refname=$(basename "$f" | tr _ /)
+			case "$refname" in
+			"$prefix"*)
+				val=$(cat "$f")
+				case "$val" in
+				symref\ *)
+					echo "$refname symref ${val#symref }" ;;
+				*)
+					echo "$refname $val" ;;
+				esac
+				;;
+			esac
+		done | LC_ALL=C sort
+		echo ""
+		;;
+	create)
+		echo ok
+		;;
+	remove)
+		# Delete this helper's ref + reflog store on disk (the
+		# ref-storage migration "remove the old store" step). Objects
+		# live in a separate store and are left alone.
+		rm -rf "$REFDIR" "$REFLOGDIR"
+		echo ok
+		;;
+	transaction-begin)
+		TXUPDATES=
+		echo ok
+		;;
+	transaction-update\ *|transaction-create\ *|\
+	transaction-delete\ *|transaction-create-symref\ *)
+		TXUPDATES="$TXUPDATES
+$line"
+		echo ok
+		;;
+	transaction-prepare)
+		# Enforce the old-value preconditions the backend forwards
+		# (helper.h "Helper obligations"): an update or a non-zero-old
+		# delete must match the ref's current value; create force-sets.
+		# This is the race-free point to check, standing in for a real
+		# helper's lock. A here-doc keeps the loop in this shell so the
+		# error flag survives.
+		tx_err=
+		while IFS= read -r upd
+		do
+			test -z "$upd" && continue
+			set -- $upd
+			pcmd="$1" pref="$2"
+			pfile="$REFDIR/$(echo "$pref" | tr / _)"
+			pcur=
+			test -f "$pfile" && pcur=$(cat "$pfile")
+			case "$pcmd" in
+			transaction-update)
+				# An all-zero old value means "must not exist"
+				# (create); otherwise the ref must equal it.
+				case "$4" in
+				*[!0]*) test "$pcur" = "$4" ||
+					tx_err="ref '$pref' is at '$pcur', expected '$4'" ;;
+				*) test -z "$pcur" ||
+					tx_err="ref '$pref' already exists at '$pcur'" ;;
+				esac ;;
+			transaction-delete)
+				# A non-zero old value must match; all-zero is a force
+				# delete (no precondition).
+				case "$3" in
+				*[!0]*) test "$pcur" = "$3" ||
+					tx_err="ref '$pref' is at '$pcur', expected '$3'" ;;
+				esac ;;
+			esac
+		done <<EOF
+$TXUPDATES
+EOF
+		if test -n "$tx_err"
+		then
+			TXUPDATES=
+			printf 'error %s\n' "$tx_err"
+		else
+			echo ok
+		fi
+		;;
+	transaction-finish)
+		echo "$TXUPDATES" | while IFS= read -r upd
+		do
+			test -z "$upd" && continue
+			set -- $upd
+			cmd="$1" refname="$2"
+			file="$REFDIR/$(echo "$refname" | tr / _)"
+			case "$cmd" in
+			transaction-update|transaction-create)
+				echo "$3" >"$file" ;;
+			transaction-delete)
+				rm -f "$file" ;;
+			transaction-create-symref)
+				echo "symref $3" >"$file" ;;
+			esac
+		done
+		echo ok
+		;;
+	transaction-abort)
+		TXUPDATES=
+		echo ok
+		;;
+	reflog-read\ *)
+		refname="${line#reflog-read }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		test -f "$file" && cat "$file"
+		echo ""
+		;;
+	reflog-read-reverse\ *)
+		refname="${line#reflog-read-reverse }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		test -f "$file" && sed -n '1!G;h;$p' "$file"
+		echo ""
+		;;
+	reflog-append\ *)
+		rest="${line#reflog-append }"
+		refname="${rest%% *}"
+		entry="${rest#* }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		echo "$entry" >>"$file"
+		echo ok
+		;;
+	reflog-exists\ *)
+		refname="${line#reflog-exists }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		if test -f "$file"
+		then
+			echo true
+		else
+			echo false
+		fi
+		;;
+	reflog-delete\ *)
+		refname="${line#reflog-delete }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		rm -f "$file"
+		echo ok
+		;;
+	reflog-list)
+		for f in "$REFLOGDIR"/*
+		do
+			test -f "$f" || continue
+			basename "$f" | tr _ /
+		done
+		echo ""
+		;;
+	reflog-copy\ *)
+		# Carry a ref's reflog across on rename/copy. delete_old=1 moves it
+		# (rename), 0 duplicates it (copy); see helper.h. The new name has no
+		# reflog yet here, so appending old's entries keeps them ahead of the
+		# rename entry the backend appends next.
+		rest="${line#reflog-copy }"
+		set -- $rest
+		old="$1" new="$2" delete_old="$3"
+		oldfile="$REFLOGDIR/$(echo "$old" | tr / _)"
+		newfile="$REFLOGDIR/$(echo "$new" | tr / _)"
+		if test -f "$oldfile"
+		then
+			cat "$oldfile" >>"$newfile"
+			if test "$delete_old" = 1
+			then
+				rm -f "$oldfile"
+			fi
+		fi
+		echo ok
+		;;
+	"")
+		;;
+	esac
+done

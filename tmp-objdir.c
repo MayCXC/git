@@ -4,9 +4,6 @@
 #include "chdir-notify.h"
 #include "dir.h"
 #include "environment.h"
-#include "object-file.h"
-#include "path.h"
-#include "string-list.h"
 #include "strbuf.h"
 #include "strvec.h"
 #include "quote.h"
@@ -183,133 +180,30 @@ struct tmp_objdir *tmp_objdir_create(struct repository *r,
 	return t;
 }
 
-/*
- * Make sure we copy packfiles and their associated metafiles in the correct
- * order. All of these ends_with checks are slightly expensive to do in
- * the midst of a sorting routine, but in practice it shouldn't matter.
- * We will have a relatively small number of packfiles to order, and loose
- * objects exit early in the first line.
- */
-static int pack_copy_priority(const char *name)
-{
-	if (!starts_with(name, "pack"))
-		return 0;
-	if (ends_with(name, ".keep"))
-		return 1;
-	if (ends_with(name, ".pack"))
-		return 2;
-	if (ends_with(name, ".rev"))
-		return 3;
-	if (ends_with(name, ".idx"))
-		return 4;
-	return 5;
-}
-
-static int pack_copy_cmp(const char *a, const char *b)
-{
-	return pack_copy_priority(a) - pack_copy_priority(b);
-}
-
-static int read_dir_paths(struct string_list *out, const char *path)
-{
-	DIR *dh;
-	struct dirent *de;
-
-	dh = opendir(path);
-	if (!dh)
-		return -1;
-
-	while ((de = readdir(dh)))
-		if (de->d_name[0] != '.')
-			string_list_append(out, de->d_name);
-
-	closedir(dh);
-	return 0;
-}
-
-static int migrate_paths(struct tmp_objdir *t,
-			 struct strbuf *src, struct strbuf *dst,
-			 enum finalize_object_file_flags flags);
-
-static int migrate_one(struct tmp_objdir *t,
-		       struct strbuf *src, struct strbuf *dst,
-		       enum finalize_object_file_flags flags)
-{
-	struct stat st;
-
-	if (stat(src->buf, &st) < 0)
-		return -1;
-	if (S_ISDIR(st.st_mode)) {
-		if (!mkdir(dst->buf, 0777)) {
-			if (adjust_shared_perm(t->repo, dst->buf))
-				return -1;
-		} else if (errno != EEXIST)
-			return -1;
-		return migrate_paths(t, src, dst, flags);
-	}
-	return finalize_object_file_flags(t->repo, src->buf, dst->buf, flags);
-}
-
-static int is_loose_object_shard(const char *name)
-{
-	return strlen(name) == 2 && isxdigit(name[0]) && isxdigit(name[1]);
-}
-
-static int migrate_paths(struct tmp_objdir *t,
-			 struct strbuf *src, struct strbuf *dst,
-			 enum finalize_object_file_flags flags)
-{
-	size_t src_len = src->len, dst_len = dst->len;
-	struct string_list paths = STRING_LIST_INIT_DUP;
-	int ret = 0;
-
-	if (read_dir_paths(&paths, src->buf) < 0)
-		return -1;
-	paths.cmp = pack_copy_cmp;
-	string_list_sort(&paths);
-
-	for (size_t i = 0; i < paths.nr; i++) {
-		const char *name = paths.items[i].string;
-		enum finalize_object_file_flags flags_copy = flags;
-
-		strbuf_addf(src, "/%s", name);
-		strbuf_addf(dst, "/%s", name);
-
-		if (is_loose_object_shard(name))
-			flags_copy |= FOF_SKIP_COLLISION_CHECK;
-
-		ret |= migrate_one(t, src, dst, flags_copy);
-
-		strbuf_setlen(src, src_len);
-		strbuf_setlen(dst, dst_len);
-	}
-
-	string_list_clear(&paths, 0);
-	return ret;
-}
-
 int tmp_objdir_migrate(struct tmp_objdir *t)
 {
-	struct strbuf src = STRBUF_INIT, dst = STRBUF_INIT;
+	struct odb_source *primary;
 	int ret;
 
 	if (!t)
 		return 0;
 
 	if (t->prev_source) {
-		if (t->repo->objects->sources->will_destroy)
+		if (odb_primary_source(t->repo->objects)->will_destroy)
 			BUG("migrating an ODB that was marked for destruction");
 		odb_restore_primary_source(t->repo->objects, t->prev_source, t->path.buf);
 		t->prev_source = NULL;
 	}
 
-	strbuf_addbuf(&src, &t->path);
-	strbuf_addstr(&dst, repo_get_object_directory(t->repo));
-
-	ret = migrate_paths(t, &src, &dst, 0);
-
-	strbuf_release(&src);
-	strbuf_release(&dst);
+	/*
+	 * Hand the quarantine's accepted objects to the primary source to
+	 * incorporate. The files source renames the loose objects and packs into
+	 * its object directory in place; a source that stores objects in its own
+	 * medium (a helper) copies them in instead. Each reads the quarantine, a
+	 * files tmp-objdir, through its own backend.
+	 */
+	primary = odb_primary_source(t->repo->objects);
+	ret = primary->migrate_quarantine(primary, t->path.buf);
 
 	tmp_objdir_destroy(t);
 	return ret;

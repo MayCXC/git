@@ -1609,6 +1609,111 @@ static int odb_source_files_read_object_delta(struct odb_source *source,
 }
 
 /*
+ * Make sure we copy packfiles and their associated metafiles in the correct
+ * order. All of these ends_with checks are slightly expensive to do in
+ * the midst of a sorting routine, but in practice it shouldn't matter.
+ * We will have a relatively small number of packfiles to order, and loose
+ * objects exit early in the first line.
+ */
+static int files_pack_copy_priority(const char *name)
+{
+	if (!starts_with(name, "pack"))
+		return 0;
+	if (ends_with(name, ".keep"))
+		return 1;
+	if (ends_with(name, ".pack"))
+		return 2;
+	if (ends_with(name, ".rev"))
+		return 3;
+	if (ends_with(name, ".idx"))
+		return 4;
+	return 5;
+}
+
+static int files_pack_copy_cmp(const char *a, const char *b)
+{
+	return files_pack_copy_priority(a) - files_pack_copy_priority(b);
+}
+
+static int files_read_dir_paths(struct string_list *out, const char *path)
+{
+	DIR *dh;
+	struct dirent *de;
+
+	dh = opendir(path);
+	if (!dh)
+		return -1;
+
+	while ((de = readdir(dh)))
+		if (de->d_name[0] != '.')
+			string_list_append(out, de->d_name);
+
+	closedir(dh);
+	return 0;
+}
+
+static int files_migrate_paths(struct repository *repo,
+			       struct strbuf *src, struct strbuf *dst,
+			       enum finalize_object_file_flags flags);
+
+static int files_migrate_one(struct repository *repo,
+			     struct strbuf *src, struct strbuf *dst,
+			     enum finalize_object_file_flags flags)
+{
+	struct stat st;
+
+	if (stat(src->buf, &st) < 0)
+		return -1;
+	if (S_ISDIR(st.st_mode)) {
+		if (!mkdir(dst->buf, 0777)) {
+			if (adjust_shared_perm(repo, dst->buf))
+				return -1;
+		} else if (errno != EEXIST)
+			return -1;
+		return files_migrate_paths(repo, src, dst, flags);
+	}
+	return finalize_object_file_flags(repo, src->buf, dst->buf, flags);
+}
+
+static int files_is_loose_object_shard(const char *name)
+{
+	return strlen(name) == 2 && isxdigit(name[0]) && isxdigit(name[1]);
+}
+
+static int files_migrate_paths(struct repository *repo,
+			       struct strbuf *src, struct strbuf *dst,
+			       enum finalize_object_file_flags flags)
+{
+	size_t src_len = src->len, dst_len = dst->len;
+	struct string_list paths = STRING_LIST_INIT_DUP;
+	int ret = 0;
+
+	if (files_read_dir_paths(&paths, src->buf) < 0)
+		return -1;
+	paths.cmp = files_pack_copy_cmp;
+	string_list_sort(&paths);
+
+	for (size_t i = 0; i < paths.nr; i++) {
+		const char *name = paths.items[i].string;
+		enum finalize_object_file_flags flags_copy = flags;
+
+		strbuf_addf(src, "/%s", name);
+		strbuf_addf(dst, "/%s", name);
+
+		if (files_is_loose_object_shard(name))
+			flags_copy |= FOF_SKIP_COLLISION_CHECK;
+
+		ret |= files_migrate_one(repo, src, dst, flags_copy);
+
+		strbuf_setlen(src, src_len);
+		strbuf_setlen(dst, dst_len);
+	}
+
+	string_list_clear(&paths, 0);
+	return ret;
+}
+
+/*
  * The files source supplies commit generations from a commit-graph file in its
  * object directory; a helper source supplies them from its store with no file.
  */
@@ -1617,11 +1722,235 @@ static int odb_source_files_provides_commit_generations(struct odb_source *sourc
 	return commit_graph_has_generations(source->odb->repo);
 }
 
+/*
+ * The local-clone object population: hardlink or copy the source repository's
+ * object files straight into this files source's object directory, the fast
+ * path "git clone" takes for a local source. Moved here from builtin/clone.c so
+ * it dispatches through the source vtable; a non-files backend declines and the
+ * objects arrive over the transport instead.
+ */
+static void odb_source_files_clone_mkdir(const char *pathname, mode_t mode)
+{
+	struct stat st;
+
+	if (!mkdir(pathname, mode))
+		return;
+	if (errno != EEXIST)
+		die_errno(_("failed to create directory '%s'"), pathname);
+	else if (stat(pathname, &st))
+		die_errno(_("failed to stat '%s'"), pathname);
+	else if (!S_ISDIR(st.st_mode))
+		die(_("%s exists and is not a directory"), pathname);
+}
+
+static void odb_source_files_copy_alternates(struct strbuf *src, const char *src_repo,
+					     struct object_database *odb)
+{
+	/*
+	 * Append the source's objects/info/alternates entries to the destination
+	 * (rather than copying bit-for-bit), preserving any "clone -s" entry and
+	 * turning relative paths absolute so they resolve in the new repository.
+	 */
+	FILE *in = xfopen(src->buf, "r");
+	struct strbuf line = STRBUF_INIT;
+
+	while (strbuf_getline(&line, in) != EOF) {
+		char *abs_path;
+		if (!line.len || line.buf[0] == '#')
+			continue;
+		if (is_absolute_path(line.buf)) {
+			odb_add_to_alternates_file(odb, line.buf);
+			continue;
+		}
+		abs_path = mkpathdup("%s/objects/%s", src_repo, line.buf);
+		if (!normalize_path_copy(abs_path, abs_path))
+			odb_add_to_alternates_file(odb, abs_path);
+		else
+			warning("skipping invalid relative alternate: %s/%s",
+				src_repo, line.buf);
+		free(abs_path);
+	}
+	strbuf_release(&line);
+	fclose(in);
+}
+
+static void odb_source_files_copy_or_link_directory(struct strbuf *src, struct strbuf *dest,
+						    const char *src_repo,
+						    struct object_database *odb,
+						    const struct odb_local_clone_opts *opts)
+{
+	int src_len, dest_len;
+	struct dir_iterator *iter;
+	int iter_status;
+	/* Local copy so a failed hardlink can fall back to copying for the rest. */
+	int no_hardlinks = opts->no_hardlinks;
+
+	/*
+	 * Refuse to copy directories not owned by us: the copy/hardlink code is
+	 * not prepared for an adversary racily swapping files for symlinks, and
+	 * hardlinking across user boundaries is unsafe (the linked files can be
+	 * rewritten by the other user).
+	 */
+	die_upon_dubious_ownership(NULL, NULL, src_repo);
+
+	odb_source_files_clone_mkdir(dest->buf, 0777);
+
+	iter = dir_iterator_begin(src->buf, DIR_ITERATOR_PEDANTIC);
+	if (!iter) {
+		if (errno == ENOTDIR) {
+			int saved_errno = errno;
+			struct stat st;
+
+			if (!lstat(src->buf, &st) && S_ISLNK(st.st_mode))
+				die(_("'%s' is a symlink, refusing to clone with --local"),
+				    src->buf);
+			errno = saved_errno;
+		}
+		die_errno(_("failed to start iterator over '%s'"), src->buf);
+	}
+
+	strbuf_addch(src, '/');
+	src_len = src->len;
+	strbuf_addch(dest, '/');
+	dest_len = dest->len;
+
+	while ((iter_status = dir_iterator_advance(iter)) == ITER_OK) {
+		strbuf_setlen(src, src_len);
+		strbuf_addstr(src, iter->relative_path);
+		strbuf_setlen(dest, dest_len);
+		strbuf_addstr(dest, iter->relative_path);
+
+		if (S_ISLNK(iter->st.st_mode))
+			die(_("symlink '%s' exists, refusing to clone with --local"),
+			    iter->relative_path);
+
+		if (S_ISDIR(iter->st.st_mode)) {
+			odb_source_files_clone_mkdir(dest->buf, 0777);
+			continue;
+		}
+
+		/* Files that cannot be copied bit-for-bit (the alternates list). */
+		if (!fspathcmp(iter->relative_path, "info/alternates")) {
+			odb_source_files_copy_alternates(src, src_repo, odb);
+			continue;
+		}
+
+		if (unlink(dest->buf) && errno != ENOENT)
+			die_errno(_("failed to unlink '%s'"), dest->buf);
+		if (!no_hardlinks) {
+			if (!link(src->buf, dest->buf)) {
+				struct stat st;
+
+				/*
+				 * Sanity-check the hardlink actually links to the
+				 * expected file (catches a time-of-check-time-of-use
+				 * swap of the source file).
+				 */
+				if (lstat(dest->buf, &st))
+					die(_("hardlink cannot be checked at '%s'"), dest->buf);
+				if (st.st_mode != iter->st.st_mode ||
+				    st.st_ino != iter->st.st_ino ||
+				    st.st_dev != iter->st.st_dev ||
+				    st.st_size != iter->st.st_size ||
+				    st.st_uid != iter->st.st_uid ||
+				    st.st_gid != iter->st.st_gid)
+					die(_("hardlink different from source at '%s'"), dest->buf);
+
+				continue;
+			}
+			if (opts->local_forced)
+				die_errno(_("failed to create link '%s'"), dest->buf);
+			no_hardlinks = 1;
+		}
+		if (copy_file_with_time(dest->buf, src->buf, 0666))
+			die_errno(_("failed to copy file to '%s'"), dest->buf);
+	}
+
+	if (iter_status != ITER_DONE) {
+		strbuf_setlen(src, src_len);
+		die(_("failed to iterate over '%s'"), src->buf);
+	}
+
+	dir_iterator_free(iter);
+}
+
+static int odb_source_files_local_clone(struct odb_source *source,
+					const char *src_repo,
+					const struct odb_local_clone_opts *opts)
+{
+	struct strbuf src = STRBUF_INIT;
+	struct strbuf cfg = STRBUF_INIT;
+	struct repository_format src_fmt = REPOSITORY_FORMAT_INIT;
+	int decline;
+
+	/*
+	 * The fast path below hardlinks or copies the source's loose objects and
+	 * packs straight off disk. A source whose objects live in a non-files
+	 * backend keeps none there, so the copy would silently produce a clone
+	 * with no objects; decline and let the caller fall back to the transport,
+	 * the same contract the no-op default uses for a destination backend that
+	 * cannot accept a local clone. The source is not instantiated here, only a
+	 * path, so its backend is read from its config at the selection boundary
+	 * (the way setup.c does) rather than dispatched through a vtable.
+	 */
+	get_common_dir(&cfg, src_repo);
+	strbuf_addstr(&cfg, "/config");
+	read_repository_format(&src_fmt, cfg.buf);
+	strbuf_release(&cfg);
+	decline = src_fmt.odb_source_name && *src_fmt.odb_source_name &&
+		  strcmp(src_fmt.odb_source_name, "files");
+	if (decline && opts->local_forced)
+		warning(_("source repository uses the %s object backend, ignoring --local"),
+			src_fmt.odb_source_name);
+	clear_repository_format(&src_fmt);
+	if (decline)
+		return -1;
+
+	get_common_dir(&src, src_repo);
+	strbuf_addstr(&src, "/objects");
+	if (opts->shared) {
+		odb_add_to_alternates_file(source->odb, src.buf);
+	} else {
+		struct strbuf dest = STRBUF_INIT;
+
+		/* The files source's path is its object directory. */
+		strbuf_addstr(&dest, source->path);
+		odb_source_files_copy_or_link_directory(&src, &dest, src_repo,
+							source->odb, opts);
+		strbuf_release(&dest);
+	}
+	strbuf_release(&src);
+	return 0;
+}
+
 /* The files source persists commit generations by writing the commit-graph file. */
 static int odb_source_files_store_commit_graph(struct odb_source *source UNUSED,
 					       struct write_commit_graph_context *ctx)
 {
 	return write_commit_graph_to_file(ctx);
+}
+
+/*
+ * Migrate a push quarantine into this files source: rename the loose objects
+ * and packs into the object directory in place. A push always stages in a files
+ * quarantine (a tmp-objdir) so the connectivity check and pre-receive hook,
+ * separate processes that cannot see an uncommitted transaction, can read the
+ * objects before acceptance; on accept they move here. A source that stores
+ * objects in its own medium (a helper), having no object directory to rename
+ * into, overrides this to copy the accepted objects in instead.
+ */
+static int odb_source_files_migrate_quarantine(struct odb_source *source,
+					       const char *quarantine_path)
+{
+	struct strbuf src = STRBUF_INIT, dst = STRBUF_INIT;
+	int ret;
+
+	strbuf_addstr(&src, quarantine_path);
+	strbuf_addstr(&dst, source->path);
+	ret = files_migrate_paths(source->odb->repo, &src, &dst, 0);
+	strbuf_release(&src);
+	strbuf_release(&dst);
+	return ret;
 }
 
 struct odb_source_files *odb_source_files_new(struct object_database *odb,
@@ -1674,7 +2003,9 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.mark_objects_promisor = odb_source_files_mark_objects_promisor;
 	files->base.read_alternates = odb_source_files_read_alternates;
 	files->base.write_alternate = odb_source_files_write_alternate;
+	files->base.migrate_quarantine = odb_source_files_migrate_quarantine;
 	files->base.provides_commit_generations = odb_source_files_provides_commit_generations;
+	files->base.local_clone = odb_source_files_local_clone;
 	files->base.store_commit_graph = odb_source_files_store_commit_graph;
 
 	/*
