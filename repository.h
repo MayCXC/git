@@ -60,6 +60,7 @@ struct repository {
 	 */
 	struct object_database *objects;
 
+	struct helper_process *odb_local_helper;
 	/* The helper process serving refs when the ref backend is the helper. */
 	struct helper_process *ref_local_helper;
 
