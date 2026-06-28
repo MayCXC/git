@@ -49,7 +49,7 @@ void test_odb_inmemory__cleanup(void)
 void test_odb_inmemory__new(void)
 {
 	struct odb_source_inmemory *source = odb_source_inmemory_new(odb);
-	cl_assert_equal_i(source->base.type, ODB_SOURCE_INMEMORY);
+	cl_assert_equal_p(source->base.odb, odb);
 	odb_source_free(&source->base);
 }
 

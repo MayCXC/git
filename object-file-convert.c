@@ -7,6 +7,7 @@
 #include "repository.h"
 #include "hash.h"
 #include "object.h"
+#include "object-file.h"
 #include "loose.h"
 #include "commit.h"
 #include "gpg-interface.h"
@@ -45,6 +46,38 @@ int repo_oid_to_algop(struct repository *repo, const struct object_id *srcoid,
 		repo_read_loose_object_map(repo);
 		if (repo_loose_object_map_oid(repo, src, to, dest))
 			return -1;
+	}
+	return 0;
+}
+
+int repo_compute_compat_oid(struct repository *repo,
+			    const void *buf, unsigned long len,
+			    enum object_type type,
+			    struct object_id *compat_oid)
+{
+	const struct git_hash_algo *algo = repo->hash_algo;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
+
+	if (!compat)
+		return -1;
+
+	/*
+	 * A blob's bytes are identical under either algorithm, so only its hash
+	 * changes; every other object type embeds object ids that must first be
+	 * rewritten into the compat algorithm before hashing.
+	 */
+	if (type == OBJ_BLOB) {
+		hash_object_file(compat, buf, len, type, compat_oid);
+	} else {
+		struct strbuf converted = STRBUF_INIT;
+		if (convert_object_file(repo, &converted, algo, compat,
+					buf, len, type, 0)) {
+			strbuf_release(&converted);
+			return -1;
+		}
+		hash_object_file(compat, converted.buf, converted.len,
+				 type, compat_oid);
+		strbuf_release(&converted);
 	}
 	return 0;
 }

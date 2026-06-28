@@ -1,15 +1,42 @@
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "chdir-notify.h"
+#include "commit-graph.h"
+#include "config.h"
+#include "copy.h"
+#include "dir.h"
+#include "dir-iterator.h"
 #include "gettext.h"
+#include "iterator.h"
+#include "setup.h"
+#include "hex.h"
+#include "loose.h"
+#include "list-objects-filter-options.h"
 #include "lockfile.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/pack-ingest.h"
 #include "odb/source.h"
 #include "odb/source-files.h"
 #include "odb/source-loose.h"
+#include "oidset.h"
+#include "pack-bitmap.h"
+#include "midx.h"
+#include "pack.h"
 #include "packfile.h"
+#include "pack-mtimes.h"
+#include "pack-objects.h"
+#include "pack-revindex.h"
+#include "path.h"
+#include "pack-revindex.h"
+#include "repack.h"
+#include "repo-settings.h"
+#include "run-command.h"
+#include "fsck.h"
 #include "strbuf.h"
+#include "string-list.h"
+#include "strvec.h"
+#include "wrapper.h"
 #include "write-or-die.h"
 
 static void odb_source_files_reparent(const char *name UNUSED,
@@ -24,10 +51,27 @@ static void odb_source_files_reparent(const char *name UNUSED,
 	files->base.path = path;
 }
 
+static void odb_source_files_unregister(struct odb_source_files *files)
+{
+	struct object_database *odb = files->base.odb;
+	struct odb_source_files **pp;
+
+	for (pp = &odb->files_sources; *pp; pp = &(*pp)->next_files) {
+		if (*pp != files)
+			continue;
+		*pp = files->next_files;
+		if (odb->files_sources_tail == &files->next_files)
+			odb->files_sources_tail = pp;
+		files->next_files = NULL;
+		return;
+	}
+}
+
 static void odb_source_files_free(struct odb_source *source)
 {
 	struct odb_source_files *files = odb_source_files_downcast(source);
 	chdir_notify_unregister(NULL, odb_source_files_reparent, files);
+	odb_source_files_unregister(files);
 	odb_source_free(&files->loose->base);
 	packfile_store_free(files->packed);
 	odb_source_release(&files->base);
@@ -267,7 +311,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	struct odb_source_files *files;
 
 	CALLOC_ARRAY(files, 1);
-	odb_source_init(&files->base, odb, ODB_SOURCE_FILES, path, local);
+	odb_source_init(&files->base, odb, path, local);
 	files->loose = odb_source_loose_new(odb, path, local);
 	files->packed = packfile_store_new(&files->base);
 
@@ -293,6 +337,13 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	 */
 	if (!is_absolute_path(path))
 		chdir_notify_register(NULL, odb_source_files_reparent, files);
+
+	/*
+	 * Register in the odb's list of files sources so packfile machinery can
+	 * enumerate files sources without branching on the source type.
+	 */
+	*odb->files_sources_tail = files;
+	odb->files_sources_tail = &files->next_files;
 
 	return files;
 }

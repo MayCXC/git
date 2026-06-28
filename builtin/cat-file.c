@@ -20,7 +20,6 @@
 #include "userdiff.h"
 #include "oid-array.h"
 #include "packfile.h"
-#include "pack-bitmap.h"
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
@@ -655,8 +654,7 @@ static int batch_object_cb(const struct object_id *oid, void *vdata)
 }
 
 static int collect_object(const struct object_id *oid,
-			  struct packed_git *pack UNUSED,
-			  off_t offset UNUSED,
+			  struct object_info *oi UNUSED,
 			  void *data)
 {
 	oid_array_append(data, oid);
@@ -664,14 +662,26 @@ static int collect_object(const struct object_id *oid,
 }
 
 static int batch_unordered_object(const struct object_id *oid,
-				  struct packed_git *pack,
-				  off_t offset,
+				  struct object_info *oi,
 				  void *vdata)
 {
 	struct object_cb_data *data = vdata;
+	struct packed_git *pack = NULL;
+	off_t offset = 0;
 
 	if (oidset_insert(data->seen, oid))
 		return 0;
+
+	/*
+	 * The enumeration provides the on-disk location (see
+	 * ODB_FOR_EACH_OBJECT_PROVIDE_LOCATION) for packed objects, so pass it
+	 * to batch_object_write() for the pack fast path; loose and other
+	 * objects carry no location and are looked up by oid.
+	 */
+	if (oi && oi->whence == OI_PACKED) {
+		pack = oi->u.packed.pack;
+		offset = oi->u.packed.offset;
+	}
 
 	oidcpy(&data->expand->oid, oid);
 	batch_object_write(NULL, data->scratch, data->opt, data->expand,
@@ -826,103 +836,28 @@ static void batch_objects_command(struct batch_options *opt,
 
 #define DEFAULT_FORMAT "%(objectname) %(objecttype) %(objectsize)"
 
-typedef int (*for_each_object_fn)(const struct object_id *oid, struct packed_git *pack,
-				  off_t offset, void *data);
-
-struct for_each_object_payload {
-	for_each_object_fn callback;
-	void *payload;
-};
-
-static int batch_one_object_oi(const struct object_id *oid,
-			       struct object_info *oi,
-			       void *_payload)
-{
-	struct for_each_object_payload *payload = _payload;
-	if (oi && oi->whence == OI_PACKED)
-		return payload->callback(oid, oi->u.packed.pack, oi->u.packed.offset,
-					 payload->payload);
-	return payload->callback(oid, NULL, 0, payload->payload);
-}
-
-static int batch_one_object_packed(const struct object_id *oid,
-				   struct packed_git *pack,
-				   uint32_t pos,
-				   void *_payload)
-{
-	struct for_each_object_payload *payload = _payload;
-	return payload->callback(oid, pack, nth_packed_object_offset(pack, pos),
-				 payload->payload);
-}
-
-static int batch_one_object_bitmapped(const struct object_id *oid,
-				      enum object_type type UNUSED,
-				      int flags UNUSED,
-				      uint32_t hash UNUSED,
-				      struct packed_git *pack,
-				      off_t offset,
-				      void *_payload)
-{
-	struct for_each_object_payload *payload = _payload;
-	return payload->callback(oid, pack, offset, payload->payload);
-}
-
 static void batch_each_object(struct batch_options *opt,
-			      for_each_object_fn callback,
+			      odb_for_each_object_cb callback,
 			      unsigned flags,
-			      void *_payload)
+			      void *cb_data)
 {
-	struct for_each_object_payload payload = {
-		.callback = callback,
-		.payload = _payload,
-	};
 	struct odb_for_each_object_options opts = {
 		.flags = flags,
+		.objects_filter = &opt->objects_filter,
 	};
-	struct bitmap_index *bitmap = NULL;
-	struct odb_source *source;
 
 	/*
-	 * TODO: we still need to tap into implementation details of the object
-	 * database sources. Ideally, we should extend `odb_for_each_object()`
-	 * to handle object filters itself so that we can move the filtering
-	 * logic into the individual sources.
+	 * Enumerate every object through the source vtable, handing each one's
+	 * object_info straight to the callback. The objects filter is handed
+	 * down as an optimization hint a source may honor (the files source
+	 * uses a pack bitmap to skip filtered objects); it is still applied
+	 * authoritatively per object as each is written, so the hint only ever
+	 * affects performance, not the set of objects iterated over. A callback
+	 * that wants the packed fast path asks for ODB_FOR_EACH_OBJECT_PROVIDE_
+	 * LOCATION in its flags and reads the location from the object_info.
 	 */
-	odb_prepare_alternates(the_repository->objects);
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		int ret = odb_source_for_each_object(&files->loose->base, NULL, batch_one_object_oi,
-						     &payload, &opts);
-		if (ret)
-			break;
-	}
-
-	if (opt->objects_filter.choice != LOFC_DISABLED &&
-	    (bitmap = prepare_bitmap_git(the_repository)) &&
-	    !for_each_bitmapped_object(bitmap, &opt->objects_filter,
-				       batch_one_object_bitmapped, &payload)) {
-		struct packed_git *pack;
-
-		repo_for_each_pack(the_repository, pack) {
-			if (bitmap_index_contains_pack(bitmap, pack) ||
-			    open_pack_index(pack))
-				continue;
-			for_each_object_in_pack(pack, batch_one_object_packed,
-						&payload, flags);
-		}
-	} else {
-		struct object_info oi = { 0 };
-
-		for (source = the_repository->objects->sources; source; source = source->next) {
-			struct odb_source_files *files = odb_source_files_downcast(source);
-			int ret = packfile_store_for_each_object(files->packed, &oi,
-								 batch_one_object_oi, &payload, &opts);
-			if (ret)
-				break;
-		}
-	}
-
-	free_bitmap_index(bitmap);
+	odb_for_each_object_ext(the_repository->objects, NULL,
+				callback, cb_data, &opts);
 }
 
 static int batch_objects(struct batch_options *opt)
@@ -979,7 +914,8 @@ static int batch_objects(struct batch_options *opt)
 			cb.seen = &seen;
 
 			batch_each_object(opt, batch_unordered_object,
-					  ODB_FOR_EACH_OBJECT_PACK_ORDER, &cb);
+					  ODB_FOR_EACH_OBJECT_PACK_ORDER |
+					  ODB_FOR_EACH_OBJECT_PROVIDE_LOCATION, &cb);
 
 			oidset_clear(&seen);
 		} else {

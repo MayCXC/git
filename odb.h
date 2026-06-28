@@ -8,6 +8,9 @@
 #include "thread-utils.h"
 
 struct cached_object_entry;
+struct list_objects_filter_options;
+struct loose_object_map;
+struct odb_source_files;
 struct odb_source_inmemory;
 struct packed_git;
 struct repository;
@@ -54,6 +57,47 @@ struct object_database {
 	struct odb_source *sources;
 	struct odb_source **sources_tail;
 	struct kh_odb_path_map *source_by_path;
+
+	/*
+	 * The subset of `sources` that store objects in packfiles: the files
+	 * sources (the primary when it uses the files backend, plus every
+	 * alternate, which are always files). It is maintained as files sources
+	 * are created and freed, so the decision of what is a files source stays
+	 * confined to the odb_source_new() factory; packfile machinery walks
+	 * this list and downcasts each member unconditionally, with no runtime
+	 * branch on the source type. Threaded via odb_source_files.next_files.
+	 */
+	struct odb_source_files *files_sources;
+	struct odb_source_files **files_sources_tail;
+
+	/*
+	 * The path to the main object directory as reported to the user (e.g.
+	 * via repo_get_object_directory()). It is set up front from the primary
+	 * source location and stays valid independently of which backend the
+	 * primary object source uses, so the reported path is available before
+	 * (and without) the primary source being created. May be relative, in
+	 * which case it is reparented when the working directory changes.
+	 *
+	 * It is the canonical main object directory and does not follow a
+	 * temporary primary swap (odb_set_temporary_primary_source(), used by
+	 * tmp-objdir for quarantine): a quarantine redirects writes through the
+	 * swapped primary source and exposes its directory via GIT_OBJECT_DIRECTORY,
+	 * but the repository's reported object directory stays the canonical one.
+	 */
+	char *object_dir;
+
+	/*
+	 * When the repository tracks a compatibility hash algorithm
+	 * (extensions.compatObjectFormat), this maps each object's storage id
+	 * to its equivalent under the compat algorithm and back. It is owned by
+	 * the object database, not by any one source: a compat object id is a
+	 * property of the object's bytes, and git (never a storage backend)
+	 * computes and records it. The on-disk form is a "loose-object-idx"
+	 * file per object directory (read from the primary object_dir and every
+	 * alternate, appended to at object_dir as objects are written through
+	 * any backend). NULL until first use. See loose.c.
+	 */
+	struct loose_object_map *compat_map;
 
 	int loaded_alternates;
 
@@ -190,6 +234,21 @@ int odb_mkstemp(struct object_database *odb,
 		struct strbuf *temp_filename, const char *pattern);
 
 /*
+ * Ensure the primary object source has been created. The primary source is
+ * created lazily because its backend type may be selected from configuration
+ * that is not yet available when the object database is first set up.
+ */
+void odb_prepare_sources(struct object_database *odb);
+
+/*
+ * Return the primary object source, creating it on first use. This is the
+ * canonical accessor for the primary (and thus for the head of the source
+ * list, whose remaining entries are the alternates); it guarantees the
+ * primary has been prepared. Mirrors get_main_ref_store() for the ref stores.
+ */
+struct odb_source *odb_primary_source(struct object_database *odb);
+
+/*
  * Prepare alternate object sources for the given database by reading
  * "objects/info/alternates" and opening the respective sources.
  */
@@ -215,6 +274,14 @@ void odb_add_to_alternates_file(struct object_database *odb,
  */
 struct odb_source *odb_add_to_alternates_memory(struct object_database *odb,
 						const char *dir);
+
+/*
+ * Return the source already registered for the given object directory path, or
+ * NULL if none is. Matches the path as registered (the same string passed when
+ * the source was added), not by filesystem normalization.
+ */
+struct odb_source *odb_find_source_by_path(struct object_database *odb,
+					   const char *path);
 
 /*
  * Read an object from the database. Returns the object data and assigns object
@@ -254,6 +321,16 @@ struct object_info {
 	unsigned long *sizep;
 	off_t *disk_sizep;
 	struct object_id *delta_base_oid;
+	/*
+	 * When the object is stored as a delta against delta_base_oid and the
+	 * source knows the raw (uncompressed) git-format delta length, it is
+	 * reported here: the companion to delta_base_oid that lets a caller set
+	 * up reuse of a stored delta (the pack-objects send path) without first
+	 * reading the delta bytes. Left untouched by sources that do not store
+	 * deltas individually (the files packfile path reports delta bases
+	 * through whence/u.packed instead).
+	 */
+	unsigned long *delta_size;
 	void **contentp;
 
 	/*
@@ -331,6 +408,16 @@ enum object_info_flags {
 	 * when `OBJECT_INFO_QUICK` was not passed.
 	 */
 	OBJECT_INFO_SECOND_READ = (1 << 4),
+
+	/*
+	 * Skip the in-memory source, which holds transient objects and
+	 * synthesizes the well-known empty tree and empty blob. Those are never
+	 * stored on disk, so a caller asking about an object's actual storage
+	 * (e.g. has_object_pack(), via object_info.whence) must consult only the
+	 * real sources; otherwise the synthesized answer would mask, say, an
+	 * empty tree that genuinely lives in a pack.
+	 */
+	OBJECT_INFO_SKIP_CACHED = (1 << 5),
 
 	/*
 	 * This is meant for bulk prefetching of missing blobs in a partial
@@ -430,6 +517,33 @@ enum odb_for_each_object_flags {
 
 	/* Only iterate over packs that do not have .keep files. */
 	ODB_FOR_EACH_OBJECT_SKIP_ON_DISK_KEPT_PACKS = (1<<4),
+
+	/*
+	 * Populate the callback's object_info with the object's on-disk
+	 * location (its `whence` and, for packed objects, the containing pack
+	 * and offset) without reading the object's contents, so a caller that
+	 * is going to read each object anyway can take a location-keyed fast
+	 * path. It is honored only where a location is available for free, i.e.
+	 * for packed objects; loose and other sources still pass a NULL
+	 * object_info when no read was requested. This lets the object commands
+	 * enumerate purely through the source vtable while keeping the
+	 * pack+offset hint that a hand-rolled loose/packed split would provide.
+	 */
+	ODB_FOR_EACH_OBJECT_PROVIDE_LOCATION = (1<<5),
+
+	/*
+	 * Iterate only over objects in the backend's consolidated bulk store,
+	 * skipping any transient per-object staging tier. Freshly written
+	 * objects may live in a staging tier before maintenance gathers them
+	 * into the bulk store: the files backend writes objects loose and only
+	 * later packs them, so it honors this by visiting just its packed
+	 * objects. A backend with no such staging tier (e.g. the helper) keeps
+	 * every object in its bulk store and so visits all of them. Callers that
+	 * build a cache derived from the settled object set (e.g. the
+	 * commit-graph) use this to avoid churning on not-yet-consolidated
+	 * objects.
+	 */
+	ODB_FOR_EACH_OBJECT_BULK_ONLY = (1<<6),
 };
 
 /*
@@ -458,6 +572,17 @@ struct odb_for_each_object_options {
 	 */
 	const struct object_id *prefix;
 	size_t prefix_hex_len;
+
+	/*
+	 * If set, an objects filter that enumeration may use to avoid yielding
+	 * objects the filter would exclude. This is a best-effort optimization
+	 * hint, not a guarantee: a source is free to ignore it, so the caller
+	 * remains responsible for applying the authoritative filter to the
+	 * objects it is handed. A source honors it only where it can prune
+	 * cheaply, e.g. the files source consults a pack bitmap. Only the
+	 * blob:none, blob:limit and object:type filters are meaningful here.
+	 */
+	struct list_objects_filter_options *objects_filter;
 };
 
 /*
@@ -509,6 +634,26 @@ int odb_count_objects(struct object_database *odb,
 		      unsigned long *out);
 
 /*
+ * The on-disk packfile layout of an object database, as reported by
+ * odb_count_packs(). This is a files-backend concept (packs, ".idx" sizes);
+ * sources without packfiles (e.g. a helper, which stores objects in its own
+ * backing store) contribute nothing, leaving the counters at zero. Used by
+ * "git count-objects -v" to describe the local pack layout.
+ */
+struct odb_pack_report {
+	unsigned long packs;
+	unsigned long objects;
+	off_t size;
+};
+
+/*
+ * Accumulate, into `report`, the local packfile layout of the object
+ * database's sources (the packs reported by dumb transports and pruners, i.e.
+ * those with a local on-disk pack). Sources with no packfiles add nothing.
+ */
+void odb_count_packs(struct object_database *odb, struct odb_pack_report *report);
+
+/*
  * Given an object ID, find the minimum required length required to make the
  * object ID unique across the whole object database.
  *
@@ -524,6 +669,173 @@ int odb_find_abbrev_len(struct object_database *odb,
 			int min_len,
 			unsigned *out);
 
+/*
+ * Flags controlling odb_optimize(). Mirrors the REFS_OPTIMIZE_* flags on the
+ * refs side (refs.h); the exact effect of each flag is up to the source.
+ *
+ * ODB_OPTIMIZE_PRUNE: also prune storage the optimization makes redundant
+ *                     (e.g. drop packs whose objects the repack subsumes).
+ * ODB_OPTIMIZE_AUTO:  optimize on a best-effort, heuristic basis (as with
+ *                     "gc --auto"); the source decides whether and how much
+ *                     work to do and may fall back to a full optimization.
+ */
+#define ODB_OPTIMIZE_PRUNE             (1 << 0)
+#define ODB_OPTIMIZE_AUTO              (1 << 1)
+#define ODB_OPTIMIZE_AGGRESSIVE        (1 << 2)
+#define ODB_OPTIMIZE_QUIET             (1 << 3)
+#define ODB_OPTIMIZE_KEEP_LARGEST_PACK (1 << 4)
+#define ODB_OPTIMIZE_CRUFT             (1 << 5)
+/*
+ * ODB_OPTIMIZE_GEOMETRIC: optimize by rolling packs up into a geometric
+ * progression (the analog of "git repack --geometric"), using
+ * `geometric_split_factor`. The files source decides per the pack geometry
+ * whether to merge a suffix of packs or, when every pack would be merged, to
+ * fall back to a full all-into-one repack (honoring the cruft/prune flags
+ * above). Sources with no packfiles ignore it and optimize their own storage.
+ */
+#define ODB_OPTIMIZE_GEOMETRIC         (1 << 6)
+/*
+ * ODB_OPTIMIZE_NO_KEEP_LARGEST_PACK: the caller explicitly asked not to keep
+ * the largest pack (git gc --no-keep-largest-pack), overriding any
+ * gc.bigPackThreshold the source would otherwise honor. Distinct from the flag
+ * being absent, which leaves the source to apply gc.bigPackThreshold.
+ */
+#define ODB_OPTIMIZE_NO_KEEP_LARGEST_PACK (1 << 7)
+/*
+ * ODB_OPTIMIZE_MIDX: optimize via multi-pack-index maintenance (the analog of
+ * the "incremental-repack" maintenance task): write the multi-pack-index,
+ * expire the packs it makes redundant, and repack small packs up to an
+ * automatically chosen batch size. The multi-pack-index is a files-pack
+ * concept, so the files source does this on its own packs; sources without one
+ * ignore it. ODB_OPTIMIZE_QUIET suppresses progress.
+ */
+#define ODB_OPTIMIZE_MIDX              (1 << 7)
+
+struct repack_opts;
+
+struct odb_optimize_opts {
+	unsigned int flags;
+	/* With ODB_OPTIMIZE_GEOMETRIC, the geometric progression factor. */
+	int geometric_split_factor;
+	/*
+	 * Prune unreachable objects older than this approxidate. NULL means do
+	 * not prune unreachable objects. How a source honors this is up to it;
+	 * the files source maps it onto repack's -a / --cruft-expiration.
+	 */
+	const char *prune_expire;
+	/*
+	 * With ODB_OPTIMIZE_CRUFT, write objects pruned by this optimization to
+	 * this destination (a pack prefix) instead of discarding them. NULL
+	 * means discard. Sources without a cruft concept ignore it.
+	 */
+	const char *expire_to;
+	/*
+	 * With ODB_OPTIMIZE_CRUFT, cap the size of a newly written cruft area;
+	 * 0 means unlimited. Sources without a cruft concept ignore it.
+	 */
+	unsigned long max_cruft_size;
+	/*
+	 * Fully-parsed repack options from "git repack" (command line plus
+	 * config). When set, the files source repacks with exactly these
+	 * instead of deriving maintenance defaults from config, the way
+	 * "git pack-refs" hands its parsed options to refs_optimize(). Other
+	 * sources have no pack concept and ignore it; it is NULL on the
+	 * "git gc" path, where the flags above drive the optimization.
+	 */
+	struct repack_opts *repack;
+};
+
+/*
+ * Optimize the storage of the object database's local sources. The exact
+ * behavior is up to each source: the files source repacks loose objects and
+ * packs, while a helper source asks the helper to optimize its own storage
+ * (for example by compacting its backing store). Alternates are borrowed read-only stores
+ * and are never optimized. Sources with nothing to optimize, such as the
+ * in-memory source, treat this as a no-op.
+ *
+ * Returns 0 on success, a negative error code otherwise.
+ */
+int odb_optimize(struct object_database *odb, struct odb_optimize_opts *opts);
+
+/*
+ * Report via `*required` whether any local source would benefit from a call to
+ * odb_optimize(). Used to decide whether automatic maintenance ("gc --auto")
+ * should run.
+ *
+ * Returns 0 on success, a negative error code otherwise.
+ */
+int odb_optimize_required(struct object_database *odb,
+			  struct odb_optimize_opts *opts,
+			  bool *required);
+
+struct fsck_options;
+
+/*
+ * Callback invoked by odb_verify() for each object an object source enumerates
+ * during verification. It receives the object's already-read raw contents so
+ * the caller can content-check it (parse it, walk its links, run the object
+ * fsck rules) and record that the object exists. It deliberately matches
+ * verify_fn (the callback verify_pack() uses), so a single per-object fsck
+ * handler serves loose, packed, and helper-backed objects alike.
+ *
+ * `buffer` may be NULL for a blob too large to hold in memory. Setting `*eaten`
+ * to non-zero hands buffer ownership to the callback, which the source must
+ * then not free. Returns 0 if the object is fine, non-zero on a problem; the
+ * source keeps iterating regardless so that a single bad object does not mask
+ * the rest.
+ */
+typedef int (*odb_verify_cb)(const struct object_id *oid,
+			     enum object_type type,
+			     unsigned long size,
+			     void *buffer, int *eaten,
+			     void *cb_data);
+
+/*
+ * Verify the integrity of the object database's stored objects (the storage
+ * side of "git fsck"): each source checks its own on-disk format - the files
+ * source scans loose objects, a helper source asks the helper to enumerate and
+ * to check its backing store. Each enumerated object's contents are passed to
+ * `cb` (typically the caller's per-object fsck handler) for content checking;
+ * storage-format problems are reported through the fsck_options callbacks.
+ * Returns 0 if every source verified clean, a negative error code otherwise.
+ */
+int odb_verify(struct object_database *odb, struct fsck_options *o,
+	       odb_verify_cb cb, void *cb_data);
+
+/*
+ * Tidy the cruft left in each local source's on-disk representation after
+ * "git prune" removed unreachable objects (stale temp files, empty fanout
+ * dirs, redundant loose objects). Dispatched per source: the files source
+ * sweeps its object directory; a source that stores objects in its own backing
+ * store (a helper) is a no-op. Temp files older than `expire` are removed;
+ * `dry_run` reports without removing and `verbose` reports what is removed.
+ */
+void odb_prune_cruft(struct object_database *odb, timestamp_t expire,
+		     int dry_run, int verbose);
+
+/*
+ * Record the given objects as promisor objects, so they and the absent
+ * objects they may reference are retained and never reported missing.
+ * Dispatches to each local source's mark_objects_promisor callback; sources
+ * with no promisor concept implement nothing and are skipped. Invoked after a
+ * promisor pack is ingested, both for the received objects (the generic
+ * pack-ingest commit) and for the local objects that pack references
+ * (index-pack).
+ */
+void odb_mark_objects_promisor(struct object_database *odb, struct oidset *oids);
+
+/*
+ * Report whether any source stores `oid` as a promisor object (received from a
+ * promisor remote). Dispatches to each source's backend, so it works whatever
+ * the primary backend is: the files source checks its ".promisor" packs, a
+ * helper reports its promisor-marked objects. The connectivity check uses this
+ * to skip a wanted ref tip that arrived in a promisor packfile. Returns
+ * non-zero if some source reports the object as promisor, 0 otherwise.
+ */
+int odb_is_promisor_object(struct object_database *odb,
+			   const struct object_id *oid);
+
+
 enum odb_write_object_flags {
 	/*
 	 * By default, `odb_write_object()` does not actually write anything
@@ -537,6 +849,18 @@ enum odb_write_object_flags {
 	 * Do not print an error in case something goes wrong.
 	 */
 	ODB_WRITE_OBJECT_SILENT = (1 << 1),
+
+	/*
+	 * Overwrite the object's stored representation in place rather than
+	 * keeping an existing copy. Set only by a pack-ingest session running in
+	 * repack mode (gc/repack re-deltifying a source's own objects), where the
+	 * source owns the object's representation the way files' repack owns its
+	 * packs; a normal write is always keep-existing. Sources whose objects are
+	 * content-addressed and immutable in representation (files loose objects)
+	 * ignore it; a source that stores a chosen representation (a helper storing
+	 * full-vs-delta) re-represents the object when it is set.
+	 */
+	ODB_WRITE_OBJECT_REPLACE = (1 << 2),
 };
 
 /*
@@ -553,6 +877,25 @@ int odb_write_object_ext(struct object_database *odb,
 			 struct object_id *oid,
 			 struct object_id *compat_oid,
 			 enum odb_write_object_flags flags);
+
+/*
+ * Store an object that git already prepared in its native pack form: the
+ * compressed entry bytes (`compressed`/`clen`) verbatim, `usize` their
+ * uncompressed length, `base_oid` the delta base (NULL for a whole object).
+ * `oid` is the (already known) object id; `resolved`/`resolved_size` are the
+ * reconstructed object, used to compute the compat-hash id and as the fallback
+ * payload (may be NULL only when the repo tracks no compat algorithm). The
+ * primary source stores the bytes via write_prepared with no compress/resolve;
+ * a source lacking write_prepared falls back to a resolved write. The recompress-
+ * free receive/migrate path. Returns 0 on success, negative on error.
+ */
+int odb_write_prepared_ext(struct object_database *odb,
+			   const struct object_id *oid,
+			   enum object_type type, unsigned long usize,
+			   const struct object_id *base_oid,
+			   const void *compressed, unsigned long clen,
+			   const void *resolved, unsigned long resolved_size,
+			   enum odb_write_object_flags flags);
 
 static inline int odb_write_object(struct object_database *odb,
 				   const void *buf, unsigned long len,

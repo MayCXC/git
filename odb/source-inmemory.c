@@ -306,7 +306,14 @@ static int odb_source_inmemory_freshen_object(struct odb_source *source,
 static int odb_source_inmemory_begin_transaction(struct odb_source *source UNUSED,
 						 struct odb_transaction **out UNUSED)
 {
-	return error("in-memory source does not support transactions");
+	/*
+	 * No transaction support: writes go straight to the in-memory map.
+	 * Fail quietly rather than error() - odb_transaction_begin() treats a
+	 * NULL transaction as "write directly through", so callers such as the
+	 * generic pack-ingest session fall back cleanly; this is a handled
+	 * condition, not a user-facing error.
+	 */
+	return -1;
 }
 
 static int odb_source_inmemory_read_alternates(struct odb_source *source UNUSED,
@@ -361,7 +368,7 @@ struct odb_source_inmemory *odb_source_inmemory_new(struct object_database *odb)
 	struct odb_source_inmemory *source;
 
 	CALLOC_ARRAY(source, 1);
-	odb_source_init(&source->base, odb, ODB_SOURCE_INMEMORY, "source", false);
+	odb_source_init(&source->base, odb, "source", false);
 
 	source->base.free = odb_source_inmemory_free;
 	source->base.close = odb_source_inmemory_close;

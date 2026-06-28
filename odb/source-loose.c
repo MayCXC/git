@@ -648,8 +648,14 @@ static int odb_source_loose_write_object_stream(struct odb_source *source,
 static int odb_source_loose_begin_transaction(struct odb_source *source UNUSED,
 					      struct odb_transaction **out UNUSED)
 {
-	/* TODO: this is a known omission that we'll want to address eventually. */
-	return error("loose source does not support transactions");
+	/*
+	 * TODO: real transaction support is a known omission. Until then fail
+	 * quietly (not error()): odb_transaction_begin() treats a NULL
+	 * transaction as "write directly through", so callers (e.g. the generic
+	 * pack-ingest session) fall back cleanly instead of seeing a spurious
+	 * error.
+	 */
+	return -1;
 }
 
 static int odb_source_loose_read_alternates(struct odb_source *source UNUSED,
@@ -712,7 +718,7 @@ struct odb_source_loose *odb_source_loose_new(struct object_database *odb,
 	struct odb_source_loose *loose;
 
 	CALLOC_ARRAY(loose, 1);
-	odb_source_init(&loose->base, odb, ODB_SOURCE_LOOSE, path, local);
+	odb_source_init(&loose->base, odb, path, local);
 
 	loose->base.free = odb_source_loose_free;
 	loose->base.close = odb_source_loose_close;

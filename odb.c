@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "abspath.h"
+#include "chdir-notify.h"
 #include "commit-graph.h"
 #include "config.h"
 #include "dir.h"
@@ -62,7 +63,7 @@ static bool odb_is_source_usable(struct object_database *o, const char *path)
 	struct strbuf normalized_objdir = STRBUF_INIT;
 	bool usable = false;
 
-	strbuf_realpath(&normalized_objdir, o->sources->path, 1);
+	strbuf_realpath(&normalized_objdir, o->object_dir, 1);
 
 	/* Detect cases where alternate disappeared */
 	if (!is_directory(path)) {
@@ -77,13 +78,24 @@ static bool odb_is_source_usable(struct object_database *o, const char *path)
 	 * thing twice, or object directory itself.
 	 */
 	if (!o->source_by_path) {
-		khiter_t p;
+		struct odb_source *src;
 
 		o->source_by_path = kh_init_odb_path_map();
-		assert(!o->sources->next);
-		p = kh_put_odb_path_map(o->source_by_path, o->sources->path, &r);
-		assert(r == 1); /* never used */
-		kh_value(o->source_by_path, p) = o->sources;
+		/*
+		 * Seed the path map from every source already present, not just
+		 * the primary. Normally that is only the primary, but when a
+		 * helper is demoted behind a files quarantine during receive
+		 * (see odb_prepare_sources) the chain already holds two sources
+		 * before any alternate is processed. Sources that share a path
+		 * (the demoted helper reuses object_dir) collapse to one entry,
+		 * which is all the alternate-dedup below needs.
+		 */
+		for (src = o->sources; src; src = src->next) {
+			khiter_t p = kh_put_odb_path_map(o->source_by_path,
+							 src->path, &r);
+			if (r)
+				kh_value(o->source_by_path, p) = src;
+		}
 	}
 
 	if (fspatheq(path, normalized_objdir.buf))
@@ -204,10 +216,51 @@ static struct odb_source *odb_add_alternate_recursively(struct object_database *
 	return alternate;
 }
 
+/*
+ * Lazily create the primary object source. It is created on first use rather
+ * than in odb_new() because its backend type is selected from configuration
+ * that may not be available when the object database is first set up.
+ */
+void odb_prepare_sources(struct object_database *odb)
+{
+	struct odb_source *primary;
+
+	if (odb->sources)
+		return;
+
+	/*
+	 * Construct the configured primary, then let it install itself into the
+	 * source list. The default installs it as the sole primary; the helper
+	 * overrides prepare_source_list to add receive-time quarantine staging,
+	 * since a backend that does not write through GIT_OBJECT_DIRECTORY is not
+	 * captured by a push quarantine and must be staged behind a files
+	 * quarantine (see odb_source.prepare_source_list).
+	 */
+	primary = odb_source_new(odb, odb->object_dir, true);
+	primary->prepare_source_list(primary, odb);
+}
+
+/*
+ * Return the primary object source, creating it on first use. This is the
+ * canonical way to obtain the primary (and thus the head of the source list,
+ * whose remaining entries are the alternates): it guarantees the primary has
+ * been prepared, so callers never observe the uninitialized NULL state.
+ * Mirrors get_main_ref_store() for the ref stores.
+ */
+struct odb_source *odb_primary_source(struct object_database *odb)
+{
+	if (!odb->object_dir)
+		BUG("attempting to get primary object source outside of repository");
+	odb_prepare_sources(odb);
+	return odb->sources;
+}
+
 void odb_add_to_alternates_file(struct object_database *odb,
 				const char *dir)
 {
-	int ret = odb_source_write_alternate(odb->sources, dir);
+	int ret;
+
+	ret = odb_source_write_alternate(odb_primary_source(odb), dir);
 	if (ret < 0)
 		die(NULL);
 	if (odb->loaded_alternates)
@@ -223,6 +276,26 @@ struct odb_source *odb_add_to_alternates_memory(struct object_database *odb,
 	 */
 	odb_prepare_alternates(odb);
 	return odb_add_alternate_recursively(odb, dir, 0);
+}
+
+struct odb_source *odb_find_source_by_path(struct object_database *odb,
+					   const char *path)
+{
+	khiter_t k;
+
+	/*
+	 * The path map is populated as sources (primary + alternates) are
+	 * registered, so make sure alternates have been loaded before looking
+	 * one up. Returns the source already registered for this path, or NULL
+	 * if none is.
+	 */
+	odb_prepare_alternates(odb);
+	if (!odb->source_by_path)
+		return NULL;
+	k = kh_get_odb_path_map(odb->source_by_path, path);
+	if (k == kh_end(odb->source_by_path))
+		return NULL;
+	return kh_value(odb->source_by_path, k);
 }
 
 struct odb_source *odb_set_temporary_primary_source(struct object_database *odb,
@@ -342,7 +415,7 @@ struct odb_source *odb_find_source(struct object_database *odb, const char *obj_
 	struct strbuf odb_path_real = STRBUF_INIT;
 
 	odb_prepare_alternates(odb);
-	for (source = odb->sources; source; source = source->next) {
+	for (source = odb_primary_source(odb); source; source = source->next) {
 		strbuf_realpath(&odb_path_real, source->path, 1);
 		if (!strcmp(obj_dir_real, odb_path_real.buf))
 			break;
@@ -476,7 +549,7 @@ int odb_for_each_alternate(struct object_database *odb,
 	int r = 0;
 
 	odb_prepare_alternates(odb);
-	for (alternate = odb->sources->next; alternate; alternate = alternate->next) {
+	for (alternate = odb_primary_source(odb)->next; alternate; alternate = alternate->next) {
 		r = cb(alternate, payload);
 		if (r)
 			break;
@@ -491,6 +564,7 @@ void odb_prepare_alternates(struct object_database *odb)
 	if (odb->loaded_alternates)
 		return;
 
+	odb_prepare_sources(odb);
 	parse_alternates(odb->alternate_db, PATH_SEP, NULL, &sources);
 	odb_source_read_alternates(odb->sources, &sources);
 	for (size_t i = 0; i < sources.nr; i++)
@@ -504,7 +578,7 @@ void odb_prepare_alternates(struct object_database *odb)
 int odb_has_alternates(struct object_database *odb)
 {
 	odb_prepare_alternates(odb);
-	return !!odb->sources->next;
+	return !!odb_primary_source(odb)->next;
 }
 
 int obj_read_use_lock = 0;
@@ -560,7 +634,8 @@ static int do_oid_object_info_extended(struct object_database *odb,
 	if (is_null_oid(real))
 		return -1;
 
-	if (!odb_source_read_object_info(odb->inmemory_objects, oid, oi, flags))
+	if (!(flags & OBJECT_INFO_SKIP_CACHED) &&
+	    !odb_source_read_object_info(odb->inmemory_objects, oid, oi, flags))
 		return 0;
 
 	odb_prepare_alternates(odb);
@@ -568,7 +643,7 @@ static int do_oid_object_info_extended(struct object_database *odb,
 	while (1) {
 		struct odb_source *source;
 
-		for (source = odb->sources; source; source = source->next)
+		for (source = odb_primary_source(odb); source; source = source->next)
 			if (!odb_source_read_object_info(source, real, oi, flags))
 				return 0;
 
@@ -578,7 +653,7 @@ static int do_oid_object_info_extended(struct object_database *odb,
 		 * caches or reload on-disk state.
 		 */
 		if (!(flags & OBJECT_INFO_QUICK)) {
-			for (source = odb->sources; source; source = source->next)
+			for (source = odb_primary_source(odb); source; source = source->next)
 				if (!odb_source_read_object_info(source, real, oi,
 								 flags | OBJECT_INFO_SECOND_READ))
 					return 0;
@@ -828,7 +903,7 @@ int odb_freshen_object(struct object_database *odb,
 {
 	struct odb_source *source;
 	odb_prepare_alternates(odb);
-	for (source = odb->sources; source; source = source->next)
+	for (source = odb_primary_source(odb); source; source = source->next)
 		if (odb_source_freshen_object(source, oid))
 			return 1;
 	return 0;
@@ -843,7 +918,7 @@ int odb_for_each_object_ext(struct object_database *odb,
 	int ret;
 
 	odb_prepare_alternates(odb);
-	for (struct odb_source *source = odb->sources; source; source = source->next) {
+	for (struct odb_source *source = odb_primary_source(odb); source; source = source->next) {
 		if (opts->flags & ODB_FOR_EACH_OBJECT_LOCAL_ONLY && !source->local)
 			continue;
 
@@ -881,7 +956,7 @@ int odb_count_objects(struct object_database *odb,
 	}
 
 	odb_prepare_alternates(odb);
-	for (source = odb->sources; source; source = source->next) {
+	for (source = odb_primary_source(odb); source; source = source->next) {
 		unsigned long c;
 
 		ret = odb_source_count_objects(source, flags, &c);
@@ -961,7 +1036,7 @@ int odb_find_abbrev_len(struct object_database *odb,
 	}
 
 	odb_prepare_alternates(odb);
-	for (struct odb_source *source = odb->sources; source; source = source->next) {
+	for (struct odb_source *source = odb_primary_source(odb); source; source = source->next) {
 		ret = odb_source_find_abbrev_len(source, oid, len, &len);
 		if (ret)
 			goto out;
@@ -992,15 +1067,89 @@ int odb_write_object_ext(struct object_database *odb,
 			 struct object_id *compat_oid,
 			 enum odb_write_object_flags flags)
 {
-	return odb_source_write_object(odb->sources, buf, len, type,
+	struct object_id compat_buf;
+
+	/*
+	 * The compatibility-algorithm id is a property of the object's bytes,
+	 * not of the storage backend, so compute it here (unless the caller
+	 * already supplied one) and hand it to whichever source stores the
+	 * object. This keeps hash conversion out of the backends: a helper that
+	 * cannot convert object ids still receives the compat id to record.
+	 */
+	if (odb->repo->compat_hash_algo && !compat_oid &&
+	    !repo_compute_compat_oid(odb->repo, buf, len, type, &compat_buf))
+		compat_oid = &compat_buf;
+
+	return odb_source_write_object(odb_primary_source(odb), buf, len, type,
 				       oid, compat_oid, flags);
+}
+
+int odb_write_prepared_ext(struct object_database *odb,
+			   const struct object_id *oid,
+			   enum object_type type, unsigned long usize,
+			   const struct object_id *base_oid,
+			   const void *compressed, unsigned long clen,
+			   const void *resolved, unsigned long resolved_size,
+			   enum odb_write_object_flags flags)
+{
+	struct odb_source *source = odb_primary_source(odb);
+	struct object_id compat_buf;
+	const struct object_id *compat_oid = NULL;
+
+	/*
+	 * Like odb_write_object_ext, the compat-hash id is a property of the
+	 * object's bytes; the primary source stores opaque compressed bytes and
+	 * cannot hash them, so compute it here from the resolved object and hand it
+	 * down for the source to record (the storage<->compat map). The caller holds
+	 * the resolved object for exactly this (index-pack/migrate resolved it).
+	 */
+	if (odb->repo->compat_hash_algo && resolved &&
+	    !repo_compute_compat_oid(odb->repo, resolved, resolved_size, type,
+				     &compat_buf))
+		compat_oid = &compat_buf;
+
+	/*
+	 * Store git's prepared compressed bytes verbatim when we can record any
+	 * needed compat id. odb_source_write_prepared returns negative when the
+	 * source has no write_prepared at all, or when a helper does not advertise
+	 * the put-raw verb at runtime (optional-capability graceful absence), fall
+	 * back to a resolved write then, which recomputes the compat id itself. The
+	 * fallback (and a compat repo with no resolved object to hash) needs the
+	 * resolved object, which the prepared-receive callers carry.
+	 */
+	if (!odb->repo->compat_hash_algo || compat_oid) {
+		int ret = odb_source_write_prepared(source, oid, compat_oid, type,
+						    usize, base_oid, compressed,
+						    clen, flags);
+		if (ret >= 0)
+			return ret;
+	}
+
+	if (!resolved)
+		return -1;
+	{
+		struct object_id written;
+		return odb_write_object_ext(odb, resolved, resolved_size, type,
+					    &written, NULL, flags);
+	}
 }
 
 int odb_write_object_stream(struct object_database *odb,
 			    struct odb_write_stream *stream, size_t len,
 			    struct object_id *oid)
 {
-	return odb_source_write_object_stream(odb->sources, stream, len, oid);
+	return odb_source_write_object_stream(odb_primary_source(odb), stream, len, oid);
+}
+
+static void odb_reparent_object_dir(const char *name UNUSED,
+				    const char *old_cwd,
+				    const char *new_cwd,
+				    void *cb_data)
+{
+	struct object_database *o = cb_data;
+	char *path = reparent_relative_path(old_cwd, new_cwd, o->object_dir);
+	free(o->object_dir);
+	o->object_dir = path;
 }
 
 struct object_database *odb_new(struct repository *repo,
@@ -1017,6 +1166,9 @@ struct object_database *odb_new(struct repository *repo,
 
 	if (!primary_source)
 		primary_source = to_free = xstrfmt("%s/objects", repo->commondir);
+	o->object_dir = xstrdup(primary_source);
+	chdir_notify_register(NULL, odb_reparent_object_dir, o);
+	o->files_sources_tail = &o->files_sources;
 	o->sources = odb_source_new(o, primary_source, true);
 	o->sources_tail = &o->sources->next;
 	o->alternate_db = xstrdup_or_null(secondary_sources);
@@ -1057,7 +1209,10 @@ void odb_free(struct object_database *o)
 	if (!o)
 		return;
 
+	chdir_notify_unregister(NULL, odb_reparent_object_dir, o);
+	free(o->object_dir);
 	free(o->alternate_db);
+	loose_object_map_clear(&o->compat_map);
 
 	oidmap_clear(&o->replace_map, 1);
 	pthread_mutex_destroy(&o->replace_mutex);

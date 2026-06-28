@@ -20,13 +20,13 @@ struct odb_source_inmemory {
 struct odb_source_inmemory *odb_source_inmemory_new(struct object_database *odb);
 
 /*
- * Cast the given object database source to the in-memory backend. This will
- * cause a BUG in case the source doesn't use this backend.
+ * Recover the in-memory backend's per-source struct from its base. Only reached
+ * from an in-memory-source vtable method, where the backend is already
+ * guaranteed (the installed vtable is the source's identity), so the cast is
+ * unconditional.
  */
 static inline struct odb_source_inmemory *odb_source_inmemory_downcast(struct odb_source *source)
 {
-	if (source->type != ODB_SOURCE_INMEMORY)
-		BUG("trying to downcast source of type '%d' to in-memory", source->type);
 	return container_of(source, struct odb_source_inmemory, base);
 }
 

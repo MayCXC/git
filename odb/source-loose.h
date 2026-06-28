@@ -35,13 +35,12 @@ struct odb_source_loose *odb_source_loose_new(struct object_database *odb,
 					      bool local);
 
 /*
- * Cast the given object database source to the loose backend. This will cause
- * a BUG in case the source doesn't use this backend.
+ * Recover the loose backend's per-source struct from its base. Only reached
+ * from a loose-source vtable method, where the backend is already guaranteed
+ * (the installed vtable is the source's identity), so the cast is unconditional.
  */
 static inline struct odb_source_loose *odb_source_loose_downcast(struct odb_source *source)
 {
-	if (source->type != ODB_SOURCE_LOOSE)
-		BUG("trying to downcast source of type '%d' to loose", source->type);
 	return container_of(source, struct odb_source_loose, base);
 }
 
