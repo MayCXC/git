@@ -638,7 +638,8 @@ static int git_sparse_checkout_init(const char *repo)
 static int checkout(int submodule_progress,
 		    struct list_objects_filter_options *filter_options,
 		    int filter_submodules,
-		    const char *ref_format)
+		    const char *ref_format,
+		    const char *object_storage)
 {
 	struct object_id oid;
 	char *head;
@@ -726,6 +727,15 @@ static int checkout(int submodule_progress,
 
 		if (ref_format)
 			strvec_pushf(&cmd.args, "--ref-format=%s", ref_format);
+
+		/*
+		 * Propagate the object storage backend to submodule clones, the
+		 * same way --ref-format propagates the ref backend, so a helper
+		 * superproject's submodules are cloned into the helper too. The
+		 * name carries any helper identity, so there is no separate flag.
+		 */
+		if (object_storage)
+			strvec_pushf(&cmd.args, "--object-storage=%s", object_storage);
 
 		if (filter_submodules && filter_options->choice)
 			strvec_pushf(&cmd.args, "--filter=%s",
@@ -900,6 +910,7 @@ int cmd_clone(int argc,
 	struct string_list option_not = STRING_LIST_INIT_NODUP;
 	const char *real_git_dir = NULL;
 	const char *ref_format = NULL;
+	const char *object_storage = NULL;
 	const char *option_upload_pack = "git-upload-pack";
 	int option_progress = -1;
 	int option_sparse_checkout = 0;
@@ -981,6 +992,8 @@ int cmd_clone(int argc,
 			   N_("separate git dir from working tree")),
 		OPT_STRING(0, "ref-format", &ref_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "object-storage", &object_storage, N_("backend"),
+			   N_("specify the object storage backend to use (\"files\" or a helper name)")),
 		OPT_STRING_LIST('c', "config", &option_config, N_("key=value"),
 				N_("set config inside the new repository")),
 		OPT_STRING_LIST(0, "server-option", &server_options,
@@ -1179,7 +1192,7 @@ int cmd_clone(int argc,
 	 * their on-disk data structures.
 	 */
 	init_db(the_repository, git_dir, real_git_dir, option_template, GIT_HASH_UNKNOWN,
-		ref_format, NULL,
+		ref_format, object_storage, NULL,
 		do_not_override_repo_unix_permissions, INIT_DB_QUIET | INIT_DB_SKIP_REFDB);
 
 	if (real_git_dir) {
@@ -1222,7 +1235,7 @@ int cmd_clone(int argc,
 	 * This is sufficient for Git commands to discover the Git directory.
 	 */
 	initialize_repository_version(the_repository, GIT_HASH_UNKNOWN,
-				      the_repository->ref_storage_name, 1);
+				      the_repository->ref_storage_name, NULL, 1);
 
 	refs_create_refdir_stubs(the_repository, git_dir, NULL);
 
@@ -1434,7 +1447,8 @@ int cmd_clone(int argc,
 	 * ours to the same thing.
 	 */
 	hash_algo = hash_algo_by_ptr(transport_get_hash_algo(transport));
-	initialize_repository_version(the_repository, hash_algo, the_repository->ref_storage_name, 1);
+	initialize_repository_version(the_repository, hash_algo,
+				      the_repository->ref_storage_name, NULL, 1);
 	repo_set_hash_algo(the_repository, hash_algo);
 	create_reference_database(the_repository, NULL, 1);
 
@@ -1622,7 +1636,8 @@ int cmd_clone(int argc,
 	err = checkout(submodule_progress,
 		       &filter_options,
 		       filter_submodules,
-		       ref_format);
+		       ref_format,
+		       object_storage);
 
 	list_objects_filter_release(&filter_options);
 

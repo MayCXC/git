@@ -800,7 +800,7 @@ static void config_from_gitmodules(config_fn_t fn, struct repository *repo, void
 			config_source.blob = oidstr = xstrdup(oid_to_hex(&oid));
 			if (repo != the_repository)
 				odb_add_submodule_source_by_path(the_repository->objects,
-								 repo->objects->sources->path);
+								 repo_get_object_directory(repo));
 		} else {
 			goto out;
 		}

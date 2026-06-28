@@ -7,16 +7,89 @@
 #include "odb.h"
 #include "odb/pack-ingest.h"
 #include "odb/source-files.h"
+#include "odb/source-helper.h"
 #include "odb/source.h"
 #include "packfile.h"
 #include "repository.h"
 #include "strbuf.h"
 
+typedef struct odb_source *(*odb_source_constructor_fn)(struct object_database *odb,
+							const char *path, bool local);
+
+static struct odb_source *files_source_new(struct object_database *odb,
+					   const char *path, bool local)
+{
+	return &odb_source_files_new(odb, path, local)->base;
+}
+
+/*
+ * The object storage backends, mirroring how refs registers ref_storage_be in
+ * refs_backends[]. A primary source is selected by name: odb_source_new() looks
+ * the configured extensions.objectStorage name up here to install the matching
+ * vtable, the one place the source backend is chosen. A name with no registered
+ * backend is taken to be a helper name and served by a git-local-<name> process,
+ * exactly as transport_get() delegates an unknown URL scheme to git-remote-<name>.
+ * Everything past source creation goes through the per-source vtable.
+ */
+struct odb_source_be {
+	odb_source_constructor_fn new;
+	/* Selectable config name (extensions.objectStorage). */
+	const char *name;
+};
+
+static const struct odb_source_be odb_source_backends[] = {
+	{ .new = files_source_new, .name = "files" },
+};
+
+static const struct odb_source_be *odb_source_backend_by_name(const char *name)
+{
+	if (!name)
+		return NULL;
+	for (size_t i = 0; i < ARRAY_SIZE(odb_source_backends); i++)
+		if (!strcmp(name, odb_source_backends[i].name))
+			return &odb_source_backends[i];
+	return NULL;
+}
+
+static struct odb_source *odb_source_new_for_name(struct object_database *odb,
+						  const char *path,
+						  const char *name,
+						  bool local)
+{
+	const struct odb_source_be *be = odb_source_backend_by_name(name);
+
+	if (be)
+		return be->new(odb, path, local);
+	/*
+	 * A configured name with no registered backend is a helper name: serve it
+	 * with git-local-<name>, mirroring transport_get()'s fallthrough to
+	 * git-remote-<name>. No name at all is the unconfigured files default.
+	 */
+	if (name && *name)
+		return odb_source_helper_new_base(odb, name, path, local);
+	return files_source_new(odb, path, local);
+}
+
 struct odb_source *odb_source_new(struct object_database *odb,
 				  const char *path,
 				  bool local)
 {
-	return &odb_source_files_new(odb, path, local)->base;
+	/*
+	 * Only the primary source uses the configured backend. Alternates and
+	 * submodule sources are filesystem object directories reached via the
+	 * objects/info/alternates mechanism, so they always use the files backend
+	 * regardless of how the primary stores its objects.
+	 */
+	if (!local)
+		return files_source_new(odb, path, local);
+	return odb_source_new_for_name(odb, path, odb->repo->odb_source_name, local);
+}
+
+struct odb_source *odb_source_new_named(struct object_database *odb,
+					const char *path,
+					const char *name)
+{
+	return odb_source_new_for_name(odb, path, name, true);
 }
 
 

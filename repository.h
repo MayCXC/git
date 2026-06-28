@@ -60,6 +60,16 @@ struct repository {
 	 */
 	struct object_database *objects;
 
+	/*
+	 * The selected object-storage backend, by name. NULL or "files" (the
+	 * default) means loose objects and packfiles; any other name is served by
+	 * a "git-local-<name>" helper process (odb_local_helper), chosen exactly as
+	 * transport_get() picks git-remote-<name> for an unknown URL scheme. The
+	 * object and ref helper backends are independent: each runs its own process
+	 * (even when both name the same program), so a helper repository has two
+	 * helper instances, never a shared one.
+	 */
+	char *odb_source_name;
 	struct helper_process *odb_local_helper;
 	/* The helper process serving refs when the ref backend is the helper. */
 	struct helper_process *ref_local_helper;
@@ -252,6 +262,7 @@ void repo_set_compat_hash_algo(struct repository *repo, uint32_t compat_algo);
 void repo_set_ref_storage_name(struct repository *repo,
 			       const char *name,
 			       const char *payload);
+void repo_set_odb_source_name(struct repository *repo, const char *name);
 void initialize_repository(struct repository *repo);
 RESULT_MUST_BE_USED
 int repo_init(struct repository *r, const char *gitdir, const char *worktree);

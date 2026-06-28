@@ -1299,9 +1299,14 @@ struct object_database *odb_new(struct repository *repo,
 		primary_source = to_free = xstrfmt("%s/objects", repo->commondir);
 	o->object_dir = xstrdup(primary_source);
 	chdir_notify_register(NULL, odb_reparent_object_dir, o);
+	/*
+	 * The primary source is created lazily (see odb_prepare_sources): its
+	 * backend type is selected from configuration that may not be known
+	 * yet when the object database is set up. The reported object directory
+	 * (object_dir, above) does not depend on the source existing.
+	 */
+	o->sources_tail = &o->sources;
 	o->files_sources_tail = &o->files_sources;
-	o->sources = odb_source_new(o, primary_source, true);
-	o->sources_tail = &o->sources->next;
 	o->alternate_db = xstrdup_or_null(secondary_sources);
 	o->inmemory_objects = &odb_source_inmemory_new(o)->base;
 

@@ -1732,7 +1732,8 @@ struct module_clone_data {
 	const char *url;
 	int depth;
 	struct list_objects_filter_options *filter_options;
-	enum ref_storage_format ref_storage_format;
+	const char *ref_storage_format;
+	const char *object_storage;
 	unsigned int quiet: 1;
 	unsigned int progress: 1;
 	unsigned int dissociate: 1;
@@ -1741,7 +1742,6 @@ struct module_clone_data {
 };
 #define MODULE_CLONE_DATA_INIT { \
 	.single_branch = -1, \
-	.ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN, \
 }
 
 struct submodule_alternate_setup {
@@ -1939,9 +1939,12 @@ static int clone_submodule(const struct module_clone_data *clone_data,
 				strvec_pushl(&cp.args, "--reference",
 					     item->string, NULL);
 		}
-		if (clone_data->ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
+		if (clone_data->ref_storage_format)
 			strvec_pushf(&cp.args, "--ref-format=%s",
-				     ref_storage_format_to_name(clone_data->ref_storage_format));
+				     clone_data->ref_storage_format);
+		if (clone_data->object_storage)
+			strvec_pushf(&cp.args, "--object-storage=%s",
+				     clone_data->object_storage);
 		if (clone_data->dissociate)
 			strvec_push(&cp.args, "--dissociate");
 		if (sm_gitdir && *sm_gitdir)
@@ -2038,7 +2041,6 @@ static int module_clone(int argc, const char **argv, const char *prefix,
 	struct string_list reference = STRING_LIST_INIT_NODUP;
 	struct list_objects_filter_options filter_options =
 		LIST_OBJECTS_FILTER_INIT;
-	const char *ref_storage_format = NULL;
 
 	struct option module_clone_options[] = {
 		OPT_STRING(0, "prefix", &clone_data.prefix,
@@ -2056,8 +2058,10 @@ static int module_clone(int argc, const char **argv, const char *prefix,
 		OPT_STRING_LIST(0, "reference", &reference,
 			   N_("repo"),
 			   N_("reference repository")),
-		OPT_STRING(0, "ref-format", &ref_storage_format, N_("format"),
+		OPT_STRING(0, "ref-format", &clone_data.ref_storage_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "object-storage", &clone_data.object_storage, N_("backend"),
+			   N_("specify the object storage backend to use")),
 		OPT_BOOL(0, "dissociate", &dissociate,
 			   N_("use --reference only while cloning")),
 		OPT_INTEGER(0, "depth", &clone_data.depth,
@@ -2083,11 +2087,6 @@ static int module_clone(int argc, const char **argv, const char *prefix,
 	argc = parse_options(argc, argv, prefix, module_clone_options,
 			     git_submodule_helper_usage, 0);
 
-	if (ref_storage_format) {
-		clone_data.ref_storage_format = ref_storage_format_by_name(ref_storage_format);
-		if (clone_data.ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format '%s'"), ref_storage_format);
-	}
 	clone_data.dissociate = !!dissociate;
 	clone_data.quiet = !!quiet;
 	clone_data.progress = !!progress;
@@ -2194,7 +2193,8 @@ struct update_data {
 	struct submodule_update_strategy update_strategy;
 	struct list_objects_filter_options *filter_options;
 	struct module_list list;
-	enum ref_storage_format ref_storage_format;
+	const char *ref_storage_format;
+	const char *object_storage;
 	int depth;
 	int max_jobs;
 	int single_branch;
@@ -2218,7 +2218,6 @@ struct update_data {
 #define UPDATE_DATA_INIT { \
 	.update_strategy = SUBMODULE_UPDATE_STRATEGY_INIT, \
 	.list = MODULE_LIST_INIT, \
-	.ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN, \
 	.recommend_shallow = -1, \
 	.references = STRING_LIST_INIT_DUP, \
 	.single_branch = -1, \
@@ -2355,9 +2354,12 @@ static int prepare_to_clone_next_submodule(const struct cache_entry *ce,
 			     expand_list_objects_filter_spec(suc->update_data->filter_options));
 	if (suc->update_data->require_init)
 		strvec_push(&child->args, "--require-init");
-	if (suc->update_data->ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
+	if (suc->update_data->ref_storage_format)
 		strvec_pushf(&child->args, "--ref-format=%s",
-			     ref_storage_format_to_name(suc->update_data->ref_storage_format));
+			     suc->update_data->ref_storage_format);
+	if (suc->update_data->object_storage)
+		strvec_pushf(&child->args, "--object-storage=%s",
+			     suc->update_data->object_storage);
 	strvec_pushl(&child->args, "--path", sub->path, NULL);
 	strvec_pushl(&child->args, "--name", sub->name, NULL);
 	strvec_pushl(&child->args, "--url", url, NULL);
@@ -2799,9 +2801,12 @@ static void update_data_to_args(const struct update_data *update_data,
 		for_each_string_list_item(item, &update_data->references)
 			strvec_pushl(args, "--reference", item->string, NULL);
 	}
-	if (update_data->ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
+	if (update_data->ref_storage_format)
 		strvec_pushf(args, "--ref-format=%s",
-			     ref_storage_format_to_name(update_data->ref_storage_format));
+			     update_data->ref_storage_format);
+	if (update_data->object_storage)
+		strvec_pushf(args, "--object-storage=%s",
+			     update_data->object_storage);
 	if (update_data->filter_options && update_data->filter_options->choice)
 		strvec_pushf(args, "--filter=%s",
 				expand_list_objects_filter_spec(
@@ -2985,7 +2990,6 @@ static int module_update(int argc, const char **argv, const char *prefix,
 	struct update_data opt = UPDATE_DATA_INIT;
 	struct list_objects_filter_options filter_options =
 		LIST_OBJECTS_FILTER_INIT;
-	const char *ref_storage_format = NULL;
 	int ret;
 	struct option module_update_options[] = {
 		OPT__SUPER_PREFIX(&opt.super_prefix),
@@ -3009,8 +3013,10 @@ static int module_update(int argc, const char **argv, const char *prefix,
 			SM_UPDATE_REBASE),
 		OPT_STRING_LIST(0, "reference", &opt.references, N_("repo"),
 			   N_("reference repository")),
-		OPT_STRING(0, "ref-format", &ref_storage_format, N_("format"),
+		OPT_STRING(0, "ref-format", &opt.ref_storage_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "object-storage", &opt.object_storage, N_("backend"),
+			   N_("specify the object storage backend to use")),
 		OPT_BOOL(0, "dissociate", &opt.dissociate,
 			   N_("use --reference only while cloning")),
 		OPT_INTEGER(0, "depth", &opt.depth,
@@ -3052,12 +3058,6 @@ static int module_update(int argc, const char **argv, const char *prefix,
 	if (filter_options.choice && !opt.init) {
 		usage_with_options(git_submodule_helper_usage,
 				   module_update_options);
-	}
-
-	if (ref_storage_format) {
-		opt.ref_storage_format = ref_storage_format_by_name(ref_storage_format);
-		if (opt.ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format '%s'"), ref_storage_format);
 	}
 
 	opt.filter_options = &filter_options;
@@ -3363,7 +3363,8 @@ struct add_data {
 	const char *sm_name;
 	const char *repo;
 	const char *realrepo;
-	enum ref_storage_format ref_storage_format;
+	const char *ref_storage_format;
+	const char *object_storage;
 	int depth;
 	unsigned int force: 1;
 	unsigned int quiet: 1;
@@ -3372,7 +3373,6 @@ struct add_data {
 };
 #define ADD_DATA_INIT { \
 	.depth = -1, \
-	.ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN, \
 }
 
 static void append_fetch_remotes(struct strbuf *msg, const char *git_dir_path)
@@ -3469,6 +3469,7 @@ static int add_submodule(const struct add_data *add_data)
 			string_list_append(&reference, p)->util = p;
 		}
 		clone_data.ref_storage_format = add_data->ref_storage_format;
+		clone_data.object_storage = add_data->object_storage;
 		clone_data.dissociate = add_data->dissociate;
 		if (add_data->depth >= 0)
 			clone_data.depth = add_data->depth;
@@ -3644,7 +3645,6 @@ static int module_add(int argc, const char **argv, const char *prefix,
 {
 	int force = 0, quiet = 0, progress = 0, dissociate = 0;
 	struct add_data add_data = ADD_DATA_INIT;
-	const char *ref_storage_format = NULL;
 	char *to_free = NULL;
 	const struct submodule *existing;
 	struct strbuf buf = STRBUF_INIT;
@@ -3658,8 +3658,10 @@ static int module_add(int argc, const char **argv, const char *prefix,
 		OPT_BOOL(0, "progress", &progress, N_("force cloning progress")),
 		OPT_STRING(0, "reference", &add_data.reference_path, N_("repository"),
 			   N_("reference repository")),
-		OPT_STRING(0, "ref-format", &ref_storage_format, N_("format"),
+		OPT_STRING(0, "ref-format", &add_data.ref_storage_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "object-storage", &add_data.object_storage, N_("backend"),
+			   N_("specify the object storage backend to use")),
 		OPT_BOOL(0, "dissociate", &dissociate, N_("borrow the objects from reference repositories")),
 		OPT_STRING(0, "name", &add_data.sm_name, N_("name"),
 			   N_("sets the submodule's name to the given string "
@@ -3685,12 +3687,6 @@ static int module_add(int argc, const char **argv, const char *prefix,
 
 	if (argc == 0 || argc > 2)
 		usage_with_options(usage, options);
-
-	if (ref_storage_format) {
-		add_data.ref_storage_format = ref_storage_format_by_name(ref_storage_format);
-		if (add_data.ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format '%s'"), ref_storage_format);
-	}
 
 	add_data.repo = argv[0];
 	if (argc == 1)

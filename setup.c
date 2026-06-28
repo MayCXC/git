@@ -10,6 +10,7 @@
 #include "hex.h"
 #include "object-file.h"
 #include "object-name.h"
+#include "odb.h"
 #include "refs.h"
 #include "replace-object.h"
 #include "repository.h"
@@ -731,6 +732,31 @@ static enum extension_result handle_extension(const char *var,
 		data->ref_storage_name = format_str;
 		data->ref_storage_payload = payload;
 		return EXTENSION_OK;
+	} else if (!strcmp(ext, "objectstorage")) {
+		if (!value)
+			return config_error_nonbool(var);
+		/*
+		 * objectStorage names the object backend outright (the way a
+		 * transport is named): "files" is the default, any other name
+		 * is served by a git-local-<name> helper, resolved when the
+		 * object source is built.
+		 *
+		 * Unlike extensions.refStorage the value is the whole name with
+		 * no "scheme://payload" form, so every name (builtin or helper)
+		 * is a bare token, the RFC 1738 scheme set transport.c accepts
+		 * for a remote helper: reject a payload or path and separator
+		 * characters here rather than spawning git-local-<garbage>.
+		 */
+		if (!*value ||
+		    value[strspn(value,
+				 "abcdefghijklmnopqrstuvwxyz"
+				 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				 "0123456789+.-")])
+			return error(_("invalid value for '%s': '%s'"),
+				     "extensions.objectstorage", value);
+		free(data->odb_source_name);
+		data->odb_source_name = xstrdup(value);
+		return EXTENSION_OK;
 	} else if (!strcmp(ext, "relativeworktrees")) {
 		data->relative_worktrees = git_config_bool(var, value);
 		return EXTENSION_OK;
@@ -903,6 +929,7 @@ void clear_repository_format(struct repository_format *format)
 	free(format->partial_clone);
 	free(format->ref_storage_name);
 	free(format->ref_storage_payload);
+	free(format->odb_source_name);
 	init_repository_format(format);
 }
 
@@ -1807,6 +1834,7 @@ static void check_repository_format(struct repository *repo, struct repository_f
 	repo_set_ref_storage_name(repo,
 				  fmt->ref_storage_name,
 				  fmt->ref_storage_payload);
+	repo_set_odb_source_name(repo, fmt->odb_source_name);
 	repo->repository_format_worktree_config =
 		fmt->worktree_config;
 	repo->repository_format_submodule_path_cfg =
@@ -2057,6 +2085,7 @@ const char *setup_git_directory_gently(struct repository *repo, int *nongit_ok)
 			repo_set_ref_storage_name(repo,
 						  repo_fmt.ref_storage_name,
 						  repo_fmt.ref_storage_payload);
+			repo_set_odb_source_name(repo, repo_fmt.odb_source_name);
 			repo->repository_format_worktree_config =
 				repo_fmt.worktree_config;
 			repo->repository_format_relative_worktrees =
@@ -2107,6 +2136,17 @@ const char *setup_git_directory_gently(struct repository *repo, int *nongit_ok)
 		free(backend);
 		free(payload);
 	}
+
+	/*
+	 * Now that the repository location and its configuration (including the
+	 * selected object-storage backend) are final, create the primary object
+	 * source. This mirrors the object database's "initialize once locations
+	 * are final" model and ensures the primary source is available before any
+	 * command runs. Code paths that set up a repository without going through
+	 * here fall back to creating the primary source on first use.
+	 */
+	if (startup_info->have_repository && repo->objects)
+		odb_prepare_sources(repo->objects);
 
 	setup_original_cwd(repo);
 
@@ -2433,6 +2473,7 @@ static int needs_work_tree_config(const char *git_dir, const char *work_tree)
 void initialize_repository_version(struct repository *repo,
 				   int hash_algo,
 				   const char *ref_storage_name,
+				   const char *odb_source_name,
 				   int reinit)
 {
 	struct strbuf repo_version = STRBUF_INIT;
@@ -2479,6 +2520,15 @@ void initialize_repository_version(struct repository *repo,
 		needs_v1 = 1;
 	} else if (reinit) {
 		repo_config_set_gently(repo, "extensions.refstorage", NULL);
+	}
+	/*
+	 * objectStorage is the object twin: unlike refs there is no clear on
+	 * reinit (the object backend cannot change across a reinit, only
+	 * "git odb migrate" rewrites it).
+	 */
+	if (odb_source_name && *odb_source_name && strcmp(odb_source_name, "files")) {
+		repo_config_set(repo, "extensions.objectstorage", odb_source_name);
+		needs_v1 = 1;
 	}
 	if (needs_v1)
 		target_version = GIT_REPO_VERSION_READ;
@@ -2609,7 +2659,8 @@ static int create_default_files(struct repository *repo,
 		adjust_shared_perm(repo, repo_get_git_dir(repo));
 	}
 
-	initialize_repository_version(repo, fmt->hash_algo, fmt->ref_storage_name, reinit);
+	initialize_repository_version(repo, fmt->hash_algo, fmt->ref_storage_name,
+				      fmt->odb_source_name, reinit);
 
 	/* Check filemode trustability */
 	repo_git_path_replace(repo, &path, "config");
@@ -2760,7 +2811,8 @@ out:
 
 static void repository_format_configure(struct repository *repo,
 					struct repository_format *repo_fmt,
-					int hash, const char *ref_format)
+					int hash, const char *ref_format,
+					const char *object_storage)
 {
 	struct default_format_config cfg = {
 		.hash = GIT_HASH_UNKNOWN,
@@ -2826,6 +2878,28 @@ static void repository_format_configure(struct repository *repo,
 		repo_fmt->ref_storage_name = xstrdup(selected);
 	}
 
+	/*
+	 * Choose the object storage backend, mirroring the ref format above: the
+	 * command line (--object-storage) wins, then GIT_DEFAULT_OBJECT_STORAGE
+	 * (only for a freshly created repository). The name is the whole identity,
+	 * "files" or a git-local-<name> object helper, stored verbatim and resolved
+	 * when the object source is built; an existing repository keeps whatever
+	 * its extensions declared, and reinitializing with a different backend is
+	 * rejected.
+	 */
+	env = getenv("GIT_DEFAULT_OBJECT_STORAGE");
+	if (object_storage) {
+		const char *current = repo_fmt->odb_source_name ?
+				      repo_fmt->odb_source_name : "files";
+		if (repo_fmt->version >= 0 && strcmp(object_storage, current))
+			die(_("attempt to reinitialize repository with different object storage backend"));
+		free(repo_fmt->odb_source_name);
+		repo_fmt->odb_source_name = xstrdup(object_storage);
+	} else if (env && repo_fmt->version < 0) {
+		free(repo_fmt->odb_source_name);
+		repo_fmt->odb_source_name = xstrdup(env);
+	}
+
 	ref_backend_uri = getenv(GIT_REFERENCE_BACKEND_ENVIRONMENT);
 	if (ref_backend_uri) {
 		char *backend, *payload;
@@ -2839,6 +2913,14 @@ static void repository_format_configure(struct repository *repo,
 
 	repo_set_ref_storage_name(repo, repo_fmt->ref_storage_name,
 				  repo_fmt->ref_storage_payload);
+	/*
+	 * Apply the object backend to the running repository too, not just its
+	 * config: the lazily created primary source reads repo->odb_source_name,
+	 * so an in-process writer that follows init (notably git-clone, which
+	 * fetches in the same process) routes objects to the chosen backend
+	 * rather than to a stale files source. Mirrors the ref format above.
+	 */
+	repo_set_odb_source_name(repo, repo_fmt->odb_source_name);
 
 	free(cfg.ref_format);
 }
@@ -2847,6 +2929,7 @@ int init_db(struct repository *repo,
 	    const char *git_dir, const char *real_git_dir,
 	    const char *template_dir, int hash,
 	    const char *ref_format,
+	    const char *object_storage,
 	    const char *initial_branch,
 	    int init_shared_repository, unsigned int flags)
 {
@@ -2882,7 +2965,8 @@ int init_db(struct repository *repo,
 	 */
 	check_repository_format(repo, &repo_fmt);
 
-	repository_format_configure(repo, &repo_fmt, hash, ref_format);
+	repository_format_configure(repo, &repo_fmt, hash, ref_format,
+				    object_storage);
 
 	/*
 	 * Ensure `core.hidedotfiles` is processed. This must happen after we

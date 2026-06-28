@@ -207,8 +207,14 @@ void repo_set_compat_hash_algo(struct repository *repo MAYBE_UNUSED, uint32_t al
 	if (hash_algo_by_ptr(repo->hash_algo) == algo)
 		BUG("hash_algo and compat_hash_algo match");
 	repo->compat_hash_algo = algo ? &hash_algos[algo] : NULL;
-	if (repo->compat_hash_algo)
-		repo_read_loose_object_map(repo);
+	/*
+	 * Do not read the loose object map here. Reading it prepares the object
+	 * sources (odb_prepare_alternates), and this setter runs before
+	 * repo_set_odb_source_name() has selected the backend, so preparing now
+	 * would force a files primary onto a repo configured for another
+	 * backend. repo_set_odb_source_name() reads the map instead: it is
+	 * always called right after this setter, once the backend is known.
+	 */
 #else
 	if (algo)
 		die(_("compatibility hash algorithm support requires Rust"));
@@ -243,6 +249,29 @@ void repo_set_ref_storage_name(struct repository *repo,
 	else if ((format = ref_storage_format_by_name(name)) == REF_STORAGE_FORMAT_UNKNOWN)
 		format = REF_STORAGE_FORMAT_HELPER;
 	repo->ref_storage_format = format;
+}
+
+void repo_set_odb_source_name(struct repository *repo, const char *name)
+{
+	/*
+	 * The selected object backend is identified by a single name (the way a
+	 * transport is named): "files" or NULL is the default, any other name is a
+	 * git-local-<name> helper, spawned lazily when the primary source is built.
+	 */
+	free(repo->odb_source_name);
+	repo->odb_source_name = xstrdup_or_null(name);
+
+	/*
+	 * Read the storage<->compat object-id map now that the backend is
+	 * selected. This setter always runs right after repo_set_compat_hash_algo()
+	 * (which deliberately defers the read), so this is the first point where
+	 * both the compat algorithm and the backend are known. Loading here both
+	 * prepares the object sources with the correct backend and populates the
+	 * map and its loose-object cache, so a later get_oid() can resolve a
+	 * compat-format object id. The call is a no-op when no compat algorithm
+	 * is configured.
+	 */
+	repo_read_loose_object_map(repo);
 }
 
 /*
@@ -326,6 +355,7 @@ int repo_init(struct repository *repo,
 	repo_set_compat_hash_algo(repo, format.compat_hash_algo);
 	repo_set_ref_storage_name(repo, format.ref_storage_name,
 				  format.ref_storage_payload);
+	repo_set_odb_source_name(repo, format.odb_source_name);
 	repo->repository_format_worktree_config = format.worktree_config;
 	repo->repository_format_relative_worktrees = format.relative_worktrees;
 	repo->repository_format_precious_objects = format.precious_objects;
@@ -338,8 +368,10 @@ int repo_init(struct repository *repo,
 	if (worktree)
 		repo_set_worktree(repo, worktree);
 
-	if (repo->compat_hash_algo)
-		repo_read_loose_object_map(repo);
+	/*
+	 * The storage<->compat object-id map was already read by
+	 * repo_set_odb_source_name() above, once the backend was known.
+	 */
 
 	clear_repository_format(&format);
 	return 0;
@@ -424,11 +456,18 @@ void repo_clear(struct repository *repo)
 
 	odb_free(repo->objects);
 	repo->objects = NULL;
+	FREE_AND_NULL(repo->odb_source_name);
 
 	/*
-	 * The ref store borrows repo->ref_local_helper, so release it only after
-	 * the ref store teardown above has dropped it.
+	 * The ODB sources borrow repo->odb_local_helper and the ref store borrows
+	 * repo->ref_local_helper, so release each only after odb_free() above and
+	 * the ref store teardown have dropped them. The two are independent
+	 * processes.
 	 */
+	if (repo->odb_local_helper) {
+		helper_process_release(repo->odb_local_helper);
+		FREE_AND_NULL(repo->odb_local_helper);
+	}
 	if (repo->ref_local_helper) {
 		helper_process_release(repo->ref_local_helper);
 		FREE_AND_NULL(repo->ref_local_helper);

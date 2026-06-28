@@ -191,6 +191,7 @@ struct repository_format {
 	int compat_hash_algo;
 	char *ref_storage_name; /* value of extensions.refStorage (the whole selector) */
 	char *ref_storage_payload;
+	char *odb_source_name; /* value of extensions.objectStorage */
 	int sparse_index;
 	char *work_tree;
 	struct string_list unknown_extensions;
@@ -245,11 +246,13 @@ int init_db(struct repository *repo,
 	    const char *git_dir, const char *real_git_dir,
 	    const char *template_dir, int hash_algo,
 	    const char *ref_format,
+	    const char *object_storage,
 	    const char *initial_branch, int init_shared_repository,
 	    unsigned int flags);
 void initialize_repository_version(struct repository *repo,
 				   int hash_algo,
 				   const char *ref_storage_name,
+				   const char *odb_source_name,
 				   int reinit);
 void create_reference_database(struct repository *repo, const char *initial_branch, int quiet);
 

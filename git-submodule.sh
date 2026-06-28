@@ -103,6 +103,22 @@ cmd_add()
 		--ref-format=*)
 			ref_format="$1"
 			;;
+		--object-storage)
+			case "$2" in '') usage ;; esac
+			object_storage="--object-storage=$2"
+			shift
+			;;
+		--object-storage=*)
+			object_storage="$1"
+			;;
+		--local-helper)
+			case "$2" in '') usage ;; esac
+			local_helper="--local-helper=$2"
+			shift
+			;;
+		--local-helper=*)
+			local_helper="$1"
+			;;
 		--dissociate)
 			dissociate=$1
 			;;
@@ -148,6 +164,8 @@ cmd_add()
 		${branch:+"$branch"} \
 		${reference:+"$reference"} \
 		${ref_format:+"$ref_format"} \
+		${object_storage:+"$object_storage"} \
+		${local_helper:+"$local_helper"} \
 		$dissociate \
 		${name:+"$name"} \
 		${depth:+"$depth"} \
@@ -310,6 +328,22 @@ cmd_update()
 		--ref-format=*)
 			ref_format="$1"
 			;;
+		--object-storage)
+			case "$2" in '') usage ;; esac
+			object_storage="--object-storage=$2"
+			shift
+			;;
+		--object-storage=*)
+			object_storage="$1"
+			;;
+		--local-helper)
+			case "$2" in '') usage ;; esac
+			local_helper="--local-helper=$2"
+			shift
+			;;
+		--local-helper=*)
+			local_helper="$1"
+			;;
 		--reference)
 			case "$2" in '') usage ;; esac
 			reference="--reference=$2"
@@ -386,6 +420,8 @@ cmd_update()
 		$merge \
 		$checkout \
 		${ref_format:+"$ref_format"} \
+		${object_storage:+"$object_storage"} \
+		${local_helper:+"$local_helper"} \
 		${reference:+"$reference"} \
 		$dissociate \
 		${depth:+"$depth"} \

@@ -5,6 +5,7 @@
 #include "dir.h"
 #include "hex.h"
 #include "packfile.h"
+#include "odb/source-files.h"
 #include "hash-lookup.h"
 #include "midx.h"
 #include "progress.h"
@@ -101,6 +102,14 @@ static int midx_read_object_offsets(const unsigned char *chunk_start,
 
 struct multi_pack_index *get_multi_pack_index(struct odb_source *source)
 {
+	/*
+	 * A multi-pack-index belongs to the files backend's packfile layout, so
+	 * this accessor is reached only with a files source: callers either hold a
+	 * concrete files store (its source) or are the files multi_pack_index_*
+	 * vtable impls, which "git multi-pack-index" and gc dispatch only to the
+	 * files backend (every other source takes the no-op default). Downcast
+	 * unconditionally.
+	 */
 	struct odb_source_files *files = odb_source_files_downcast(source);
 	packfile_store_prepare(files->packed);
 	return files->packed->midx;
@@ -514,6 +523,7 @@ int nth_bitmapped_pack(struct multi_pack_index *m,
 				 sizeof(uint32_t));
 	bp->pack_int_id = pack_int_id;
 	bp->from_midx = m;
+	bp->source = NULL;
 
 	return 0;
 }
@@ -828,13 +838,12 @@ void clear_midx_file(struct repository *r)
 {
 	struct strbuf midx = STRBUF_INIT;
 
-	get_midx_filename(r->objects->sources, &midx);
+	get_midx_filename(odb_primary_source(r->objects), &midx);
 
 	if (r->objects) {
-		struct odb_source *source;
+		struct odb_source_files *files;
 
-		for (source = r->objects->sources; source; source = source->next) {
-			struct odb_source_files *files = odb_source_files_downcast(source);
+		for (files = r->objects->files_sources; files; files = files->next_files) {
 			if (files->packed->midx)
 				close_midx(files->packed->midx);
 			files->packed->midx = NULL;
@@ -844,8 +853,8 @@ void clear_midx_file(struct repository *r)
 	if (remove_path(midx.buf))
 		die(_("failed to clear multi-pack-index at %s"), midx.buf);
 
-	clear_midx_files_ext(r->objects->sources, MIDX_EXT_BITMAP, NULL);
-	clear_midx_files_ext(r->objects->sources, MIDX_EXT_REV, NULL);
+	clear_midx_files_ext(odb_primary_source(r->objects), MIDX_EXT_BITMAP, NULL);
+	clear_midx_files_ext(odb_primary_source(r->objects), MIDX_EXT_REV, NULL);
 
 	strbuf_release(&midx);
 }
@@ -853,13 +862,12 @@ void clear_midx_file(struct repository *r)
 void clear_incremental_midx_files(struct repository *r,
 				  const struct strvec *keep_hashes)
 {
-	struct odb_source *source = r->objects->sources;
+	struct odb_source_files *files;
 	struct strbuf chain = STRBUF_INIT;
 
-	get_midx_chain_filename(source, &chain);
+	get_midx_chain_filename(odb_primary_source(r->objects), &chain);
 
-	for (; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+	for (files = r->objects->files_sources; files; files = files->next_files) {
 		if (files->packed->midx)
 			close_midx(files->packed->midx);
 		files->packed->midx = NULL;
@@ -869,11 +877,11 @@ void clear_incremental_midx_files(struct repository *r,
 		die(_("failed to clear multi-pack-index chain at %s"),
 		    chain.buf);
 
-	clear_incremental_midx_files_ext(r->objects->sources, MIDX_EXT_BITMAP,
+	clear_incremental_midx_files_ext(odb_primary_source(r->objects), MIDX_EXT_BITMAP,
 					 keep_hashes);
-	clear_incremental_midx_files_ext(r->objects->sources, MIDX_EXT_REV,
+	clear_incremental_midx_files_ext(odb_primary_source(r->objects), MIDX_EXT_REV,
 					 keep_hashes);
-	clear_incremental_midx_files_ext(r->objects->sources, MIDX_EXT_MIDX,
+	clear_incremental_midx_files_ext(odb_primary_source(r->objects), MIDX_EXT_MIDX,
 					 keep_hashes);
 
 	strbuf_release(&chain);

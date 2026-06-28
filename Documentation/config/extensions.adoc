@@ -56,6 +56,17 @@ preciousObjects:::
 For historical reasons, this extension is respected regardless of the
 `core.repositoryFormatVersion` setting.
 
+objectStorage:::
+	Specify the object storage backend. The value is a single name: `files`
+	(the default: loose objects and packfiles) or any other name, which
+	selects the `git-local-<name>` object helper program that serves objects
+	over a line protocol, the way `refStorage` selects a reference helper and
+	an unknown URL scheme selects a `git-remote-<name>` helper.
++
+Like `refStorage`, this should only be set by linkgit:git-init[1] or
+linkgit:git-clone[1]; convert an existing repository with `git odb migrate
+--object-storage=<name>` instead.
+
 refStorage:::
 	Specify the ref storage format and a corresponding payload. The value
 	can be either a format name or a URI:

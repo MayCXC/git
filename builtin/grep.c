@@ -28,6 +28,7 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source-files.h"
 #include "oid-array.h"
 #include "oidset.h"
 #include "packfile.h"
@@ -510,7 +511,7 @@ static int grep_submodule(struct grep_opt *opt,
 	 * unexpected code interaction, it won't be needed).
 	 */
 	odb_add_submodule_source_by_path(the_repository->objects,
-					 subrepo->objects->sources->path);
+					 repo_get_object_directory(subrepo));
 	obj_read_unlock();
 
 	memcpy(&subopt, opt, sizeof(subopt));
@@ -1358,13 +1359,16 @@ int cmd_grep(int argc,
 			repo_read_gitmodules(the_repository, 1);
 
 		if (startup_info->have_repository) {
-			struct odb_source *source;
+			struct odb_source_files *files;
 
+			/*
+			 * Warm each files source's pack state up front (other
+			 * backends have no packs) so worker threads do not race
+			 * on lazy initialization once started.
+			 */
 			odb_prepare_alternates(the_repository->objects);
-			for (source = the_repository->objects->sources; source; source = source->next) {
-				struct odb_source_files *files = odb_source_files_downcast(source);
+			for (files = the_repository->objects->files_sources; files; files = files->next_files)
 				packfile_store_prepare(files->packed);
-			}
 		}
 
 		start_threads(&opt);

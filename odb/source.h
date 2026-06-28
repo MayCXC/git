@@ -789,6 +789,17 @@ struct odb_source *odb_source_new(struct object_database *odb,
 				  bool local);
 
 /*
+ * Like odb_source_new(), but construct a primary source for the explicitly given
+ * backend name rather than the object database's currently configured one. This
+ * builds the destination store of an object-storage migration. A name with no
+ * registered backend is a helper name (git-local-<name>), as in odb_source_new().
+ */
+struct odb_source *odb_source_new_named(struct object_database *odb,
+					const char *path,
+					const char *name);
+
+
+/*
  * Initialize the source for the given object database located at `path`.
  * `local` indicates whether or not the source is the local and thus primary
  * object source of the object database.

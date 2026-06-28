@@ -83,6 +83,7 @@ int cmd_init_db(int argc,
 	unsigned int flags = 0;
 	const char *object_format = NULL;
 	const char *ref_format = NULL;
+	const char *object_storage = NULL;
 	const char *initial_branch = NULL;
 	int hash_algo = GIT_HASH_UNKNOWN;
 	int init_shared_repository = -1;
@@ -109,6 +110,8 @@ int cmd_init_db(int argc,
 			   N_("specify the hash algorithm to use")),
 		OPT_STRING(0, "ref-format", &ref_format, N_("format"),
 			   N_("specify the reference format to use")),
+		OPT_STRING(0, "object-storage", &object_storage, N_("backend"),
+			   N_("specify the object storage backend to use (\"files\" or a helper name)")),
 		OPT_END()
 	};
 	int ret;
@@ -246,7 +249,7 @@ int cmd_init_db(int argc,
 
 	flags |= INIT_DB_EXIST_OK;
 	ret = init_db(the_repository, git_dir, real_git_dir, template_dir, hash_algo,
-		      ref_format, initial_branch,
+		      ref_format, object_storage, initial_branch,
 		      init_shared_repository, flags);
 
 	free(template_dir_to_free);
