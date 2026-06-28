@@ -598,6 +598,111 @@ void stage_tmp_packfiles(struct repository *repo,
 	free(mtimes_tmp_name);
 }
 
+const char *derive_filename(const char *pack_name, const char *strip,
+			    const char *suffix, struct strbuf *buf)
+{
+	size_t len;
+	if (!strip_suffix(pack_name, strip, &len) || !len ||
+	    pack_name[len - 1] != '.')
+		die(_("packfile name '%s' does not end with '.%s'"),
+		    pack_name, strip);
+	strbuf_add(buf, pack_name, len);
+	strbuf_addstr(buf, suffix);
+	return buf->buf;
+}
+
+void write_special_file(struct repository *repo, const char *suffix,
+			const char *msg, const char *pack_name,
+			const unsigned char *hash, const char **report)
+{
+	struct strbuf name_buf = STRBUF_INIT;
+	const char *filename;
+	int fd;
+	int msg_len = strlen(msg);
+
+	if (pack_name)
+		filename = derive_filename(pack_name, "pack", suffix, &name_buf);
+	else
+		filename = odb_pack_name(repo, &name_buf, hash, suffix);
+
+	fd = safe_create_file_with_leading_directories(repo, filename);
+	if (fd < 0) {
+		if (errno != EEXIST)
+			die_errno(_("cannot write %s file '%s'"),
+				  suffix, filename);
+	} else {
+		if (msg_len > 0) {
+			write_or_die(fd, msg, msg_len);
+			write_or_die(fd, "\n", 1);
+		}
+		if (close(fd) != 0)
+			die_errno(_("cannot close written %s file '%s'"),
+				  suffix, filename);
+		if (report)
+			*report = suffix;
+	}
+	strbuf_release(&name_buf);
+}
+
+static void finalize_pack_component(struct repository *repo,
+				    const char **final_name,
+				    const char *curr_name,
+				    struct strbuf *name, unsigned char *hash,
+				    const char *ext, int make_read_only_if_same)
+{
+	if (!*final_name || strcmp(*final_name, curr_name)) {
+		if (!*final_name)
+			*final_name = odb_pack_name(repo, name, hash, ext);
+		if (finalize_object_file(repo, curr_name, *final_name))
+			die(_("unable to rename temporary '*.%s' file to '%s'"),
+			    ext, *final_name);
+	} else if (make_read_only_if_same) {
+		chmod(*final_name, 0444);
+	}
+}
+
+const char *install_packfile(struct repository *repo, unsigned char *hash,
+			     const char **final_pack_name,
+			     const char *curr_pack_name,
+			     const char **final_index_name,
+			     const char *curr_index_name,
+			     const char **final_rev_index_name,
+			     const char *curr_rev_index_name,
+			     const char *keep_msg, const char *promisor_msg,
+			     int make_read_only_if_same)
+{
+	const char *report = "pack";
+	struct strbuf pack_name = STRBUF_INIT;
+	struct strbuf index_name = STRBUF_INIT;
+	struct strbuf rev_index_name = STRBUF_INIT;
+
+	/*
+	 * Write the .keep/.promisor markers before the pack becomes visible, so
+	 * a concurrent gc cannot repack or prune the pack before its caller is
+	 * done with it.
+	 */
+	if (keep_msg)
+		write_special_file(repo, "keep", keep_msg, *final_pack_name,
+				   hash, &report);
+	if (promisor_msg)
+		write_special_file(repo, "promisor", promisor_msg,
+				   *final_pack_name, hash, NULL);
+
+	finalize_pack_component(repo, final_pack_name, curr_pack_name,
+				&pack_name, hash, "pack", make_read_only_if_same);
+	if (curr_rev_index_name)
+		finalize_pack_component(repo, final_rev_index_name,
+					curr_rev_index_name, &rev_index_name,
+					hash, "rev", 1);
+	finalize_pack_component(repo, final_index_name, curr_index_name,
+				&index_name, hash, "idx", 1);
+
+	strbuf_release(&rev_index_name);
+	strbuf_release(&index_name);
+	strbuf_release(&pack_name);
+	return report;
+}
+
 void write_promisor_file(const char *promisor_name, struct ref **sought, int nr_sought)
 {
 	int i, err;

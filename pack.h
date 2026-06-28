@@ -154,4 +154,38 @@ void rename_tmp_packfile_idx(struct repository *repo,
 			     struct strbuf *basename,
 			     char **idx_tmp_name);
 
+/*
+ * Strip the ".<strip>" suffix off pack_name and append <suffix>, writing the
+ * result into buf and returning it (e.g. "pack-X.pack" + "idx" -> "pack-X.idx").
+ */
+const char *derive_filename(const char *pack_name, const char *strip,
+			    const char *suffix, struct strbuf *buf);
+
+/*
+ * Write a marker file (e.g. ".keep" or ".promisor") alongside a pack. If
+ * pack_name is non-NULL it names the destination pack; otherwise the location
+ * is derived from hash. msg (possibly empty) is written as the file content. If
+ * report is non-NULL and the file is created, *report is set to suffix.
+ */
+void write_special_file(struct repository *repo, const char *suffix,
+			const char *msg, const char *pack_name,
+			const unsigned char *hash, const char **report);
+
+/*
+ * Install a finished pack into the object store: write the .keep/.promisor
+ * markers (before the pack becomes visible), then move the temporary pack,
+ * index, and (optional) reverse index into place. Each final_* name is filled
+ * in from hash when initially NULL. Returns the report token ("pack", or "keep"
+ * when a .keep marker was written) for index-pack's stdout.
+ */
+const char *install_packfile(struct repository *repo, unsigned char *hash,
+			     const char **final_pack_name,
+			     const char *curr_pack_name,
+			     const char **final_index_name,
+			     const char *curr_index_name,
+			     const char **final_rev_index_name,
+			     const char *curr_rev_index_name,
+			     const char *keep_msg, const char *promisor_msg,
+			     int make_read_only_if_same);
+
 #endif

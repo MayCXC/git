@@ -1542,78 +1542,14 @@ static void fix_unresolved_deltas(struct hashfile *f)
 	free(sorted_by_pos);
 }
 
-static const char *derive_filename(const char *pack_name, const char *strip,
-				   const char *suffix, struct strbuf *buf)
-{
-	size_t len;
-	if (!strip_suffix(pack_name, strip, &len) || !len ||
-	    pack_name[len - 1] != '.')
-		die(_("packfile name '%s' does not end with '.%s'"),
-		    pack_name, strip);
-	strbuf_add(buf, pack_name, len);
-	strbuf_addstr(buf, suffix);
-	return buf->buf;
-}
-
-static void write_special_file(const char *suffix, const char *msg,
-			       const char *pack_name, const unsigned char *hash,
-			       const char **report)
-{
-	struct strbuf name_buf = STRBUF_INIT;
-	const char *filename;
-	int fd;
-	int msg_len = strlen(msg);
-
-	if (pack_name)
-		filename = derive_filename(pack_name, "pack", suffix, &name_buf);
-	else
-		filename = odb_pack_name(the_repository, &name_buf, hash, suffix);
-
-	fd = safe_create_file_with_leading_directories(the_repository, filename);
-	if (fd < 0) {
-		if (errno != EEXIST)
-			die_errno(_("cannot write %s file '%s'"),
-				  suffix, filename);
-	} else {
-		if (msg_len > 0) {
-			write_or_die(fd, msg, msg_len);
-			write_or_die(fd, "\n", 1);
-		}
-		if (close(fd) != 0)
-			die_errno(_("cannot close written %s file '%s'"),
-				  suffix, filename);
-		if (report)
-			*report = suffix;
-	}
-	strbuf_release(&name_buf);
-}
-
-static void rename_tmp_packfile(const char **final_name,
-				const char *curr_name,
-				struct strbuf *name, unsigned char *hash,
-				const char *ext, int make_read_only_if_same)
-{
-	if (!*final_name || strcmp(*final_name, curr_name)) {
-		if (!*final_name)
-			*final_name = odb_pack_name(the_repository, name, hash, ext);
-		if (finalize_object_file(the_repository, curr_name, *final_name))
-			die(_("unable to rename temporary '*.%s' file to '%s'"),
-			    ext, *final_name);
-	} else if (make_read_only_if_same) {
-		chmod(*final_name, 0444);
-	}
-}
-
 static void final(const char *final_pack_name, const char *curr_pack_name,
 		  const char *final_index_name, const char *curr_index_name,
 		  const char *final_rev_index_name, const char *curr_rev_index_name,
 		  const char *keep_msg, const char *promisor_msg,
 		  unsigned char *hash)
 {
-	const char *report = "pack";
-	struct strbuf pack_name = STRBUF_INIT;
-	struct strbuf index_name = STRBUF_INIT;
-	struct strbuf rev_index_name = STRBUF_INIT;
+	const char *report;
+	int index_name_given;
 
 	if (!from_stdin) {
 		close(input_fd);
@@ -1623,25 +1559,28 @@ static void final(const char *final_pack_name, const char *curr_pack_name,
 			die_errno(_("error while closing pack file"));
 	}
 
-	if (keep_msg)
-		write_special_file("keep", keep_msg, final_pack_name, hash,
-				   &report);
-	if (promisor_msg)
-		write_special_file("promisor", promisor_msg, final_pack_name,
-				   hash, NULL);
+	/*
+	 * install_packfile() leaves *final_index_name pointing into a released
+	 * strbuf when it has to derive the name, so capture whether a stable
+	 * name was supplied before the call and recompute the canonical one from
+	 * the hash otherwise.
+	 */
+	index_name_given = !!final_index_name;
 
-	rename_tmp_packfile(&final_pack_name, curr_pack_name, &pack_name,
-			    hash, "pack", from_stdin);
-	if (curr_rev_index_name)
-		rename_tmp_packfile(&final_rev_index_name, curr_rev_index_name,
-				    &rev_index_name, hash, "rev", 1);
-	rename_tmp_packfile(&final_index_name, curr_index_name, &index_name,
-			    hash, "idx", 1);
+	report = install_packfile(the_repository, hash,
+				  &final_pack_name, curr_pack_name,
+				  &final_index_name, curr_index_name,
+				  &final_rev_index_name, curr_rev_index_name,
+				  keep_msg, promisor_msg, from_stdin);
 
 	if (do_fsck_object && startup_info->have_repository) {
+		struct strbuf idx = STRBUF_INIT;
+		const char *idx_name = index_name_given ? final_index_name :
+			odb_pack_name(the_repository, &idx, hash, "idx");
 		struct odb_source_files *files =
 			odb_source_files_downcast(the_repository->objects->sources);
-		packfile_store_load_pack(files->packed, final_index_name, 0);
+		packfile_store_load_pack(files->packed, idx_name, 0);
+		strbuf_release(&idx);
 	}
 
 	if (!from_stdin) {
@@ -1656,10 +1595,6 @@ static void final(const char *final_pack_name, const char *curr_pack_name,
 		/* Write the last part of the buffer to stdout */
 		write_in_full(1, input_buffer + input_offset, input_len);
 	}
-
-	strbuf_release(&rev_index_name);
-	strbuf_release(&index_name);
-	strbuf_release(&pack_name);
 }
 
 static int git_index_pack_config(const char *k, const char *v,
@@ -1868,7 +1803,7 @@ static void repack_local_links(void)
 		 * pack-objects creates the .pack and .idx files, but not the
 		 * .promisor file. Create the .promisor file, which is empty.
 		 */
-		write_special_file("promisor", "", NULL, binary, NULL);
+		write_special_file(the_repository, "promisor", "", NULL, binary, NULL);
 	}
 
 	fclose(out);
