@@ -1326,7 +1326,7 @@ int is_pseudo_ref(const char *refname);
  * specified one.
  */
 int repo_migrate_ref_storage_format(struct repository *repo,
-				    enum ref_storage_format format,
+				    const char *name,
 				    unsigned int flags,
 				    struct strbuf *err);
 

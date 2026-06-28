@@ -30,7 +30,7 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 		NULL,
 	};
 	const char *format_str = NULL;
-	enum ref_storage_format format;
+	const char *current;
 	unsigned int flags = 0;
 	struct option options[] = {
 		OPT_STRING_F(0, "ref-format", &format_str, N_("format"),
@@ -53,19 +53,21 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 	if (!format_str)
 		usage(_("missing --ref-format=<format>"));
 
-	format = ref_storage_format_by_name(format_str);
-	if (format == REF_STORAGE_FORMAT_UNKNOWN) {
-		err = error(_("unknown ref storage format '%s'"), format_str);
+	/*
+	 * The destination is a selector name: a builtin format or, like an
+	 * unknown URL scheme, a git-local-<name> ref helper, resolved when the
+	 * destination store is built (a missing helper fails there). Reject a
+	 * same-format request up front for a clearer message.
+	 */
+	current = the_repository->ref_storage_name && *the_repository->ref_storage_name ?
+		  the_repository->ref_storage_name :
+		  ref_storage_format_to_name(REF_STORAGE_FORMAT_DEFAULT);
+	if (!strcmp(current, format_str)) {
+		err = error(_("repository already uses '%s' format"), current);
 		goto out;
 	}
 
-	if (the_repository->ref_storage_format == format) {
-		err = error(_("repository already uses '%s' format"),
-			    ref_storage_format_to_name(format));
-		goto out;
-	}
-
-	if (repo_migrate_ref_storage_format(the_repository, format, flags, &errbuf) < 0) {
+	if (repo_migrate_ref_storage_format(the_repository, format_str, flags, &errbuf) < 0) {
 		err = error("%s", errbuf.buf);
 		goto out;
 	}

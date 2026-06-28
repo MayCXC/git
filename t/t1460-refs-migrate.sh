@@ -82,13 +82,13 @@ test_expect_success "missing ref storage format" '
 	test_cmp expect err
 '
 
-test_expect_success "unknown ref storage format" '
+test_expect_success "unknown ref storage format defers to a helper" '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
 	test_must_fail git -C repo refs migrate \
 		--ref-format=unknown 2>err &&
 	cat >expect <<-EOF &&
-	error: unknown ref storage format ${SQ}unknown${SQ}
+	fatal: unable to start helper ${SQ}unknown${SQ}
 	EOF
 	test_cmp expect err
 '

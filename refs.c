@@ -3350,7 +3350,7 @@ static int has_worktrees(void)
 }
 
 int repo_migrate_ref_storage_format(struct repository *repo,
-				    enum ref_storage_format format,
+				    const char *name,
 				    unsigned int flags,
 				    struct strbuf *errbuf)
 {
@@ -3365,10 +3365,13 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		.name = STRBUF_INIT,
 		.mail = STRBUF_INIT,
 	};
+	const char *current = repo->ref_storage_name && *repo->ref_storage_name
+		? repo->ref_storage_name
+		: ref_storage_format_to_name(REF_STORAGE_FORMAT_DEFAULT);
 	int did_migrate_refs = 0;
 	int ret;
 
-	if (repo->ref_storage_format == format) {
+	if (!strcmp(current, name)) {
 		strbuf_addstr(errbuf, "current and new ref storage format are equal");
 		ret = -1;
 		goto done;
@@ -3425,8 +3428,8 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		goto done;
 	}
 
-	new_refs = ref_store_init(repo, ref_storage_format_to_name(format), NULL,
-				  new_gitdir.buf, REF_STORE_ALL_CAPS, 0);
+	new_refs = ref_store_init(repo, name, NULL, new_gitdir.buf,
+				  REF_STORE_ALL_CAPS, 1);
 	ret = ref_store_create_on_disk(new_refs, 0, errbuf);
 	if (ret < 0)
 		goto done;
@@ -3511,7 +3514,7 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 	 * We also need to swap out the repository's main ref store.
 	 */
 	initialize_repository_version(the_repository, hash_algo_by_ptr(repo->hash_algo),
-				      ref_storage_format_to_name(format), 1);
+				      name, 1);
 
 	/*
 	 * Unset the old ref store and release it. `get_main_ref_store()` will

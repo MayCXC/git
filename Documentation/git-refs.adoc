@@ -57,9 +57,16 @@ OPTIONS
 The following options are specific to `git refs migrate`:
 
 `--ref-format=<format>`::
-	The ref format to migrate the ref store to. Can be one of:
+	The ref format to migrate the ref store to. A builtin format name selects
+	that backend:
 +
 include::ref-storage-format.adoc[]
++
+Any other name selects the `git-local-<name>` reference helper program, exactly
+as an unknown URL scheme selects a `git-remote-<name>` helper; the references are
+copied into a freshly created store served by that helper. A helper that is a
+migration destination keeps its on-disk state under the repository directory, so
+the relocation step can move it into place.
 
 `--dry-run`::
 	Perform the migration, but do not modify the repository. The migrated
