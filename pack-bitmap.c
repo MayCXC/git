@@ -18,6 +18,7 @@
 #include "repository.h"
 #include "trace2.h"
 #include "odb.h"
+#include "odb/source-files.h"
 #include "list-objects-filter-options.h"
 #include "midx.h"
 #include "config.h"
@@ -48,11 +49,32 @@ struct bitmap_index {
 	 * The pack or multi-pack index (MIDX) that this bitmap index belongs
 	 * to.
 	 *
-	 * Exactly one of these must be non-NULL; this specifies the object
-	 * order used to interpret this bitmap.
+	 * Exactly one of `pack`, `midx`, or `source` (below) is non-NULL;
+	 * that one specifies the object order used to interpret this bitmap.
 	 */
 	struct packed_git *pack;
 	struct multi_pack_index *midx;
+
+	/*
+	 * A non-pack ODB source (an object-storage helper) that supplies its own
+	 * object order instead of a pack/midx. objects.pack_pos IS the bit, and
+	 * bit <-> oid is resolved on demand through the source (nothing fetched at
+	 * open): an operation hands its set of bits to odb_source_resolve_bits and
+	 * gets back exactly those oids in bit order (O(touched), the batched analogue
+	 * of touching a pack's mmap'd .idx); oid -> bit is odb_source_pos_of_oid (the
+	 * analogue of find_pack_entry_one). `source` (below) being non-NULL marks a
+	 * source bitmap; source_nr is the object count; `map` points at a malloc'd
+	 * bitmap buffer the source handed over (freed, not munmapped); reachability
+	 * for objects not in the order falls back to a walk.
+	 */
+	uint32_t source_nr;
+	struct repository *source_repo;
+	/*
+	 * For a source bitmap opened without its commit entries (the helper holds
+	 * them as per-commit rows): the odb_source to fault a commit's bitmap in
+	 * through, on a `bitmaps` khash miss. NULL means entries were loaded eagerly.
+	 */
+	struct odb_source *source;
 
 	/*
 	 * If using a multi-pack index chain, 'base' points to the
@@ -197,8 +219,15 @@ static struct ewah_bitmap *read_bitmap_1(struct bitmap_index *index)
 	return read_bitmap(index->map, index->map_size, &index->map_pos);
 }
 
+static inline int bitmap_is_source(struct bitmap_index *index)
+{
+	return index->source != NULL;
+}
+
 static uint32_t bitmap_num_objects_total(struct bitmap_index *index)
 {
+	if (bitmap_is_source(index))
+		return index->source_nr;
 	if (index->midx) {
 		struct multi_pack_index *m = index->midx;
 		return m->num_objects + m->num_objects_in_base;
@@ -208,6 +237,8 @@ static uint32_t bitmap_num_objects_total(struct bitmap_index *index)
 
 static uint32_t bitmap_num_objects(struct bitmap_index *index)
 {
+	if (bitmap_is_source(index))
+		return index->source_nr;
 	if (index->midx)
 		return index->midx->num_objects;
 	return index->pack->num_objects;
@@ -237,6 +268,8 @@ static uint32_t bitmap_name_hash(struct bitmap_index *index, uint32_t pos)
 
 static struct repository *bitmap_repo(struct bitmap_index *bitmap_git)
 {
+	if (bitmap_is_source(bitmap_git))
+		return bitmap_git->source_repo;
 	if (bitmap_is_midx(bitmap_git))
 		return bitmap_git->midx->source->odb->repo;
 	return bitmap_git->pack->repo;
@@ -380,10 +413,30 @@ static inline uint8_t read_u8(const unsigned char *buffer, size_t *pos)
 
 #define MAX_XOR_OFFSET 160
 
+/* Receive the single oid resolve_bits yields for a one-bit lookup (nth). */
+struct source_one_oid { struct object_id *out; int got; };
+static void source_set_one_oid(const struct object_id *oid, void *data)
+{
+	struct source_one_oid *c = data;
+	oidcpy(c->out, oid);
+	c->got = 1;
+}
+
 static int nth_bitmap_object_oid(struct bitmap_index *index,
 				 struct object_id *oid,
 				 uint32_t n)
 {
+	if (bitmap_is_source(index)) {
+		/* n is the bit; resolve it through the source (a one-bit batch). */
+		uint32_t bit = n;
+		struct source_one_oid c = { oid, 0 };
+		if (n >= index->source_nr)
+			return -1;
+		if (odb_source_resolve_bits(index->source, &bit, 1,
+					    source_set_one_oid, &c) < 0 || !c.got)
+			return -1;
+		return 0;
+	}
 	if (index->midx)
 		return nth_midxed_object_oid(oid, index->midx, n) ? 0 : -1;
 	return nth_packed_object_id(oid, index->pack, n);
@@ -598,6 +651,8 @@ static int open_pack_bitmap_1(struct bitmap_index *bitmap_git, struct packed_git
 
 static int load_reverse_index(struct repository *r, struct bitmap_index *bitmap_git)
 {
+	if (bitmap_is_source(bitmap_git))
+		return 0;	/* source bit positions are the object order; no revindex */
 	if (bitmap_is_midx(bitmap_git)) {
 		struct multi_pack_index *m;
 
@@ -680,59 +735,103 @@ static int load_bitmap(struct repository *r, struct bitmap_index *bitmap_git,
 	return 0;
 }
 
-static int open_pack_bitmap(struct repository *r,
-			    struct bitmap_index *bitmap_git)
+/*
+ * The files backend's odb_source `open_bitmap` method: open this source's
+ * reachability bitmap (its multi-pack-index bitmap if present, else one of its
+ * pack bitmaps) from its own concrete packfile_store. open_*_bitmap_1() keep
+ * the first bitmap and ignore any extras (reported under trace2).
+ */
+int files_open_bitmap(struct odb_source *source, struct bitmap_index *bitmap_git)
 {
-	struct packed_git *p;
-	int ret = -1;
+	struct odb_source_files *files = odb_source_files_downcast(source);
+	struct multi_pack_index *midx = get_multi_pack_index(source);
+	struct packfile_list_entry *e;
+	int found = 0;
 
-	repo_for_each_pack(r, p) {
-		if (open_pack_bitmap_1(bitmap_git, p) == 0) {
-			ret = 0;
-			/*
-			 * The only reason to keep looking is to report
-			 * duplicates.
-			 */
+	if (midx && open_midx_bitmap_1(bitmap_git, midx) == 0) {
+		found = 1;
+		/* The only reason to keep looking is to report duplicates. */
+		if (!trace2_is_enabled())
+			return 0;
+	}
+
+	for (e = packfile_store_get_packs(files->packed); e; e = e->next) {
+		if (open_pack_bitmap_1(bitmap_git, e->pack) == 0) {
+			found = 1;
 			if (!trace2_is_enabled())
 				break;
 		}
 	}
 
-	return ret;
+	return found ? 0 : -1;
 }
 
-static int open_midx_bitmap(struct repository *r,
-			    struct bitmap_index *bitmap_git)
+/*
+ * Open a reachability bitmap supplied by a non-pack ODB source (an
+ * object-storage helper): `map`/`map_size` is the EWAH .bitmap content the source handed over,
+ * and `order`/`nr` is its object order (order[i] is the oid at bit position i).
+ * Ownership of `map` and `order` passes to `bitmap_git` (released by
+ * free_bitmap_index, which frees rather than munmaps a source map). This is the
+ * source analogue of open_pack_bitmap_1(); the caller then runs load_bitmap().
+ * Returns 0 if the header parsed, -1 otherwise.
+ */
+int bitmap_git_open_source(struct bitmap_index *bitmap_git,
+			   struct repository *repo,
+			   unsigned char *map, size_t map_size,
+			   uint32_t nr, struct odb_source *source)
 {
-	struct odb_source *source;
-	int ret = -1;
+	/*
+	 * This consumes map: on success bitmap_git owns it (freed by
+	 * free_bitmap_index, including after a load_bitmap_header failure here); on
+	 * the early rejection below it is freed before returning, so the caller
+	 * always relinquishes it after the call.
+	 */
+	if (bitmap_git->pack || bitmap_git->midx || bitmap_git->source)
+		goto reject;	/* a bitmap is already open; ignore this one */
 
-	assert(!bitmap_git->map);
+	/*
+	 * Nothing is fetched at open: bit <-> oid is resolved on demand through the
+	 * source (odb_source_resolve_bits for an operation's bit set, batched;
+	 * odb_source_pos_of_oid for a want). source_nr is the object count.
+	 */
+	bitmap_git->source_repo = repo;
+	bitmap_git->source = source;	/* marks a source bitmap; commits + orderings on demand */
+	bitmap_git->source_nr = nr;
 
-	odb_prepare_alternates(r->objects);
-	for (source = r->objects->sources; source; source = source->next) {
-		struct multi_pack_index *midx = get_multi_pack_index(source);
-		if (midx && !open_midx_bitmap_1(bitmap_git, midx))
-			ret = 0;
-	}
-	return ret;
+	bitmap_git->map = map;
+	bitmap_git->map_size = map_size;
+	bitmap_git->map_pos = 0;
+	bitmap_git->base_nr = 0;
+
+	return load_bitmap_header(bitmap_git);
+
+reject:
+	free(map);
+	return -1;
 }
 
 static int open_bitmap(struct repository *r,
 		       struct bitmap_index *bitmap_git)
 {
-	int found;
+	struct odb_source *source;
+	int found = 0;
 
 	assert(!bitmap_git->map);
 
-	found = !open_midx_bitmap(r, bitmap_git);
-
 	/*
-	 * these will all be skipped if we opened a midx bitmap; but run it
-	 * anyway if tracing is enabled to report the duplicates
+	 * Each source reports its own reachability bitmap through the vtable
+	 * (a non-files backend has none); the first one found wins, and we keep
+	 * looking only to report duplicates under trace2. No branch on the
+	 * backend type.
 	 */
-	if (!found || trace2_is_enabled())
-		found |= !open_pack_bitmap(r, bitmap_git);
+	odb_prepare_alternates(r->objects);
+	for (source = odb_primary_source(r->objects); source; source = source->next) {
+		if (odb_source_open_bitmap(source, bitmap_git) == 0) {
+			found = 1;
+			if (!trace2_is_enabled())
+				break;
+		}
+	}
 
 	return found ? 0 : -1;
 }
@@ -757,6 +856,55 @@ struct bitmap_index *prepare_midx_bitmap_git(struct multi_pack_index *midx)
 
 	free_bitmap_index(bitmap_git);
 	return NULL;
+}
+
+int for_each_bitmap_commit_entry(struct repository *r, struct packed_git *pack,
+				 bitmap_commit_entry_fn fn, void *data)
+{
+	struct bitmap_index *bitmap_git = xcalloc(1, sizeof(*bitmap_git));
+	struct object_id oid;
+	struct stored_bitmap *stored;
+	int ret = 0;
+
+	if (open_pack_bitmap_1(bitmap_git, pack) < 0 ||
+	    load_bitmap(r, bitmap_git, 0) < 0) {
+		free_bitmap_index(bitmap_git);
+		return -1;
+	}
+
+	/*
+	 * load_bitmap() only fills ->bitmaps eagerly when the bitmap has no
+	 * commit lookup table; force the eager load otherwise so every entry is
+	 * iterable, exactly as test_bitmap_commits_with_offset() does.
+	 */
+	if (bitmap_git->table_lookup && load_bitmap_entries_v1(bitmap_git) < 0) {
+		free_bitmap_index(bitmap_git);
+		return -1;
+	}
+
+	/*
+	 * stored->root is the entry as read (the xor-delta for a chained entry,
+	 * the full set otherwise); stored->xor->oid is the base commit. We never
+	 * call bitmap_for_commit()/lookup_stored_bitmap() here, so the raw form
+	 * is preserved -- we hand it out verbatim, base-by-oid.
+	 */
+	kh_foreach(bitmap_git->bitmaps, oid, stored, {
+		if (!ret) {
+			struct strbuf buf = STRBUF_INIT;
+			const struct object_id *xor_base =
+				stored->xor ? &stored->xor->oid : NULL;
+
+			if (ewah_serialize_strbuf(stored->root, &buf) < 0)
+				ret = -1;
+			else
+				ret = fn(&oid, xor_base, stored->flags,
+					 buf.buf, buf.len, data);
+			strbuf_release(&buf);
+		}
+	});
+
+	free_bitmap_index(bitmap_git);
+	return ret;
 }
 
 int bitmap_index_contains_pack(struct bitmap_index *bitmap, struct packed_git *pack)
@@ -853,6 +1001,8 @@ static uint32_t bitmap_bsearch_pos(struct bitmap_index *bitmap_git,
 {
 	int found;
 
+	if (bitmap_is_source(bitmap_git))
+		return 0;	/* source has no lookup table; its entries are eager */
 	if (bitmap_is_midx(bitmap_git))
 		found = bsearch_midx(oid, bitmap_git->midx, result);
 	else
@@ -1017,6 +1167,53 @@ corrupt:
 	return NULL;
 }
 
+/*
+ * The source-backed analogue of lazy_bitmap_for_commit(): a source bitmap opened
+ * without its commit entries (the helper stores them as per-commit rows) faults
+ * one in on demand via the odb_source. The stored entry is the raw EWAH (an
+ * xor-delta when xor_base is set) plus its xor-base commit oid, so we recurse to
+ * load the base raw, by oid, and chain to it -- exactly what store_bitmap()
+ * expects, with composition deferred to lookup_stored_bitmap(), just as the
+ * lookup-table path does. Returns NULL if the source has no entry for this commit.
+ */
+static struct stored_bitmap *source_lazy_bitmap_for_commit(struct bitmap_index *bitmap_git,
+							   struct commit *commit)
+{
+	struct object_id xor_base;
+	struct stored_bitmap *xor_st = NULL;
+	struct ewah_bitmap *root;
+	void *ewah_bytes = NULL;
+	size_t ewah_len = 0, pos = 0;
+	int flags = 0;
+
+	if (odb_source_get_commit_bitmap(bitmap_git->source, &commit->object.oid,
+					 &xor_base, &flags, &ewah_bytes, &ewah_len) < 0)
+		return NULL;
+
+	root = read_bitmap((const unsigned char *)ewah_bytes, ewah_len, &pos);
+	free(ewah_bytes);
+	if (!root)
+		return NULL;
+
+	if (!is_null_oid(&xor_base)) {
+		khiter_t p = kh_get_oid_map(bitmap_git->bitmaps, xor_base);
+		if (p < kh_end(bitmap_git->bitmaps)) {
+			xor_st = kh_value(bitmap_git->bitmaps, p);
+		} else {
+			struct commit *base = lookup_commit(bitmap_git->source_repo,
+							    &xor_base);
+			if (base)
+				xor_st = source_lazy_bitmap_for_commit(bitmap_git, base);
+		}
+		if (!xor_st) {
+			ewah_pool_free(root);
+			return NULL;
+		}
+	}
+
+	return store_bitmap(bitmap_git, root, &commit->object.oid, xor_st, flags, 0);
+}
+
 static struct ewah_bitmap *find_bitmap_for_commit(struct bitmap_index *bitmap_git,
 						  struct commit *commit,
 						  struct bitmap_index **found)
@@ -1028,6 +1225,15 @@ static struct ewah_bitmap *find_bitmap_for_commit(struct bitmap_index *bitmap_gi
 	hash_pos = kh_get_oid_map(bitmap_git->bitmaps, commit->object.oid);
 	if (hash_pos >= kh_end(bitmap_git->bitmaps)) {
 		struct stored_bitmap *bitmap = NULL;
+		if (bitmap_git->source) {
+			bitmap = source_lazy_bitmap_for_commit(bitmap_git, commit);
+			if (!bitmap)
+				return find_bitmap_for_commit(bitmap_git->base, commit,
+							      found);
+			if (found)
+				*found = bitmap_git;
+			return lookup_stored_bitmap(bitmap);
+		}
 		if (!bitmap_git->table_lookup)
 			return find_bitmap_for_commit(bitmap_git->base, commit,
 						      found);
@@ -1092,11 +1298,25 @@ static int bitmap_position_midx(struct bitmap_index *bitmap_git,
 	return got;
 }
 
+static int bitmap_position_source(struct bitmap_index *bitmap_git,
+				  const struct object_id *oid)
+{
+	/*
+	 * oid -> bit on demand (the source analogue of find_pack_entry_one() +
+	 * offset_to_pack_pos()): the helper indexes objects by oid, so one query
+	 * returns the bit, or -1 if the object is not in the bitmap. No in-memory
+	 * index to bsearch.
+	 */
+	return odb_source_pos_of_oid(bitmap_git->source, oid);
+}
+
 static int bitmap_position(struct bitmap_index *bitmap_git,
 			   const struct object_id *oid)
 {
 	int pos;
-	if (bitmap_is_midx(bitmap_git))
+	if (bitmap_is_source(bitmap_git))
+		pos = bitmap_position_source(bitmap_git, oid);
+	else if (bitmap_is_midx(bitmap_git))
 		pos = bitmap_position_midx(bitmap_git, oid);
 	else
 		pos = bitmap_position_packfile(bitmap_git, oid);
@@ -1694,6 +1914,19 @@ static void init_type_iterator(struct ewah_or_iterator *it,
 	}
 }
 
+struct show_source_objects {
+	show_reachable_fn show_reach;
+	enum object_type type;
+	void *payload;
+};
+
+static void show_source_object(const struct object_id *oid, void *data)
+{
+	struct show_source_objects *c = data;
+	/* The source has no pack location and no name-hash cache (hash 0). */
+	c->show_reach(oid, c->type, 0, 0, NULL, 0, c->payload);
+}
+
 static void show_objects_for_type(
 	struct bitmap_index *bitmap_git,
 	struct bitmap *objects,
@@ -1703,6 +1936,9 @@ static void show_objects_for_type(
 {
 	size_t i = 0;
 	uint32_t offset;
+	int is_source = bitmap_is_source(bitmap_git);
+	uint32_t *src_bits = NULL;
+	size_t src_nr = 0, src_alloc = 0;
 
 	struct ewah_or_iterator it;
 	eword_t filter;
@@ -1728,7 +1964,16 @@ static void show_objects_for_type(
 
 			offset += ewah_bit_ctz64(word >> offset);
 
-			if (bitmap_is_midx(bitmap_git)) {
+			if (is_source) {
+				/*
+				 * objects.pack_pos == the bit; collect it and resolve
+				 * the whole set to oids in one batch after the loop
+				 * (the object has no pack location).
+				 */
+				ALLOC_GROW(src_bits, src_nr + 1, src_alloc);
+				src_bits[src_nr++] = pos + offset;
+				continue;
+			} else if (bitmap_is_midx(bitmap_git)) {
 				struct multi_pack_index *m = bitmap_git->midx;
 				uint32_t pack_id;
 
@@ -1753,6 +1998,20 @@ static void show_objects_for_type(
 	}
 
 	ewah_or_iterator_release(&it);
+
+	if (is_source) {
+		/*
+		 * Hand this type's bit set to the source and emit its oids in bit
+		 * order: one batched resolve over exactly the bits touched. Skip the
+		 * round-trip (and its query) entirely when this type contributed none.
+		 */
+		if (src_nr) {
+			struct show_source_objects ctx = { show_reach, object_type, payload };
+			odb_source_resolve_bits(bitmap_git->source, src_bits, src_nr,
+						show_source_object, &ctx);
+		}
+		free(src_bits);
+	}
 }
 
 static int in_bitmapped_pack(struct bitmap_index *bitmap_git,
@@ -1762,7 +2021,10 @@ static int in_bitmapped_pack(struct bitmap_index *bitmap_git,
 		struct object *object = roots->item;
 		roots = roots->next;
 
-		if (bitmap_is_midx(bitmap_git)) {
+		if (bitmap_is_source(bitmap_git)) {
+			if (bitmap_position_source(bitmap_git, &object->oid) >= 0)
+				return 1;
+		} else if (bitmap_is_midx(bitmap_git)) {
 			if (bsearch_midx(&object->oid, bitmap_git->midx, NULL))
 				return 1;
 		} else {
@@ -1864,6 +2126,19 @@ static unsigned long get_size_by_pos(struct bitmap_index *bitmap_git,
 	if (pos < bitmap_num_objects_total(bitmap_git)) {
 		struct packed_git *pack;
 		off_t ofs;
+
+		if (bitmap_is_source(bitmap_git)) {
+			/*
+			 * objects.pack_pos == the bit; read the object's size
+			 * through the odb (it has no pack location).
+			 */
+			struct object_id oid;
+			nth_bitmap_object_oid(bitmap_git, &oid, pos);
+			if (odb_read_object_info_extended(bitmap_repo(bitmap_git)->objects,
+							  &oid, &oi, 0) < 0)
+				die(_("unable to get size of %s"), oid_to_hex(&oid));
+			return size;
+		}
 
 		if (bitmap_is_midx(bitmap_git)) {
 			uint32_t midx_pos = pack_pos_to_midx(bitmap_git->midx, pos);
@@ -2355,6 +2630,23 @@ static int try_partial_reuse(struct bitmap_index *bitmap_git,
 	return 0;
 }
 
+/*
+ * The length of the leading run of objects [0, limit) whose result bits are all
+ * set, in whole-eword steps (the granularity at which a bitmapped pack or source
+ * bulk-reuses): a contiguous all-result prefix within which every reused delta's
+ * base also lies. A source's reuse_window caps this to what its backend will
+ * stream.
+ */
+static uint32_t bitmap_reuse_prefix_len(struct bitmap *result, uint32_t limit)
+{
+	size_t pos = 0;
+	while (pos < result->word_alloc &&
+	       pos < limit / BITS_IN_EWORD &&
+	       result->words[pos] == (eword_t)~0)
+		pos++;
+	return cast_size_t_to_uint32_t(pos * BITS_IN_EWORD);
+}
+
 static void reuse_partial_packfile_from_bitmap_1(struct bitmap_index *bitmap_git,
 						 struct bitmapped_pack *pack,
 						 struct bitmap *reuse)
@@ -2385,6 +2677,17 @@ static void reuse_partial_packfile_from_bitmap_1(struct bitmap_index *bitmap_git
 		       result->words[pos] == (eword_t)~0)
 			pos++;
 		memset(reuse->words, 0xFF, pos * sizeof(eword_t));
+	}
+
+	if (pack->source) {
+		/*
+		 * A source has no packfile to inspect per object; it reuses only the
+		 * contiguous all-result prefix marked above (every delta's base is in
+		 * it by contiguity). The remaining result objects fall to the normal
+		 * per-object path, where check_object reuses each stored source delta
+		 * (read_object_delta). So skip the per-bit pass.
+		 */
+		return;
 	}
 
 	for (; pos < result->word_alloc; pos++) {
@@ -2476,6 +2779,37 @@ void reuse_partial_packfile_from_bitmap(struct bitmap_index *bitmap_git,
 
 	assert(result);
 
+	if (bitmap_is_source(bitmap_git)) {
+		uint32_t window;
+		/*
+		 * A source has no packfile to region-copy, but its objects are stored
+		 * in pack_pos (bit) order, so it reuses the same way: a single window
+		 * over the all-result prefix. write_reused_pack() then streams those
+		 * objects from the source (write_reused_pack_from_source) instead of
+		 * copying pack bytes.
+		 *
+		 * Ask the source how much of that prefix it will reuse: it grants the
+		 * window (0 to decline, when serving a bitmap but not advertising
+		 * reuse-pack, which are independent). Setup is the only safe site to
+		 * decline, because by write time the reused objects have been removed
+		 * from the result bitmap and cannot be re-emitted singly.
+		 */
+		window = odb_source_reuse_window(bitmap_git->source,
+						 bitmap_reuse_prefix_len(result, bitmap_git->source_nr));
+		if (!window)
+			return;
+		ALLOC_GROW(packs, packs_nr + 1, packs_alloc);
+		packs[packs_nr].p = NULL;
+		packs[packs_nr].source = bitmap_git->source;
+		packs[packs_nr].bitmap_pos = 0;
+		packs[packs_nr].bitmap_nr = window;
+		packs[packs_nr].from_midx = NULL;
+		packs[packs_nr].pack_int_id = -1;
+		packs_nr++;
+		objects_nr = window;
+		goto have_packs;
+	}
+
 	load_reverse_index(r, bitmap_git);
 
 	if (!bitmap_is_midx(bitmap_git) || !bitmap_git->midx->chunk_bitmapped_packs)
@@ -2543,12 +2877,14 @@ void reuse_partial_packfile_from_bitmap(struct bitmap_index *bitmap_git,
 			packs[packs_nr].bitmap_nr = pack->num_objects;
 			packs[packs_nr].bitmap_pos = 0;
 			packs[packs_nr].from_midx = bitmap_git->midx;
+			packs[packs_nr].source = NULL;
 			packs_nr++;
 		}
 
 		objects_nr = pack->num_objects;
 	}
 
+have_packs:
 	if (!packs_nr)
 		return;
 
@@ -2817,7 +3153,9 @@ void test_bitmap_walk(struct rev_info *revs)
 			oid_to_hex(&root->oid),
 			(int)bm->bit_size, ewah_checksum(bm));
 
-		if (bitmap_is_midx(found))
+		if (bitmap_is_source(found))
+			fprintf_ln(stderr, "Located via source.");
+		else if (bitmap_is_midx(found))
 			fprintf_ln(stderr, "Located via MIDX '%s'.",
 				   midx_get_checksum_hex(found->midx));
 		else
@@ -2962,7 +3300,9 @@ static void bit_pos_to_object_id(struct bitmap_index *bitmap_git,
 {
 	uint32_t index_pos;
 
-	if (bitmap_is_midx(bitmap_git))
+	if (bitmap_is_source(bitmap_git))
+		index_pos = bit_pos;	/* objects.pack_pos == bit */
+	else if (bitmap_is_midx(bitmap_git))
 		index_pos = pack_pos_to_midx(bitmap_git->midx, bit_pos);
 	else
 		index_pos = pack_pos_to_index(bitmap_git->pack, bit_pos);
@@ -3134,7 +3474,9 @@ uint32_t *create_bitmap_mapping(struct bitmap_index *bitmap_git,
 		struct object_entry *oe;
 		uint32_t index_pos;
 
-		if (bitmap_is_midx(bitmap_git))
+		if (bitmap_is_source(bitmap_git))
+			index_pos = i;	/* objects.pack_pos == bit */
+		else if (bitmap_is_midx(bitmap_git))
 			index_pos = pack_pos_to_midx(bitmap_git->midx, i);
 		else
 			index_pos = pack_pos_to_index(bitmap_git->pack, i);
@@ -3156,8 +3498,12 @@ void free_bitmap_index(struct bitmap_index *b)
 	if (!b)
 		return;
 
-	if (b->map)
-		munmap(b->map, b->map_size);
+	if (b->map) {
+		if (bitmap_is_source(b))
+			free(b->map);	/* source: malloc'd buffer, not an mmap */
+		else
+			munmap(b->map, b->map_size);
+	}
 	ewah_pool_free(b->commits);
 	ewah_pool_free(b->trees);
 	ewah_pool_free(b->blobs);
@@ -3391,28 +3737,29 @@ static int verify_bitmap_file(const struct git_hash_algo *algop,
 	return res;
 }
 
-int verify_bitmap_files(struct repository *r)
+int verify_source_bitmaps(struct odb_source *source)
 {
-	struct odb_source *source;
-	struct packed_git *p;
+	struct odb_source_files *files = odb_source_files_downcast(source);
+	struct multi_pack_index *m = get_multi_pack_index(source);
+	const struct git_hash_algo *algop = source->odb->repo->hash_algo;
+	struct packfile_list_entry *e;
 	int res = 0;
 
-	odb_prepare_alternates(r->objects);
-	for (source = r->objects->sources; source; source = source->next) {
-		struct multi_pack_index *m = get_multi_pack_index(source);
-		char *midx_bitmap_name;
-
-		if (!m)
-			continue;
-
-		midx_bitmap_name = midx_bitmap_filename(m);
-		res |= verify_bitmap_file(r->hash_algo, midx_bitmap_name);
+	/*
+	 * This source's reachability bitmaps: its multi-pack-index bitmap, if
+	 * any, plus each of its packs' bitmaps. Called per source from the files
+	 * verify method (via the odb_verify fan), so it checks only this
+	 * source's bitmaps with no cross-source walk. A missing bitmap is fine.
+	 */
+	if (m) {
+		char *midx_bitmap_name = midx_bitmap_filename(m);
+		res |= verify_bitmap_file(algop, midx_bitmap_name);
 		free(midx_bitmap_name);
 	}
 
-	repo_for_each_pack(r, p) {
-		char *pack_bitmap_name = pack_bitmap_filename(p);
-		res |= verify_bitmap_file(r->hash_algo, pack_bitmap_name);
+	for (e = packfile_store_get_packs(files->packed); e; e = e->next) {
+		char *pack_bitmap_name = pack_bitmap_filename(e->pack);
+		res |= verify_bitmap_file(algop, pack_bitmap_name);
 		free(pack_bitmap_name);
 	}
 

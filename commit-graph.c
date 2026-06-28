@@ -769,7 +769,7 @@ static struct commit_graph *prepare_commit_graph(struct repository *r)
 		return NULL;
 
 	odb_prepare_alternates(r->objects);
-	for (source = r->objects->sources; source; source = source->next) {
+	for (source = odb_primary_source(r->objects); source; source = source->next) {
 		r->objects->commit_graph = read_commit_graph_one(source);
 		if (r->objects->commit_graph)
 			break;
@@ -778,19 +778,29 @@ static struct commit_graph *prepare_commit_graph(struct repository *r)
 	return r->objects->commit_graph;
 }
 
-int generation_numbers_enabled(struct repository *r)
+int commit_graph_has_generations(struct repository *r)
 {
 	uint32_t first_generation;
-	struct commit_graph *g;
+	struct commit_graph *g = prepare_commit_graph(r);
 
-	g = prepare_commit_graph(r);
 	if (!g || !g->num_commits)
-	       return 0;
+		return 0;
 
 	first_generation = get_be32(g->chunk_commit_data +
 				    g->hash_algo->rawsz + 8) >> 2;
 
 	return !!first_generation;
+}
+
+int generation_numbers_enabled(struct repository *r)
+{
+	/*
+	 * Each source answers whether it supplies generation numbers by its own
+	 * means: the files source from a commit-graph file
+	 * (commit_graph_has_generations), a helper source from the generations it
+	 * stored with no file. The walk's cutoffs engage when the primary does.
+	 */
+	return odb_source_provides_commit_generations(odb_primary_source(r->objects));
 }
 
 int corrected_commit_dates_enabled(struct repository *r)
@@ -1064,6 +1074,29 @@ static int parse_commit_in_graph_one(struct commit_graph *g,
 	return 0;
 }
 
+/*
+ * No commit-graph file (or the commit is not in it): a source (a helper that
+ * stored generations) may still supply this commit's generation. Fault it into
+ * the slab so generation cutoffs work; tree/parents/date are then parsed from
+ * the commit object as usual. O(1) per touched commit.
+ */
+static void fault_commit_generation_from_source(struct repository *r,
+						struct commit *item)
+{
+	struct odb_source *source = odb_primary_source(r->objects);
+	timestamp_t gen;
+
+	if (commit_graph_data_at(item)->generation)
+		return;	/* already known */
+	/*
+	 * get_commit_generation answers only when the source supplies generations
+	 * (the files default and a helper without the graph capability return < 0),
+	 * so its return is the capability test; no separate provides check.
+	 */
+	if (!odb_source_get_commit_generation(source, &item->object.oid, &gen))
+		commit_graph_data_at(item)->generation = gen;
+}
+
 int parse_commit_in_graph(struct repository *r, struct commit *item)
 {
 	static int checked_env = 0;
@@ -1076,9 +1109,10 @@ int parse_commit_in_graph(struct repository *r, struct commit *item)
 	checked_env = 1;
 
 	g = prepare_commit_graph(r);
-	if (!g)
-		return 0;
-	return parse_commit_in_graph_one(g, item);
+	if (g && parse_commit_in_graph_one(g, item))
+		return 1;
+	fault_commit_generation_from_source(r, item);
+	return 0;
 }
 
 void load_commit_graph_info(struct repository *r, struct commit *item)
@@ -1998,10 +2032,10 @@ static int fill_oids_from_commits(struct write_commit_graph_context *ctx,
 
 static void fill_oids_from_all_packs(struct write_commit_graph_context *ctx)
 {
-	struct odb_source *source;
 	enum object_type type;
 	struct odb_for_each_object_options opts = {
-		.flags = ODB_FOR_EACH_OBJECT_PACK_ORDER,
+		.flags = ODB_FOR_EACH_OBJECT_PACK_ORDER |
+			 ODB_FOR_EACH_OBJECT_BULK_ONLY,
 	};
 	struct object_info oi = {
 		.typep = &type,
@@ -2013,12 +2047,13 @@ static void fill_oids_from_all_packs(struct write_commit_graph_context *ctx)
 			_("Finding commits for commit graph among packed objects"),
 			ctx->approx_nr_objects);
 
-	odb_prepare_alternates(ctx->r->objects);
-	for (source = ctx->r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		packfile_store_for_each_object(files->packed, &oi, add_packed_commits_oi,
-					       ctx, &opts);
-	}
+	/*
+	 * Enumerate every source's consolidated object store through the vtable.
+	 * For the files backend BULK_ONLY visits its packed objects; a backend
+	 * with no loose staging tier yields all of its objects.
+	 */
+	odb_for_each_object_ext(ctx->r->objects, &oi, add_packed_commits_oi,
+				ctx, &opts);
 
 	if (ctx->progress_done < ctx->approx_nr_objects)
 		display_progress(ctx->progress, ctx->approx_nr_objects);
@@ -2091,7 +2126,25 @@ static int write_graph_chunk_base(struct hashfile *f,
 	return 0;
 }
 
-static int write_commit_graph_file(struct write_commit_graph_context *ctx)
+/*
+ * The commits selected for the commit-graph and their count. A source's
+ * store_commit_graph reads these to persist each commit's generation (a helper
+ * into its store, the files source into the commit-graph file it writes).
+ */
+struct commit **commit_graph_ctx_commits(struct write_commit_graph_context *ctx,
+					 size_t *nr)
+{
+	*nr = ctx->commits.nr;
+	return ctx->commits.items;
+}
+
+/*
+ * Write the commit-graph file for this context: the files source's way of
+ * persisting commit generations (odb_source_files_store_commit_graph calls
+ * here, and a helper without the graph capability falls back to it). A helper
+ * that stores generations in its own medium does not reach this.
+ */
+int write_commit_graph_to_file(struct write_commit_graph_context *ctx)
 {
 	uint32_t i;
 	struct hashfile *f;
@@ -2700,7 +2753,7 @@ int write_commit_graph(struct odb_source *source,
 	if (ctx.changed_paths)
 		compute_bloom_filters(&ctx);
 
-	res = write_commit_graph_file(&ctx);
+	res = odb_source_store_commit_graph(ctx.odb_source, &ctx);
 
 	if (ctx.changed_paths)
 		deinit_bloom_filters();

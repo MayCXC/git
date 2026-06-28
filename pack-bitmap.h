@@ -11,6 +11,18 @@
 struct commit;
 struct repository;
 struct rev_info;
+struct odb_source;
+struct bitmap_index;
+struct object_id;
+
+/*
+ * Open the files source's reachability bitmap into `bitmap_git` (the files
+ * backend's odb_source `open_bitmap` vtable method, operating on the source's
+ * own packfile_store). Returns 0 on success, -1 if the source has no bitmap.
+ */
+int files_open_bitmap(struct odb_source *source, struct bitmap_index *bitmap_git);
+
+int verify_source_bitmaps(struct odb_source *source);
 
 static const char BITMAP_IDX_SIGNATURE[] = {'B', 'I', 'T', 'M'};
 
@@ -64,10 +76,32 @@ struct bitmapped_pack {
 
 	struct multi_pack_index *from_midx; /* MIDX only */
 	uint32_t pack_int_id; /* MIDX only */
+
+	/*
+	 * Non-pack object source backing this reuse window (e.g. a helper),
+	 * NULL for a files-backed pack. When set, write_reused_pack() serves the
+	 * reuse from the source's pack_pos-ordered store rather than packfile
+	 * bytes (the source analog of the verbatim region copy).
+	 */
+	struct odb_source *source;
 };
 
 struct bitmap_index *prepare_bitmap_git(struct repository *r);
 struct bitmap_index *prepare_midx_bitmap_git(struct multi_pack_index *midx);
+
+/*
+ * Open a reachability bitmap from a non-pack ODB source (the source analogue of
+ * a pack/midx bitmap): `map`/`map_size` is the EWAH .bitmap content, `idx`/`nr`
+ * the index-order object table (the .idx: idx[n] = oid at index position n) and
+ * `rev` the reverse index (the .rev: rev[bit] = index position of bit `bit`).
+ * Ownership of map/idx/rev passes to `bitmap_git`. Used by a source's
+ * open_bitmap vtable method; the caller (open_bitmap) then runs the common load.
+ * Returns 0 on success, -1 otherwise.
+ */
+int bitmap_git_open_source(struct bitmap_index *bitmap_git,
+			   struct repository *repo,
+			   unsigned char *map, size_t map_size,
+			   uint32_t nr, struct odb_source *source);
 
 /*
  * Given a bitmap index, determine whether it contains the pack either directly
@@ -199,8 +233,23 @@ int bitmap_is_midx(struct bitmap_index *bitmap_git);
 
 int bitmap_is_preferred_refname(struct repository *r, const char *refname);
 
-int verify_bitmap_files(struct repository *r);
-
 struct ewah_bitmap *read_bitmap(const unsigned char *map,
 				size_t map_size, size_t *map_pos);
+
+/*
+ * Enumerate a pack's commit bitmap entries in their stored (xor-compressed)
+ * form, reusing git's own bitmap reader. For each bitmapped commit, `fn` gets
+ * the commit oid, its xor-base commit oid (NULL for a full, non-xor entry), the
+ * entry flags, and the verbatim EWAH bytes. Used to export the bitmap into an
+ * external object store (the local-helper backend) as one row per commit,
+ * base-by-oid, mirroring how object deltas are stored. Returns 0, the callback's
+ * first non-zero return, or -1 if the pack bitmap could not be read.
+ */
+typedef int (*bitmap_commit_entry_fn)(const struct object_id *commit_oid,
+				      const struct object_id *xor_base,
+				      int flags,
+				      const void *ewah, size_t ewah_len,
+				      void *data);
+int for_each_bitmap_commit_entry(struct repository *r, struct packed_git *pack,
+				 bitmap_commit_entry_fn fn, void *data);
 #endif

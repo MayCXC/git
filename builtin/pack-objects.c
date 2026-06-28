@@ -1259,8 +1259,8 @@ static size_t write_reused_pack_verbatim(struct bitmapped_pack *reuse_packfile,
 	return pos;
 }
 
-static void write_reused_pack(struct bitmapped_pack *reuse_packfile,
-			      struct hashfile *f)
+static void write_reused_pack_from_packfile(struct bitmapped_pack *reuse_packfile,
+					    struct hashfile *f)
 {
 	size_t i = reuse_packfile->bitmap_pos / BITS_IN_EWORD;
 	uint32_t offset;
@@ -1325,6 +1325,67 @@ static void write_reused_pack(struct bitmapped_pack *reuse_packfile,
 
 done:
 	unuse_pack(&w_curs);
+}
+
+static int source_reuse_emit(void *data, enum object_type type, unsigned long size,
+			     const struct object_id *base, const void *content,
+			     unsigned long clen)
+{
+	struct hashfile *f = data;
+	unsigned char header[MAX_PACK_OBJECT_HEADER];
+	unsigned len;
+
+	/*
+	 * Frame one reused source object into the output pack, the same shape
+	 * check_object/write_object uses for a single reused source delta: a
+	 * REF_DELTA header + base oid for a delta (its base is in the reused
+	 * prefix, so it is sent), a plain type header otherwise, then the verbatim
+	 * compressed bytes -- no inflate, no recompress.
+	 */
+	if (base) {
+		len = encode_in_pack_object_header(header, sizeof(header),
+						   OBJ_REF_DELTA, size);
+		hashwrite(f, header, len);
+		hashwrite(f, base->hash, the_hash_algo->rawsz);
+	} else {
+		len = encode_in_pack_object_header(header, sizeof(header), type, size);
+		hashwrite(f, header, len);
+	}
+	hashwrite(f, content, clen);
+	display_progress(progress_state, ++written);
+	return 0;
+}
+
+static void write_reused_pack_from_source(struct bitmapped_pack *reuse_packfile,
+					  struct hashfile *f)
+{
+	/*
+	 * Reuse the source's objects in bulk (the analog of
+	 * write_reused_pack_from_packfile's verbatim region copy): stream the
+	 * reusable pack_pos prefix and frame each entry. The prefix is the
+	 * contiguous all-result run, so every delta's base is also in it and goes
+	 * out as a position-independent REF_DELTA. reuse_packfile_objects is the
+	 * prefix length (the popcount of the reuse bitmap).
+	 */
+	if (odb_source_stream_reuse(reuse_packfile->source, reuse_packfile_objects,
+				    source_reuse_emit, f) < 0)
+		die(_("source-backed pack reuse failed"));
+}
+
+static void write_reused_pack(struct bitmapped_pack *reuse_packfile,
+			      struct hashfile *f)
+{
+	/*
+	 * Dispatch the reuse to its backend: a files-backed pack copies its
+	 * verbatim region and per-object bytes (write_reused_pack_from_packfile);
+	 * a source-backed window (e.g. a helper) streams its pack_pos run
+	 * (write_reused_pack_from_source). The reuse selection above is otherwise
+	 * backend-agnostic.
+	 */
+	if (reuse_packfile->source)
+		write_reused_pack_from_source(reuse_packfile, f);
+	else
+		write_reused_pack_from_packfile(reuse_packfile, f);
 }
 
 static void write_excluded_by_configs(void)

@@ -131,10 +131,35 @@ struct commit_graph *parse_commit_graph(struct repository *r,
 					void *graph_map, size_t graph_size);
 
 /*
- * Return 1 if and only if the repository has a commit-graph
- * file and generation numbers are computed in that file.
+ * Return 1 if and only if this repository has a commit-graph file whose
+ * generation numbers are computed. This is the files source's answer to
+ * provides_commit_generations (a helper source answers from its stored
+ * generations instead).
+ */
+int commit_graph_has_generations(struct repository *r);
+
+/*
+ * Return 1 if and only if the primary source supplies generation numbers (the
+ * files source from a commit-graph file, a helper source from generations it
+ * stored with no file).
  */
 int generation_numbers_enabled(struct repository *r);
+
+struct write_commit_graph_context;
+
+/*
+ * Write the commit-graph file for this context. This is the files source's way
+ * of persisting commit generations (odb_source_files_store_commit_graph calls
+ * here); a helper without the graph capability falls back to it.
+ */
+int write_commit_graph_to_file(struct write_commit_graph_context *ctx);
+
+/*
+ * The commits selected for the commit-graph, with their count in *nr. A
+ * source's store_commit_graph reads these to persist each commit's generation.
+ */
+struct commit **commit_graph_ctx_commits(struct write_commit_graph_context *ctx,
+					 size_t *nr);
 
 /*
  * Return 1 if and only if the repository has a commit-graph

@@ -189,14 +189,6 @@ struct packfile_list_entry *packfile_store_get_packs(struct packfile_store *stor
  * lives with that backend rather than as a generic repo-level helper.
  */
 
-/*
- * Compatibility alias kept while the remaining repo_for_each_pack() callers are
- * converted to iterate the files sources directly with odb_for_each_files_pack()
- * above; removed once the last one is.
- */
-#define repo_for_each_pack(repo, p) \
-	odb_for_each_files_pack((repo)->objects, p)
-
 int packfile_store_read_object_stream(struct odb_read_stream **out,
 				      struct packfile_store *store,
 				      const struct object_id *oid);

@@ -79,7 +79,7 @@ static int bitmap_write(const char *basename)
 	uint32_t i;
 
 	prepare_repo_settings(the_repository);
-	repo_for_each_pack(the_repository, p) {
+	odb_for_each_files_pack(the_repository->objects, p) {
 		if (!strcmp(pack_basename(p), basename))
 			break;
 	}

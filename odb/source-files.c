@@ -117,6 +117,56 @@ static int odb_source_files_read_object_stream(struct odb_read_stream **out,
 	return -1;
 }
 
+/*
+ * Hand a packed object discovered via the bitmap fast path to the
+ * for_each_object callback. This path is taken only for identity/location
+ * enumeration (a NULL request), so we either pass the pack location when the
+ * caller asked for it or a NULL object_info, mirroring how
+ * packfile_store_for_each_object() reports a packed object.
+ */
+struct files_filtered_packed_cb {
+	odb_for_each_object_cb cb;
+	void *cb_data;
+	int provide_location;
+};
+
+static int files_filtered_packed_emit(const struct object_id *oid,
+				      struct packed_git *pack,
+				      off_t offset,
+				      struct files_filtered_packed_cb *data)
+{
+	if (data->provide_location) {
+		struct object_info oi = OBJECT_INFO_INIT;
+
+		oi.whence = OI_PACKED;
+		oi.u.packed.pack = pack;
+		oi.u.packed.offset = offset;
+		return data->cb(oid, &oi, data->cb_data);
+	}
+	return data->cb(oid, NULL, data->cb_data);
+}
+
+static int files_show_bitmapped_object(const struct object_id *oid,
+				       enum object_type type UNUSED,
+				       int flags UNUSED,
+				       uint32_t hash UNUSED,
+				       struct packed_git *pack,
+				       off_t offset,
+				       void *payload)
+{
+	return files_filtered_packed_emit(oid, pack, offset, payload);
+}
+
+static int files_show_packed_object(const struct object_id *oid,
+				    struct packed_git *pack,
+				    uint32_t pos,
+				    void *payload)
+{
+	return files_filtered_packed_emit(oid, pack,
+					  nth_packed_object_offset(pack, pos),
+					  payload);
+}
+
 static int odb_source_files_for_each_object(struct odb_source *source,
 					    const struct object_info *request,
 					    odb_for_each_object_cb cb,
@@ -126,10 +176,62 @@ static int odb_source_files_for_each_object(struct odb_source *source,
 	struct odb_source_files *files = odb_source_files_downcast(source);
 	int ret;
 
-	if (!(opts->flags & ODB_FOR_EACH_OBJECT_PROMISOR_ONLY)) {
+	/*
+	 * Loose objects are the files backend's transient staging tier: freshly
+	 * written objects land here until maintenance packs them. Skip them when
+	 * only the consolidated store was requested, and likewise for
+	 * promisor-only iteration since there are no loose promisor objects.
+	 */
+	if (!(opts->flags & (ODB_FOR_EACH_OBJECT_PROMISOR_ONLY |
+			     ODB_FOR_EACH_OBJECT_BULK_ONLY))) {
 		ret = odb_source_for_each_object(&files->loose->base, request, cb, cb_data, opts);
 		if (ret)
 			return ret;
+	}
+
+	/*
+	 * When asked to honor an objects filter and a pack bitmap is available,
+	 * enumerate the bitmapped objects through it without reading them,
+	 * letting the bitmap apply the filter; the remaining (non-bitmapped)
+	 * packs are then walked normally. The bitmap belongs to the local
+	 * repository, so only the local source can use it, and this is purely
+	 * an optimization for identity/location enumeration: a caller that
+	 * wants full object info per object (a non-NULL request) falls through
+	 * to the regular pack walk below.
+	 */
+	if (source->local && !request && opts->objects_filter &&
+	    opts->objects_filter->choice != LOFC_DISABLED) {
+		struct bitmap_index *bitmap = prepare_bitmap_git(source->odb->repo);
+
+		if (bitmap) {
+			struct files_filtered_packed_cb data = {
+				.cb = cb,
+				.cb_data = cb_data,
+				.provide_location = !!(opts->flags & ODB_FOR_EACH_OBJECT_PROVIDE_LOCATION),
+			};
+
+			if (!for_each_bitmapped_object(bitmap, opts->objects_filter,
+						       files_show_bitmapped_object, &data)) {
+				struct packfile_list_entry *e;
+
+				ret = 0;
+				for (e = packfile_store_get_packs(files->packed); e; e = e->next) {
+					if (bitmap_index_contains_pack(bitmap, e->pack) ||
+					    open_pack_index(e->pack))
+						continue;
+					ret = for_each_object_in_pack(e->pack,
+								      files_show_packed_object,
+								      &data, opts->flags);
+					if (ret)
+						break;
+				}
+				free_bitmap_index(bitmap);
+				return ret;
+			}
+
+			/* Filter unsupported by the bitmap; fall back to a full walk. */
+			free_bitmap_index(bitmap);
+		}
 	}
 
 	ret = packfile_store_for_each_object(files->packed, request, cb, cb_data, opts);
@@ -1029,6 +1131,15 @@ static int odb_source_files_verify(struct odb_source *source,
 	}
 
 	/*
+	 * This source's reachability bitmaps (storage-format integrity, like the
+	 * rev-index above): fsck dispatches bitmap verification through the odb_verify
+	 * fan. A non-files source has no bitmaps and keeps the no-op verify default,
+	 * so this is reached only with files context.
+	 */
+	if (verify_source_bitmaps(source))
+		vd.ret = -1;
+
+	/*
 	 * This source's multi-pack-index, when the repository uses one. Folded
 	 * in from fsck's old per-source "git multi-pack-index verify" spawn so
 	 * fsck dispatches midx verification through the same odb_verify fan; a
@@ -1497,6 +1608,22 @@ static int odb_source_files_read_object_delta(struct odb_source *source,
 	return 0;  /* not packed -> loose -> stored whole, not a delta */
 }
 
+/*
+ * The files source supplies commit generations from a commit-graph file in its
+ * object directory; a helper source supplies them from its store with no file.
+ */
+static int odb_source_files_provides_commit_generations(struct odb_source *source)
+{
+	return commit_graph_has_generations(source->odb->repo);
+}
+
+/* The files source persists commit generations by writing the commit-graph file. */
+static int odb_source_files_store_commit_graph(struct odb_source *source UNUSED,
+					       struct write_commit_graph_context *ctx)
+{
+	return write_commit_graph_to_file(ctx);
+}
+
 struct odb_source_files *odb_source_files_new(struct object_database *odb,
 					      const char *path,
 					      bool local)
@@ -1539,6 +1666,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.multi_pack_index_expire = odb_source_files_multi_pack_index_expire;
 	files->base.multi_pack_index_repack = odb_source_files_multi_pack_index_repack;
 	files->base.read_compat_map = odb_source_files_read_compat_map;
+	files->base.open_bitmap = files_open_bitmap;
 	files->base.has_received_pack = odb_source_files_has_received_pack;
 	files->base.is_object_kept = odb_source_files_is_object_kept;
 	files->base.cruft_object_preserved = odb_source_files_cruft_object_preserved;
@@ -1546,6 +1674,8 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.mark_objects_promisor = odb_source_files_mark_objects_promisor;
 	files->base.read_alternates = odb_source_files_read_alternates;
 	files->base.write_alternate = odb_source_files_write_alternate;
+	files->base.provides_commit_generations = odb_source_files_provides_commit_generations;
+	files->base.store_commit_graph = odb_source_files_store_commit_graph;
 
 	/*
 	 * Ideally, we would only ever store absolute paths in the source. This
