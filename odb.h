@@ -321,6 +321,23 @@ int odb_read_object_delta(struct object_database *odb,
 			  unsigned long *raw_len);
 
 /*
+ * Migrate the object storage backend used by the repository to `name`, the twin
+ * of `repo_migrate_ref_storage_format()` for objects. `name` is the backend's
+ * config name: "files", or a git-local-<name> helper name. Every object in the
+ * repository's primary source is copied into a freshly constructed destination
+ * source through the object-source vtable, the repository's
+ * extensions.objectStorage configuration is switched over, the now-redundant
+ * source store is removed, and the in-core object database is reset so that
+ * subsequent access re-initializes against the new backend. Unlike ref-storage
+ * migration, this is worktree-safe: every worktree shares the one object store
+ * at the common directory. Returns 0 on success, a negative value otherwise,
+ * with a human-readable message appended to `err`.
+ */
+int repo_migrate_object_storage_format(struct repository *repo,
+				       const char *name,
+				       struct strbuf *err);
+
+/*
  * Add an object file to the in-memory object store, without writing it
  * to disk.
  *

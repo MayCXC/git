@@ -6,6 +6,7 @@
 #include "dir.h"
 #include "environment.h"
 #include "gettext.h"
+#include "helper.h"
 #include "hex.h"
 #include "khash.h"
 #include "lockfile.h"
@@ -15,6 +16,8 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source-files.h"
+#include "odb/source-helper.h"
 #include "odb/source-inmemory.h"
 #include "packfile.h"
 #include "path.h"
@@ -342,6 +345,128 @@ void odb_restore_primary_source(struct object_database *odb,
 	odb->repo->disable_ref_updates = false;
 	odb->sources = restore_source;
 	odb_source_free(cur_source);
+}
+
+struct migrate_object_data {
+	struct repository *repo;
+	struct odb_source *dest;
+	unsigned long count;
+};
+
+static int migrate_one_object(const struct object_id *oid,
+			      struct object_info *oi UNUSED,
+			      void *cb_data)
+{
+	struct migrate_object_data *data = cb_data;
+	enum object_type type;
+	unsigned long size;
+	struct object_id written;
+	void *buf;
+	int ret;
+
+	buf = odb_read_object(data->repo->objects, oid, &type, &size);
+	if (!buf)
+		return error(_("unable to read object %s"), oid_to_hex(oid));
+
+	ret = odb_source_write_object(data->dest, buf, size, type,
+				      &written, NULL, 0);
+	free(buf);
+	if (ret < 0)
+		return error(_("unable to write object %s into the destination object store"),
+			     oid_to_hex(oid));
+	/*
+	 * Objects are content addressed, so a faithful copy must round-trip to
+	 * the same id. A mismatch means the destination altered the bytes (or
+	 * hashed them differently), which would silently corrupt history.
+	 */
+	if (!oideq(&written, oid))
+		return error(_("object %s changed identity to %s during migration"),
+			     oid_to_hex(oid), oid_to_hex(&written));
+
+	data->count++;
+	return 0;
+}
+
+int repo_migrate_object_storage_format(struct repository *repo,
+				       const char *name,
+				       struct strbuf *err)
+{
+	struct object_database *odb = repo->objects;
+	struct odb_source *old_source, *new_source = NULL;
+	struct migrate_object_data data = { .repo = repo };
+	struct object_info request = OBJECT_INFO_INIT;
+	struct odb_for_each_object_options opts = { 0 };
+	const char *cur = repo->odb_source_name ? repo->odb_source_name : "files";
+	int ret;
+
+	if (!name || !*name) {
+		strbuf_addstr(err, _("missing object storage backend name"));
+		return -1;
+	}
+	if (!strcmp(cur, name)) {
+		strbuf_addstr(err, _("current and new object storage are the same"));
+		return -1;
+	}
+
+	old_source = odb->sources;
+	if (!old_source || !old_source->for_each_object) {
+		strbuf_addstr(err, _("the current object source cannot be enumerated"));
+		return -1;
+	}
+
+	/*
+	 * Build the destination as a standalone source (not linked into the
+	 * object database, whose primary stays the source store so reads still
+	 * resolve there) named by the migration target, and copy every object into
+	 * it through the object-source vtable. A helper destination spawns its own
+	 * git-local-<name> from the name. Bulk migrations can wrap this in
+	 * new_source->begin_transaction for a single backing-store commit.
+	 */
+	new_source = odb_source_new_named(odb, old_source->path, name);
+	if (!new_source) {
+		strbuf_addf(err, _("cannot build object storage backend '%s'"), name);
+		ret = -1;
+		goto out;
+	}
+
+	data.dest = new_source;
+	ret = old_source->for_each_object(old_source, &request,
+					  migrate_one_object, &data, &opts);
+	if (ret < 0) {
+		strbuf_addstr(err, _("failed to copy objects into the destination object store"));
+		goto out;
+	}
+
+	/*
+	 * The destination now durably holds every object. Persist the new
+	 * configuration (extensions.objectStorage, as ref migration persists
+	 * extensions.refStorage), switch the in-core backend selection, and reset
+	 * the object database so the next access re-initializes against the new
+	 * backend. The ref format is passed through unchanged.
+	 */
+	initialize_repository_version(repo, hash_algo_by_ptr(repo->hash_algo),
+				      repo->ref_storage_name, name, 1);
+
+	odb_source_free(new_source);
+	new_source = NULL;
+
+	/*
+	 * The source store is now redundant; remove it. The configuration already
+	 * designates the destination, so an interruption here only leaves a
+	 * harmless stale store behind, never an unreadable repository.
+	 */
+	old_source->remove_storage(old_source);
+
+	repo_set_odb_source_name(repo, name);
+	odb_free(repo->objects);
+	repo->objects = NULL;
+
+	return 0;
+
+out:
+	if (new_source)
+		odb_source_free(new_source);
+	return ret;
 }
 
 char *compute_alternate_path(const char *path, struct strbuf *err)

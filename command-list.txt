@@ -147,6 +147,7 @@ git-multi-pack-index                    plumbingmanipulators
 git-mv                                  mainporcelain           worktree
 git-name-rev                            plumbinginterrogators
 git-notes                               mainporcelain
+git-odb                                 plumbingmanipulators
 git-p4                                  foreignscminterface
 git-pack-objects                        plumbingmanipulators
 git-pack-redundant                      plumbinginterrogators

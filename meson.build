@@ -660,6 +660,7 @@ builtin_sources = [
   'builtin/mv.c',
   'builtin/name-rev.c',
   'builtin/notes.c',
+  'builtin/odb.c',
   'builtin/pack-objects.c',
   'builtin/pack-refs.c',
   'builtin/patch-id.c',

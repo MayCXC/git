@@ -1953,6 +1953,51 @@ static int odb_source_files_migrate_quarantine(struct odb_source *source,
 	return ret;
 }
 
+static int odb_source_files_remove_storage(struct odb_source *source)
+{
+	struct strbuf path = STRBUF_INIT;
+	DIR *dir;
+	struct dirent *de;
+
+	/*
+	 * Loose objects live in two-hex-character shard directories directly
+	 * under the object directory; remove each shard.
+	 */
+	dir = opendir(source->path);
+	if (dir) {
+		while ((de = readdir(dir))) {
+			if (strlen(de->d_name) != 2 ||
+			    !isxdigit(de->d_name[0]) ||
+			    !isxdigit(de->d_name[1]))
+				continue;
+			strbuf_reset(&path);
+			strbuf_addf(&path, "%s/%s", source->path, de->d_name);
+			remove_dir_recursively(&path, 0);
+		}
+		closedir(dir);
+	}
+
+	/* Packs and the multi-pack-index live under "pack". */
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/pack", source->path);
+	remove_dir_recursively(&path, 0);
+
+	/*
+	 * The commit-graph is a regenerable cache over these objects; drop it so
+	 * the destination backend's commit-graph is the only one. info/alternates
+	 * is configuration, not storage, and is deliberately left in place.
+	 */
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/info/commit-graph", source->path);
+	unlink(path.buf);
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/info/commit-graphs", source->path);
+	remove_dir_recursively(&path, 0);
+
+	strbuf_release(&path);
+	return 0;
+}
+
 struct odb_source_files *odb_source_files_new(struct object_database *odb,
 					      const char *path,
 					      bool local)
@@ -1989,6 +2034,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.verify = odb_source_files_verify;
 	files->base.remove_objects = odb_source_files_remove_objects;
 	files->base.prune_cruft = odb_source_files_prune_cruft;
+	files->base.remove_storage = odb_source_files_remove_storage;
 	files->base.multi_pack_index_write = odb_source_files_multi_pack_index_write;
 	files->base.multi_pack_index_compact = odb_source_files_multi_pack_index_compact;
 	files->base.multi_pack_index_verify = odb_source_files_multi_pack_index_verify;

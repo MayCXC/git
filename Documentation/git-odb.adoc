@@ -1,0 +1,58 @@
+git-odb(1)
+==========
+
+NAME
+----
+git-odb - Low-level access to the object database
+
+
+SYNOPSIS
+--------
+[synopsis]
+git odb migrate --object-storage=<name>
+
+DESCRIPTION
+-----------
+
+This command provides low-level access to the object database.
+
+COMMANDS
+--------
+
+`migrate`::
+	Migrate the object storage backend used by the repository. Every object
+	in the repository's current object store is copied into a freshly
+	created store of the requested backend, the repository configuration is
+	switched over to it, and the now-redundant old store is removed. This is
+	the object-storage counterpart of the ref-storage migration performed by
+	linkgit:git-refs[1].
+
+OPTIONS
+-------
+
+The following options are specific to `git odb migrate`:
+
+`--object-storage=<name>`::
+	The object storage backend to migrate the object database to. The name is
+	the whole identity: `files` (the default, storing loose objects and
+	packfiles on disk) or any other name, which selects the
+	`git-local-<name>` helper program that serves objects over a line
+	protocol, the way an unknown URL scheme selects a `git-remote-<name>`
+	helper. The chosen name is recorded in `extensions.objectStorage`.
+
+KNOWN LIMITATIONS
+-----------------
+
+* There is no way to block concurrent writes to the repository during an
+  ongoing migration. Concurrent writes can lead to an inconsistent migrated
+  state. Users are expected to block writes on a higher level. If your
+  repository is registered for scheduled maintenance, it is recommended to
+  unregister it first with linkgit:git-maintenance[1].
+
+Unlike ref-storage migration, object-storage migration is supported in
+repositories that have worktrees, since all worktrees share a single object
+store at the common directory.
+
+GIT
+---
+Part of the linkgit:git[1] suite

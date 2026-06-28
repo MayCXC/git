@@ -1456,6 +1456,7 @@ BUILTIN_OBJS += builtin/multi-pack-index.o
 BUILTIN_OBJS += builtin/mv.o
 BUILTIN_OBJS += builtin/name-rev.o
 BUILTIN_OBJS += builtin/notes.o
+BUILTIN_OBJS += builtin/odb.o
 BUILTIN_OBJS += builtin/pack-objects.o
 ifndef WITH_BREAKING_CHANGES
 BUILTIN_OBJS += builtin/pack-redundant.o
