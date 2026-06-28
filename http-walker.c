@@ -539,11 +539,8 @@ static int fetch_object(struct walker *walker, const struct object_id *oid)
 	} else if (!oideq(&obj_req->oid, &req->real_oid)) {
 		ret = error("File %s has bad hash", hex);
 	} else if (req->rename < 0) {
-		struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
-		struct strbuf buf = STRBUF_INIT;
-		odb_loose_path(files->loose, &buf, &req->oid);
-		ret = error("unable to write sha1 filename %s", buf.buf);
-		strbuf_release(&buf);
+		ret = error(_("unable to write loose object %s"),
+			    oid_to_hex(&req->oid));
 	}
 
 	release_http_object_request(&obj_req->req);

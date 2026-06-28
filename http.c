@@ -2590,18 +2590,22 @@ static int fetch_and_setup_pack_index(struct packfile_list *packs,
 				      unsigned char *sha1,
 				      const char *base_url)
 {
-	struct packed_git *new_pack, *p;
+	struct packed_git *new_pack;
+	struct odb_source *source;
 	char *tmp_idx = NULL;
 	int ret;
 
 	/*
 	 * If we already have the pack locally, no need to fetch its index or
-	 * even add it to list; we already have all of its objects.
+	 * even add it to list; we already have all of its objects. Each source
+	 * answers for its own packs through the vtable; a backend that does not
+	 * track received packs (e.g. a helper) reports not-held and we re-fetch
+	 * (ingestion is idempotent).
 	 */
-	repo_for_each_pack(the_repository, p) {
-		if (hasheq(p->hash, sha1, the_repository->hash_algo))
+	odb_prepare_alternates(the_repository->objects);
+	for (source = odb_primary_source(the_repository->objects); source; source = source->next)
+		if (odb_source_has_received_pack(source, sha1))
 			return 0;
-	}
 
 	tmp_idx = fetch_pack_index(sha1, base_url);
 	if (!tmp_idx)
@@ -2716,9 +2720,14 @@ cleanup:
 void http_install_packfile(struct packed_git *p,
 			   struct packfile_list *list_to_remove_from)
 {
-	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
 	packfile_list_remove(list_to_remove_from, p);
-	packfile_store_add_pack(files->packed, p);
+	/*
+	 * index-pack has already ingested the objects through the primary's
+	 * pack-ingest path; hand the freshly fetched pack to the source to
+	 * integrate (the files source registers the on-disk pack; other
+	 * backends discard the descriptor and reprepare). Takes ownership of p.
+	 */
+	odb_source_note_received_pack(odb_primary_source(the_repository->objects), p);
 }
 
 struct http_pack_request *new_http_pack_request(
@@ -2826,7 +2835,6 @@ static size_t fwrite_sha1_file(char *ptr, size_t eltsize, size_t nmemb,
 struct http_object_request *new_http_object_request(const char *base_url,
 						    const struct object_id *oid)
 {
-	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
 	char *hex = oid_to_hex(oid);
 	struct strbuf filename = STRBUF_INIT;
 	struct strbuf prevfile = STRBUF_INIT;
@@ -2841,7 +2849,14 @@ struct http_object_request *new_http_object_request(const char *base_url,
 	oidcpy(&freq->oid, oid);
 	freq->localfile = -1;
 
-	odb_loose_path(files->loose, &filename, oid);
+	/*
+	 * Stage the download at a deterministic per-object path under the
+	 * (eager, backend-agnostic) object directory, so an interrupted fetch
+	 * resumes into the same file on any primary. It is same-filesystem as
+	 * the loose layout, so the files install_loose_object can still rename
+	 * it into place zero-copy.
+	 */
+	strbuf_addf(&filename, "%s/%s", repo_get_object_directory(the_repository), hex);
 	strbuf_addf(&freq->tmpfile, "%s.temp", filename.buf);
 
 	strbuf_addf(&prevfile, "%s.prev", filename.buf);
@@ -2967,9 +2982,7 @@ void process_http_object_request(struct http_object_request *freq)
 
 int finish_http_object_request(struct http_object_request *freq)
 {
-	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
 	struct stat st;
-	struct strbuf filename = STRBUF_INIT;
 
 	close(freq->localfile);
 	freq->localfile = -1;
@@ -2994,9 +3007,8 @@ int finish_http_object_request(struct http_object_request *freq)
 		unlink_or_warn(freq->tmpfile.buf);
 		return -1;
 	}
-	odb_loose_path(files->loose, &filename, &freq->oid);
-	freq->rename = finalize_object_file(the_repository, freq->tmpfile.buf, filename.buf);
-	strbuf_release(&filename);
+	freq->rename = odb_source_install_loose_object(odb_primary_source(the_repository->objects),
+						       freq->tmpfile.buf, &freq->oid);
 
 	return freq->rename;
 }
