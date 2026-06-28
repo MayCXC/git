@@ -85,7 +85,6 @@ int cmd_init_db(int argc,
 	const char *ref_format = NULL;
 	const char *initial_branch = NULL;
 	int hash_algo = GIT_HASH_UNKNOWN;
-	enum ref_storage_format ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN;
 	int init_shared_repository = -1;
 	const struct option init_db_options[] = {
 		OPT_STRING(0, "template", &template_dir, N_("template-directory"),
@@ -172,12 +171,6 @@ int cmd_init_db(int argc,
 			die(_("unknown hash algorithm '%s'"), object_format);
 	}
 
-	if (ref_format) {
-		ref_storage_format = ref_storage_format_by_name(ref_format);
-		if (ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format '%s'"), ref_format);
-	}
-
 	if (init_shared_repository != -1)
 		repo_settings_set_shared_repository(the_repository, init_shared_repository);
 
@@ -253,7 +246,7 @@ int cmd_init_db(int argc,
 
 	flags |= INIT_DB_EXIST_OK;
 	ret = init_db(the_repository, git_dir, real_git_dir, template_dir, hash_algo,
-		      ref_storage_format, initial_branch,
+		      ref_format, initial_branch,
 		      init_shared_repository, flags);
 
 	free(template_dir_to_free);

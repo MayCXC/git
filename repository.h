@@ -161,6 +161,14 @@ struct repository {
 	/* Repository's config values parsed by git_default_config() */
 	struct repo_config_values config_values_private_;
 
+	/*
+	 * The selected reference backend, by name: a builtin format ("files",
+	 * "reftable") or, like an unknown object/URL scheme, a "git-local-<name>"
+	 * ref helper. This is the canonical selector (the object twin is
+	 * odb_source_name); ref_storage_format below is the derived view, kept for
+	 * the vtable index and its UNKNOWN "not-yet-determined" sentinel.
+	 */
+	char *ref_storage_name;
 	/* Repository's reference storage format, as serialized on disk. */
 	enum ref_storage_format ref_storage_format;
 	/*
@@ -240,9 +248,9 @@ void repo_set_gitdir(struct repository *repo, const char *root,
 void repo_set_worktree(struct repository *repo, const char *path);
 void repo_set_hash_algo(struct repository *repo, uint32_t algo);
 void repo_set_compat_hash_algo(struct repository *repo, uint32_t compat_algo);
-void repo_set_ref_storage_format(struct repository *repo,
-				 enum ref_storage_format format,
-				 const char *payload);
+void repo_set_ref_storage_name(struct repository *repo,
+			       const char *name,
+			       const char *payload);
 void initialize_repository(struct repository *repo);
 RESULT_MUST_BE_USED
 int repo_init(struct repository *r, const char *gitdir, const char *worktree);

@@ -189,7 +189,7 @@ struct repository_format {
 	int is_bare;
 	int hash_algo;
 	int compat_hash_algo;
-	enum ref_storage_format ref_storage_format;
+	char *ref_storage_name; /* value of extensions.refStorage (the whole selector) */
 	char *ref_storage_payload;
 	int sparse_index;
 	char *work_tree;
@@ -207,7 +207,6 @@ struct repository_format {
 	.version = -1, \
 	.is_bare = -1, \
 	.hash_algo = GIT_HASH_DEFAULT, \
-	.ref_storage_format = REF_STORAGE_FORMAT_FILES, \
 	.unknown_extensions = STRING_LIST_INIT_DUP, \
 	.v1_only_extensions = STRING_LIST_INIT_DUP, \
 }
@@ -245,12 +244,12 @@ const char *get_template_dir(const char *option_template);
 int init_db(struct repository *repo,
 	    const char *git_dir, const char *real_git_dir,
 	    const char *template_dir, int hash_algo,
-	    enum ref_storage_format ref_storage_format,
+	    const char *ref_format,
 	    const char *initial_branch, int init_shared_repository,
 	    unsigned int flags);
 void initialize_repository_version(struct repository *repo,
 				   int hash_algo,
-				   enum ref_storage_format ref_storage_format,
+				   const char *ref_storage_name,
 				   int reinit);
 void create_reference_database(struct repository *repo, const char *initial_branch, int quiet);
 

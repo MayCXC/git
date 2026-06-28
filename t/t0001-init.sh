@@ -636,26 +636,31 @@ test_expect_success DEFAULT_REPO_FORMAT 'extensions.refStorage with unknown back
 	git init refstorage &&
 	git -C refstorage config core.repositoryformatversion 1 &&
 	git -C refstorage config extensions.refStorage garbage &&
-	test_must_fail git -C refstorage rev-parse 2>err &&
-	grep "invalid value for ${SQ}extensions.refstorage${SQ}: ${SQ}garbage${SQ}" err
+	# An unknown ref-storage name selects a git-local-<name> ref helper, the
+	# way an unknown URL scheme selects a remote helper, so a ref operation
+	# fails only when that helper program cannot be started, not at parse.
+	test_must_fail git -C refstorage for-each-ref 2>err &&
+	grep "unable to start helper ${SQ}garbage${SQ}" err
 '
 
 test_expect_success 'init with GIT_DEFAULT_REF_FORMAT=garbage' '
 	test_when_finished "rm -rf refformat" &&
 	cat >expect <<-EOF &&
-	fatal: unknown ref storage format ${SQ}garbage${SQ}
+	fatal: unable to start helper ${SQ}garbage${SQ}
 	EOF
 	test_must_fail env GIT_DEFAULT_REF_FORMAT=garbage git init refformat 2>err &&
 	test_cmp expect err
 '
 
-test_expect_success 'init warns about invalid init.defaultRefFormat' '
+test_expect_success 'init does not validate init.defaultRefFormat (deferred to a helper)' '
 	test_when_finished "rm -rf repo" &&
 	test_config_global init.defaultRefFormat garbage &&
 
-	echo "warning: unknown ref storage format ${SQ}garbage${SQ}" >expect &&
+	# A non-builtin name is a git-local-<name> helper, resolved only when the
+	# ref store is built, so it is stored without a warning here; the
+	# higher-precedence GIT_DEFAULT_REF_FORMAT still wins for this init.
 	git init repo 2>err &&
-	test_cmp expect err &&
+	test_must_be_empty err &&
 
 	git -C repo rev-parse --show-ref-format >actual &&
 	echo $GIT_DEFAULT_REF_FORMAT >expected &&
@@ -823,7 +828,7 @@ done
 test_expect_success 'init with --ref-format=garbage' '
 	test_when_finished "rm -rf refformat" &&
 	cat >expect <<-EOF &&
-	fatal: unknown ref storage format ${SQ}garbage${SQ}
+	fatal: unable to start helper ${SQ}garbage${SQ}
 	EOF
 	test_must_fail git init --ref-format=garbage refformat 2>err &&
 	test_cmp expect err

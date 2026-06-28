@@ -638,7 +638,7 @@ static int git_sparse_checkout_init(const char *repo)
 static int checkout(int submodule_progress,
 		    struct list_objects_filter_options *filter_options,
 		    int filter_submodules,
-		    enum ref_storage_format ref_storage_format)
+		    const char *ref_format)
 {
 	struct object_id oid;
 	char *head;
@@ -724,9 +724,8 @@ static int checkout(int submodule_progress,
 			strvec_push(&cmd.args, "--no-fetch");
 		}
 
-		if (ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
-			strvec_pushf(&cmd.args, "--ref-format=%s",
-				     ref_storage_format_to_name(ref_storage_format));
+		if (ref_format)
+			strvec_pushf(&cmd.args, "--ref-format=%s", ref_format);
 
 		if (filter_submodules && filter_options->choice)
 			strvec_pushf(&cmd.args, "--filter=%s",
@@ -893,7 +892,6 @@ int cmd_clone(int argc,
 	int submodule_progress;
 	int filter_submodules = 0;
 	int hash_algo;
-	enum ref_storage_format ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN;
 	const int do_not_override_repo_unix_permissions = -1;
 	int option_reject_shallow = -1; /* unspecified */
 	int deepen = 0;
@@ -1026,12 +1024,6 @@ int cmd_clone(int argc,
 		deepen = 1;
 	if (option_single_branch == -1)
 		option_single_branch = deepen ? 1 : 0;
-
-	if (ref_format) {
-		ref_storage_format = ref_storage_format_by_name(ref_format);
-		if (ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format '%s'"), ref_format);
-	}
 
 	if (option_mirror) {
 		option_bare = 1;
@@ -1187,7 +1179,7 @@ int cmd_clone(int argc,
 	 * their on-disk data structures.
 	 */
 	init_db(the_repository, git_dir, real_git_dir, option_template, GIT_HASH_UNKNOWN,
-		ref_storage_format, NULL,
+		ref_format, NULL,
 		do_not_override_repo_unix_permissions, INIT_DB_QUIET | INIT_DB_SKIP_REFDB);
 
 	if (real_git_dir) {
@@ -1230,7 +1222,7 @@ int cmd_clone(int argc,
 	 * This is sufficient for Git commands to discover the Git directory.
 	 */
 	initialize_repository_version(the_repository, GIT_HASH_UNKNOWN,
-				      the_repository->ref_storage_format, 1);
+				      the_repository->ref_storage_name, 1);
 
 	refs_create_refdir_stubs(the_repository, git_dir, NULL);
 
@@ -1442,7 +1434,7 @@ int cmd_clone(int argc,
 	 * ours to the same thing.
 	 */
 	hash_algo = hash_algo_by_ptr(transport_get_hash_algo(transport));
-	initialize_repository_version(the_repository, hash_algo, the_repository->ref_storage_format, 1);
+	initialize_repository_version(the_repository, hash_algo, the_repository->ref_storage_name, 1);
 	repo_set_hash_algo(the_repository, hash_algo);
 	create_reference_database(the_repository, NULL, 1);
 
@@ -1630,7 +1622,7 @@ int cmd_clone(int argc,
 	err = checkout(submodule_progress,
 		       &filter_options,
 		       filter_submodules,
-		       ref_storage_format);
+		       ref_format);
 
 	list_objects_filter_release(&filter_options);
 

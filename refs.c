@@ -57,6 +57,25 @@ enum ref_storage_format ref_storage_format_by_name(const char *name)
 	return REF_STORAGE_FORMAT_UNKNOWN;
 }
 
+static const struct ref_storage_be *find_ref_storage_backend_by_name(const char *name)
+{
+	enum ref_storage_format format;
+
+	/* No selector means the repository's default builtin backend. */
+	if (!name || !*name)
+		return refs_backends[REF_STORAGE_FORMAT_DEFAULT];
+	format = ref_storage_format_by_name(name);
+	if (format != REF_STORAGE_FORMAT_UNKNOWN)
+		return refs_backends[format];
+	/*
+	 * A name that is not a builtin format is the "git-local-<name>" ref
+	 * helper, exactly as transport_get() delegates an unknown URL scheme to
+	 * git-remote-<name>. The chosen name reaches the helper backend through
+	 * opts->name so it can spawn the matching program.
+	 */
+	return &refs_be_helper;
+}
+
 const char *ref_storage_format_to_name(enum ref_storage_format ref_storage_format)
 {
 	const struct ref_storage_be *be = find_ref_storage_backend(ref_storage_format);
@@ -2319,26 +2338,26 @@ static struct ref_store *lookup_ref_store_map(struct strmap *map,
  * gitdir using the given ref storage format.
  */
 static struct ref_store *ref_store_init(struct repository *repo,
-					enum ref_storage_format format,
+					const char *name,
+					const char *payload,
 					const char *gitdir,
-					unsigned int flags)
+					unsigned int flags,
+					unsigned int standalone)
 {
-	const struct ref_storage_be *be;
+	const struct ref_storage_be *be = find_ref_storage_backend_by_name(name);
 	struct ref_store *refs;
 	struct ref_store_init_options opts = {
 		.access_flags = flags,
 		.log_all_ref_updates = repo_settings_get_log_all_ref_updates(repo),
+		.name = name,
+		.standalone = standalone,
 	};
-
-	be = find_ref_storage_backend(format);
-	if (!be)
-		BUG("reference backend is unknown");
 
 	/*
 	 * TODO Send in a 'struct worktree' instead of a 'gitdir', and
 	 * allow the backend to handle how it wants to deal with worktrees.
 	 */
-	refs = be->init(repo, repo->ref_storage_payload, gitdir, &opts);
+	refs = be->init(repo, payload, gitdir, &opts);
 
 	return refs;
 }
@@ -2357,8 +2376,9 @@ struct ref_store *get_main_ref_store(struct repository *r)
 	if (!r->gitdir)
 		BUG("attempting to get main_ref_store outside of repository");
 
-	r->refs_private = ref_store_init(r, r->ref_storage_format,
-					 r->gitdir, REF_STORE_ALL_CAPS);
+	r->refs_private = ref_store_init(r, r->ref_storage_name,
+					 r->ref_storage_payload, r->gitdir,
+					 REF_STORE_ALL_CAPS, 0);
 	r->refs_private = maybe_debug_wrap_ref_store(r->gitdir, r->refs_private);
 	return r->refs_private;
 }
@@ -2418,9 +2438,9 @@ struct ref_store *repo_get_submodule_ref_store(struct repository *repo,
 		free(subrepo);
 		goto done;
 	}
-	refs = ref_store_init(subrepo, subrepo->ref_storage_format,
-			      submodule_sb.buf,
-			      REF_STORE_READ | REF_STORE_ODB);
+	refs = ref_store_init(subrepo, subrepo->ref_storage_name,
+			      subrepo->ref_storage_payload, submodule_sb.buf,
+			      REF_STORE_READ | REF_STORE_ODB, 0);
 	register_ref_store_map(&repo->submodule_ref_stores, "submodule",
 			       refs, submodule);
 
@@ -2448,12 +2468,14 @@ struct ref_store *get_worktree_ref_store(const struct worktree *wt)
 		struct strbuf common_path = STRBUF_INIT;
 		repo_common_path_append(wt->repo, &common_path,
 					"worktrees/%s", wt->id);
-		refs = ref_store_init(wt->repo, wt->repo->ref_storage_format,
-				      common_path.buf, REF_STORE_ALL_CAPS);
+		refs = ref_store_init(wt->repo, wt->repo->ref_storage_name,
+				      wt->repo->ref_storage_payload,
+				      common_path.buf, REF_STORE_ALL_CAPS, 0);
 		strbuf_release(&common_path);
 	} else {
-		refs = ref_store_init(wt->repo, wt->repo->ref_storage_format,
-				      wt->repo->commondir, REF_STORE_ALL_CAPS);
+		refs = ref_store_init(wt->repo, wt->repo->ref_storage_name,
+				      wt->repo->ref_storage_payload,
+				      wt->repo->commondir, REF_STORE_ALL_CAPS, 0);
 	}
 
 	if (refs)
@@ -3403,8 +3425,8 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		goto done;
 	}
 
-	new_refs = ref_store_init(repo, format, new_gitdir.buf,
-				  REF_STORE_ALL_CAPS);
+	new_refs = ref_store_init(repo, ref_storage_format_to_name(format), NULL,
+				  new_gitdir.buf, REF_STORE_ALL_CAPS, 0);
 	ret = ref_store_create_on_disk(new_refs, 0, errbuf);
 	if (ret < 0)
 		goto done;
@@ -3488,7 +3510,8 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 	 * repository format so that clients will use the new ref store.
 	 * We also need to swap out the repository's main ref store.
 	 */
-	initialize_repository_version(the_repository, hash_algo_by_ptr(repo->hash_algo), format, 1);
+	initialize_repository_version(the_repository, hash_algo_by_ptr(repo->hash_algo),
+				      ref_storage_format_to_name(format), 1);
 
 	/*
 	 * Unset the old ref store and release it. `get_main_ref_store()` will

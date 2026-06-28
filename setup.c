@@ -690,22 +690,46 @@ static enum extension_result handle_extension(const char *var,
 		data->compat_hash_algo = format;
 		return EXTENSION_OK;
 	} else if (!strcmp(ext, "refstorage")) {
-		unsigned int format;
 		char *format_str;
+		char *payload = NULL;
 
 		if (!value)
 			return config_error_nonbool(var);
 
-		parse_reference_uri(value, &format_str,
-				    &data->ref_storage_payload);
+		parse_reference_uri(value, &format_str, &payload);
 
-		format = ref_storage_format_by_name(format_str);
-		free(format_str);
+		/*
+		 * The selector name is the whole identity (the object twin is
+		 * extensions.objectStorage): a builtin format name selects that
+		 * backend, any other name names the git-local-<name> ref helper
+		 * the way an unknown URL scheme names a remote helper. It is stored
+		 * verbatim and resolved when the ref store is built.
+		 *
+		 * A builtin format takes its own optional "scheme://payload". Any
+		 * other name becomes the helper's program name, so it must be a
+		 * bare token (the way a remote helper is named by a clean scheme,
+		 * not a whole URL): reject a payload or path and separator
+		 * characters here rather than spawning git-local-<garbage>. The
+		 * accepted characters are git's own RFC 1738 scheme set, the ones
+		 * transport.c allows when an unknown scheme names a remote helper
+		 * ("make sure scheme is reasonable").
+		 */
+		if (ref_storage_format_by_name(format_str) == REF_STORAGE_FORMAT_UNKNOWN &&
+		    (payload || !*format_str ||
+		     format_str[strspn(format_str,
+				       "abcdefghijklmnopqrstuvwxyz"
+				       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				       "0123456789+.-")])) {
+			int ret = error(_("invalid value for '%s': '%s'"),
+					"extensions.refstorage", value);
+			free(format_str);
+			free(payload);
+			return ret;
+		}
 
-		if (format == REF_STORAGE_FORMAT_UNKNOWN)
-			return error(_("invalid value for '%s': '%s'"),
-				     "extensions.refstorage", value);
-		data->ref_storage_format = format;
+		free(data->ref_storage_name);
+		data->ref_storage_name = format_str;
+		data->ref_storage_payload = payload;
 		return EXTENSION_OK;
 	} else if (!strcmp(ext, "relativeworktrees")) {
 		data->relative_worktrees = git_config_bool(var, value);
@@ -877,6 +901,7 @@ void clear_repository_format(struct repository_format *format)
 	string_list_clear(&format->v1_only_extensions, 0);
 	free(format->work_tree);
 	free(format->partial_clone);
+	free(format->ref_storage_name);
 	free(format->ref_storage_payload);
 	init_repository_format(format);
 }
@@ -1779,9 +1804,9 @@ static void check_repository_format(struct repository *repo, struct repository_f
 	startup_info->have_repository = 1;
 	repo_set_hash_algo(repo, fmt->hash_algo);
 	repo_set_compat_hash_algo(repo, fmt->compat_hash_algo);
-	repo_set_ref_storage_format(repo,
-				    fmt->ref_storage_format,
-				    fmt->ref_storage_payload);
+	repo_set_ref_storage_name(repo,
+				  fmt->ref_storage_name,
+				  fmt->ref_storage_payload);
 	repo->repository_format_worktree_config =
 		fmt->worktree_config;
 	repo->repository_format_submodule_path_cfg =
@@ -2029,9 +2054,9 @@ const char *setup_git_directory_gently(struct repository *repo, int *nongit_ok)
 			repo_set_hash_algo(repo, repo_fmt.hash_algo);
 			repo_set_compat_hash_algo(repo,
 						  repo_fmt.compat_hash_algo);
-			repo_set_ref_storage_format(repo,
-						    repo_fmt.ref_storage_format,
-						    repo_fmt.ref_storage_payload);
+			repo_set_ref_storage_name(repo,
+						  repo_fmt.ref_storage_name,
+						  repo_fmt.ref_storage_payload);
 			repo->repository_format_worktree_config =
 				repo_fmt.worktree_config;
 			repo->repository_format_relative_worktrees =
@@ -2069,13 +2094,15 @@ const char *setup_git_directory_gently(struct repository *repo, int *nongit_ok)
 	ref_backend_uri = getenv(GIT_REFERENCE_BACKEND_ENVIRONMENT);
 	if (ref_backend_uri) {
 		char *backend, *payload;
-		enum ref_storage_format format;
 
 		parse_reference_uri(ref_backend_uri, &backend, &payload);
-		format = ref_storage_format_by_name(backend);
-		if (format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format: '%s'"), backend);
-		repo_set_ref_storage_format(repo, format, payload);
+		/*
+		 * The scheme is the selector name (the env overriding the config):
+		 * a builtin format or, like an unknown URL scheme, a git-local-<name>
+		 * ref helper. It is stored verbatim and resolved when the ref store
+		 * is built.
+		 */
+		repo_set_ref_storage_name(repo, backend, payload);
 
 		free(backend);
 		free(payload);
@@ -2405,24 +2432,19 @@ static int needs_work_tree_config(const char *git_dir, const char *work_tree)
 
 void initialize_repository_version(struct repository *repo,
 				   int hash_algo,
-				   enum ref_storage_format ref_storage_format,
+				   const char *ref_storage_name,
 				   int reinit)
 {
 	struct strbuf repo_version = STRBUF_INIT;
 	int target_version = GIT_REPO_VERSION;
 	int default_submodule_path_config = 0;
-
 	/*
-	 * Note that we initialize the repository version to 1 when the ref
-	 * storage format is unknown. This is on purpose so that we can add the
-	 * correct object format to the config during git-clone(1). The format
-	 * version will get adjusted by git-clone(1) once it has learned about
-	 * the remote repository's format.
+	 * An unknown object format requires the v1 repo format on purpose, so
+	 * git-clone(1) can add the real object format to the config once it has
+	 * learned the remote repository's; hence this is the broad hash test, not
+	 * the narrower objectformat-write one below.
 	 */
-	if (hash_algo != GIT_HASH_SHA1_LEGACY ||
-	    ref_storage_format != REF_STORAGE_FORMAT_FILES ||
-	    repo->ref_storage_payload)
-		target_version = GIT_REPO_VERSION_READ;
+	int needs_v1 = hash_algo != GIT_HASH_SHA1_LEGACY;
 
 	if (hash_algo != GIT_HASH_SHA1_LEGACY && hash_algo != GIT_HASH_UNKNOWN)
 		repo_config_set(repo, "extensions.objectformat",
@@ -2430,20 +2452,36 @@ void initialize_repository_version(struct repository *repo,
 	else if (reinit)
 		repo_config_set_gently(repo, "extensions.objectformat", NULL);
 
+	/*
+	 * Each storage backend designates itself by a single open-ended name:
+	 * extensions.refStorage for refs and extensions.objectStorage for objects
+	 * (written just below). "files" (or NULL) is the v0 default and records
+	 * nothing; any other name is a builtin format or a git-local-<name> helper
+	 * and a v1-only extension, which (with a non-SHA-1 object format) requires
+	 * the v1 repo format. Nothing here branches on the backend: the name is the
+	 * whole identity, resolved when the store is built.
+	 *
+	 * A ref split-store keeps its "<name>://<payload>" suffix; on reinit to the
+	 * default, a stale ref extension is cleared.
+	 */
 	if (repo->ref_storage_payload) {
-		struct strbuf ref_uri = STRBUF_INIT;
-
-		strbuf_addf(&ref_uri, "%s://%s",
-			    ref_storage_format_to_name(ref_storage_format),
+		struct strbuf uri = STRBUF_INIT;
+		strbuf_addf(&uri, "%s://%s",
+			    ref_storage_name && *ref_storage_name ?
+			    ref_storage_name : "files",
 			    repo->ref_storage_payload);
-		repo_config_set(repo, "extensions.refstorage", ref_uri.buf);
-		strbuf_release(&ref_uri);
-	} else if (ref_storage_format != REF_STORAGE_FORMAT_FILES) {
-		repo_config_set(repo, "extensions.refstorage",
-				ref_storage_format_to_name(ref_storage_format));
+		repo_config_set(repo, "extensions.refstorage", uri.buf);
+		strbuf_release(&uri);
+		needs_v1 = 1;
+	} else if (ref_storage_name && *ref_storage_name &&
+		   strcmp(ref_storage_name, "files")) {
+		repo_config_set(repo, "extensions.refstorage", ref_storage_name);
+		needs_v1 = 1;
 	} else if (reinit) {
 		repo_config_set_gently(repo, "extensions.refstorage", NULL);
 	}
+	if (needs_v1)
+		target_version = GIT_REPO_VERSION_READ;
 
 	if (reinit) {
 		struct strbuf config = STRBUF_INIT;
@@ -2571,7 +2609,7 @@ static int create_default_files(struct repository *repo,
 		adjust_shared_perm(repo, repo_get_git_dir(repo));
 	}
 
-	initialize_repository_version(repo, fmt->hash_algo, fmt->ref_storage_format, reinit);
+	initialize_repository_version(repo, fmt->hash_algo, fmt->ref_storage_name, reinit);
 
 	/* Check filemode trustability */
 	repo_git_path_replace(repo, &path, "config");
@@ -2666,7 +2704,7 @@ static void separate_git_dir(const char *git_dir, const char *git_link)
 
 struct default_format_config {
 	int hash;
-	enum ref_storage_format ref_format;
+	char *ref_format; /* ref-storage selector name, NULL if unset */
 };
 
 static int read_default_format_config(const char *key, const char *value,
@@ -2691,9 +2729,14 @@ static int read_default_format_config(const char *key, const char *value,
 		ret = git_config_string(&str, key, value);
 		if (ret)
 			goto out;
-		cfg->ref_format = ref_storage_format_by_name(str);
-		if (cfg->ref_format == REF_STORAGE_FORMAT_UNKNOWN)
-			warning(_("unknown ref storage format '%s'"), str);
+		/*
+		 * Store the selector name verbatim; a name that is not a builtin
+		 * format is a git-local-<name> helper, resolved when the ref store
+		 * is built, so there is nothing to validate here.
+		 */
+		free(cfg->ref_format);
+		cfg->ref_format = str;
+		str = NULL;
 		goto out;
 	}
 
@@ -2702,9 +2745,9 @@ static int read_default_format_config(const char *key, const char *value,
 	 * "init.defaultRefFormat" takes precedence over this setting.
 	 */
 	if (!strcmp(key, "feature.experimental") &&
-	    cfg->ref_format == REF_STORAGE_FORMAT_UNKNOWN &&
+	    !cfg->ref_format &&
 	    git_config_bool(key, value)) {
-		cfg->ref_format = REF_STORAGE_FORMAT_REFTABLE;
+		cfg->ref_format = xstrdup("reftable");
 		ret = 0;
 		goto out;
 	}
@@ -2717,11 +2760,11 @@ out:
 
 static void repository_format_configure(struct repository *repo,
 					struct repository_format *repo_fmt,
-					int hash, enum ref_storage_format ref_format)
+					int hash, const char *ref_format)
 {
 	struct default_format_config cfg = {
 		.hash = GIT_HASH_UNKNOWN,
-		.ref_format = REF_STORAGE_FORMAT_UNKNOWN,
+		.ref_format = NULL,
 	};
 	struct config_options opts = {
 		.respect_includes = 1,
@@ -2755,51 +2798,55 @@ static void repository_format_configure(struct repository *repo,
 	}
 	repo_set_hash_algo(repo, repo_fmt->hash_algo);
 
+	/*
+	 * --ref-format names the ref backend exactly as --object-storage names the
+	 * object backend below: a builtin format (files, reftable) or, like an
+	 * unknown URL scheme naming a remote helper, a git-local-<name> ref helper
+	 * whose program name is the format. The name is stored verbatim and
+	 * resolved when the ref store is built, so nothing here branches on it.
+	 * Precedence: --ref-format, then GIT_DEFAULT_REF_FORMAT, then
+	 * init.defaultRefFormat / feature.experimental, then the builtin default;
+	 * an existing repository keeps its format, and reinitializing with a
+	 * different one is rejected.
+	 */
 	env = getenv("GIT_DEFAULT_REF_FORMAT");
-	if (repo_fmt->version >= 0 &&
-	    ref_format != REF_STORAGE_FORMAT_UNKNOWN &&
-	    ref_format != repo_fmt->ref_storage_format) {
-		die(_("attempt to reinitialize repository with different reference storage format"));
-	} else if (ref_format != REF_STORAGE_FORMAT_UNKNOWN) {
-		repo_fmt->ref_storage_format = ref_format;
-	} else if (env) {
-		ref_format = ref_storage_format_by_name(env);
-		if (ref_format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format '%s'"), env);
-		if (repo_fmt->version < 0 ||
-		    repo_fmt->ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
-			repo_fmt->ref_storage_format = ref_format;
-	} else if (cfg.ref_format != REF_STORAGE_FORMAT_UNKNOWN) {
-		repo_fmt->ref_storage_format = cfg.ref_format;
+	if (repo_fmt->version >= 0) {
+		const char *current = repo_fmt->ref_storage_name &&
+				      *repo_fmt->ref_storage_name ?
+				      repo_fmt->ref_storage_name :
+				      ref_storage_format_to_name(REF_STORAGE_FORMAT_DEFAULT);
+		if (ref_format && strcmp(ref_format, current))
+			die(_("attempt to reinitialize repository with different reference storage format"));
 	} else {
-		repo_fmt->ref_storage_format = REF_STORAGE_FORMAT_DEFAULT;
+		const char *selected = ref_format ? ref_format :
+				       env ? env :
+				       cfg.ref_format ? cfg.ref_format :
+				       ref_storage_format_to_name(REF_STORAGE_FORMAT_DEFAULT);
+		free(repo_fmt->ref_storage_name);
+		repo_fmt->ref_storage_name = xstrdup(selected);
 	}
-
 
 	ref_backend_uri = getenv(GIT_REFERENCE_BACKEND_ENVIRONMENT);
 	if (ref_backend_uri) {
 		char *backend, *payload;
-		enum ref_storage_format format;
 
 		parse_reference_uri(ref_backend_uri, &backend, &payload);
-		format = ref_storage_format_by_name(backend);
-		if (format == REF_STORAGE_FORMAT_UNKNOWN)
-			die(_("unknown ref storage format: '%s'"), backend);
-
-		repo_fmt->ref_storage_format = format;
+		free(repo_fmt->ref_storage_name);
+		repo_fmt->ref_storage_name = backend;
+		free(repo_fmt->ref_storage_payload);
 		repo_fmt->ref_storage_payload = payload;
-
-		free(backend);
 	}
 
-	repo_set_ref_storage_format(repo, repo_fmt->ref_storage_format,
-				    repo_fmt->ref_storage_payload);
+	repo_set_ref_storage_name(repo, repo_fmt->ref_storage_name,
+				  repo_fmt->ref_storage_payload);
+
+	free(cfg.ref_format);
 }
 
 int init_db(struct repository *repo,
 	    const char *git_dir, const char *real_git_dir,
 	    const char *template_dir, int hash,
-	    enum ref_storage_format ref_storage_format,
+	    const char *ref_format,
 	    const char *initial_branch,
 	    int init_shared_repository, unsigned int flags)
 {
@@ -2835,7 +2882,7 @@ int init_db(struct repository *repo,
 	 */
 	check_repository_format(repo, &repo_fmt);
 
-	repository_format_configure(repo, &repo_fmt, hash, ref_storage_format);
+	repository_format_configure(repo, &repo_fmt, hash, ref_format);
 
 	/*
 	 * Ensure `core.hidedotfiles` is processed. This must happen after we

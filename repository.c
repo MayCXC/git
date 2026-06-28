@@ -215,13 +215,34 @@ void repo_set_compat_hash_algo(struct repository *repo MAYBE_UNUSED, uint32_t al
 #endif
 }
 
-void repo_set_ref_storage_format(struct repository *repo,
-				 enum ref_storage_format format,
-				 const char *payload)
+void repo_set_ref_storage_name(struct repository *repo,
+			       const char *name,
+			       const char *payload)
 {
-	repo->ref_storage_format = format;
+	enum ref_storage_format format;
+
+	free(repo->ref_storage_name);
+	repo->ref_storage_name = xstrdup_or_null(name);
 	free(repo->ref_storage_payload);
 	repo->ref_storage_payload = xstrdup_or_null(payload);
+
+	/*
+	 * The name is the canonical selector (the object twin is odb_source_name);
+	 * derive the format view the same way the construction boundary
+	 * (find_ref_storage_backend_by_name) resolves it: a builtin name maps to
+	 * its format, any other non-empty name is the "git-local-<name>" ref
+	 * helper, and an empty or NULL selector is the default backend. The UNKNOWN
+	 * sentinel is reserved for a repository whose format has not been set at all
+	 * (a zero-initialized struct), which is what config.c keys on; calling this
+	 * setter always establishes a concrete format. The helper process itself
+	 * (repo->ref_local_helper) is spawned lazily when the ref store is built,
+	 * named from this selector, and shut down in repo_clear().
+	 */
+	if (!name || !*name)
+		format = REF_STORAGE_FORMAT_DEFAULT;
+	else if ((format = ref_storage_format_by_name(name)) == REF_STORAGE_FORMAT_UNKNOWN)
+		format = REF_STORAGE_FORMAT_HELPER;
+	repo->ref_storage_format = format;
 }
 
 /*
@@ -303,8 +324,8 @@ int repo_init(struct repository *repo,
 
 	repo_set_hash_algo(repo, format.hash_algo);
 	repo_set_compat_hash_algo(repo, format.compat_hash_algo);
-	repo_set_ref_storage_format(repo, format.ref_storage_format,
-				    format.ref_storage_payload);
+	repo_set_ref_storage_name(repo, format.ref_storage_name,
+				  format.ref_storage_payload);
 	repo->repository_format_worktree_config = format.worktree_config;
 	repo->repository_format_relative_worktrees = format.relative_worktrees;
 	repo->repository_format_precious_objects = format.precious_objects;
@@ -398,6 +419,7 @@ void repo_clear(struct repository *repo)
 	FREE_AND_NULL(repo->index_file);
 	FREE_AND_NULL(repo->worktree);
 	FREE_AND_NULL(repo->submodule_prefix);
+	FREE_AND_NULL(repo->ref_storage_name);
 	FREE_AND_NULL(repo->ref_storage_payload);
 
 	odb_free(repo->objects);
