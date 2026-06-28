@@ -33,10 +33,13 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 	struct packed_git *new_pack = NULL;
 	struct transport *transport;
 	size_t base_len;
+	int self_contained_and_connected;
 
 	if (!opt)
 		opt = &defaults;
 	transport = opt->transport;
+	self_contained_and_connected = transport && transport->smart_options &&
+		transport->smart_options->self_contained_and_connected;
 
 	oid = fn(cb_data);
 	if (!oid) {
@@ -52,29 +55,24 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 		 * all promisor objects (slow), and then the connectivity check
 		 * itself becomes a no-op because in a partial clone every
 		 * object is a promisor object. Instead, just make sure we
-		 * received, in a promisor packfile, the objects pointed to by
-		 * each wanted ref.
+		 * received each wanted ref's object as a promisor object: for
+		 * the files backend that means it landed in a promisor
+		 * packfile, while another backend (e.g. a helper) reports its
+		 * own promisor objects. The check dispatches per source, so it
+		 * works whatever the primary object backend is.
 		 *
-		 * Before checking for promisor packs, be sure we have the
-		 * latest pack-files loaded into memory.
+		 * Before checking, be sure we have the latest pack-files loaded
+		 * into memory.
 		 */
 		odb_reprepare(the_repository->objects);
 		do {
-			struct packed_git *p;
-
-			repo_for_each_pack(the_repository, p) {
-				if (!p->pack_promisor)
-					continue;
-				if (find_pack_entry_one(oid, p))
-					goto promisor_pack_found;
-			}
 			/*
-			 * Fallback to rev-list with oid and the rest of the
-			 * object IDs provided by fn.
+			 * If this object is not a stored promisor object, fall
+			 * back to rev-list with it and the rest of the object
+			 * IDs provided by fn.
 			 */
-			goto no_promisor_pack_found;
-promisor_pack_found:
-			;
+			if (!odb_is_promisor_object(the_repository->objects, oid))
+				goto no_promisor_pack_found;
 		} while ((oid = fn(cb_data)) != NULL);
 		if (opt->err_fd)
 			close(opt->err_fd);
@@ -121,8 +119,7 @@ no_promisor_pack_found:
 
 	rev_list_in = xfdopen(rev_list.in, "w");
 
-	if (transport && transport->smart_options &&
-	    transport->smart_options->self_contained_and_connected &&
+	if (self_contained_and_connected &&
 	    transport->pack_lockfiles.nr == 1 &&
 	    strip_suffix(transport->pack_lockfiles.items[0].string,
 			 ".keep", &base_len)) {
@@ -145,6 +142,17 @@ no_promisor_pack_found:
 		 * rev-list for verification.
 		 */
 		if (new_pack && find_pack_entry_one(oid, new_pack))
+			continue;
+
+		/*
+		 * With no just-indexed pack file to consult (for example a
+		 * non-files backend ingested the objects directly, so there is
+		 * no ".idx" to open), the same self-contained-and-connected
+		 * guarantee means a wanted tip that is now present in the
+		 * object store is good without a rev-list walk.
+		 */
+		if (self_contained_and_connected &&
+		    odb_has_object(the_repository->objects, oid, 0))
 			continue;
 
 		if (fprintf(rev_list_in, "%s\n", oid_to_hex(oid)) < 0)

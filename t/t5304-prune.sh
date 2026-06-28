@@ -59,6 +59,28 @@ test_expect_success 'prune --expire' '
 	test_path_is_missing $BLOB_FILE
 '
 
+test_expect_success 'prune --dry-run reports only the loose objects it removes' '
+	test_when_finished "rm -rf dryrun" &&
+	git init dryrun &&
+	(
+		cd dryrun &&
+		git config core.logAllRefUpdates false &&
+		git commit -q --allow-empty -m keep &&
+		git commit -q --allow-empty -m doomed &&
+		doomed=$(git rev-parse HEAD) &&
+		# Pack the doomed commit while it is still reachable, then orphan it:
+		# prune removes loose objects, not packed ones (repack does that), so
+		# --dry-run must not list the packed-but-unreachable commit.
+		git repack -adq &&
+		git reset -q --hard HEAD^ &&
+		# A loose unreachable object prune will remove, as a positive control.
+		orphan=$(echo orphan | git hash-object -w --stdin) &&
+		git prune --dry-run --expire=now >report &&
+		grep "$orphan" report &&
+		! grep "$doomed" report
+	)
+'
+
 test_expect_success 'gc: implicit prune --expire' '
 	add_blob &&
 	test-tool chmtime =-$((2*$week-30)) $BLOB_FILE &&

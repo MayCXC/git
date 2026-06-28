@@ -79,7 +79,7 @@ static int parse_object_dir(const struct option *opt, const char *arg,
 	char **value = opt->value;
 	free(*value);
 	if (unset)
-		*value = xstrdup(the_repository->objects->sources->path);
+		*value = xstrdup(repo_get_object_directory(the_repository));
 	else
 		*value = real_pathdup(arg, 1);
 	return 0;
@@ -211,10 +211,10 @@ static int cmd_multi_pack_index_write(int argc, const char **argv,
 
 		read_packs_from_stdin(&packs);
 
-		ret = write_midx_file_only(source, &packs,
-					   opts.preferred_pack,
-					   opts.refs_snapshot,
-					   opts.incremental_base, opts.flags);
+		ret = odb_source_multi_pack_index_write(source, &packs,
+							opts.preferred_pack,
+							opts.refs_snapshot,
+							opts.incremental_base, opts.flags);
 
 		string_list_clear(&packs, 0);
 		free(opts.refs_snapshot);
@@ -223,8 +223,9 @@ static int cmd_multi_pack_index_write(int argc, const char **argv,
 
 	}
 
-	ret = write_midx_file(source, opts.preferred_pack,
-			      opts.refs_snapshot, opts.flags);
+	ret = odb_source_multi_pack_index_write(source, NULL, opts.preferred_pack,
+						opts.refs_snapshot,
+						opts.incremental_base, opts.flags);
 
 	free(opts.refs_snapshot);
 	return ret;
@@ -234,11 +235,7 @@ static int cmd_multi_pack_index_compact(int argc, const char **argv,
 					const char *prefix,
 					struct repository *repo)
 {
-	struct multi_pack_index *m, *cur;
-	struct multi_pack_index *from_midx = NULL;
-	struct multi_pack_index *to_midx = NULL;
 	struct odb_source *source;
-	int ret;
 
 	struct option *options;
 	static struct option builtin_multi_pack_index_compact_options[] = {
@@ -282,33 +279,8 @@ static int cmd_multi_pack_index_compact(int argc, const char **argv,
 
 	FREE_AND_NULL(options);
 
-	m = get_multi_pack_index(source);
-
-	for (cur = m; cur && !(from_midx && to_midx); cur = cur->base_midx) {
-		const char *midx_csum = midx_get_checksum_hex(cur);
-
-		if (!from_midx && !strcmp(midx_csum, argv[0]))
-			from_midx = cur;
-		if (!to_midx && !strcmp(midx_csum, argv[1]))
-			to_midx = cur;
-	}
-
-	if (!from_midx)
-		die(_("could not find MIDX: %s"), argv[0]);
-	if (!to_midx)
-		die(_("could not find MIDX: %s"), argv[1]);
-	if (from_midx == to_midx)
-		die(_("MIDX compaction endpoints must be unique"));
-
-	for (m = from_midx; m; m = m->base_midx) {
-		if (m == to_midx)
-			die(_("MIDX %s must be an ancestor of %s"), argv[0], argv[1]);
-	}
-
-	ret = write_midx_file_compact(source, from_midx, to_midx,
-				      opts.incremental_base, opts.flags);
-
-	return ret;
+	return odb_source_multi_pack_index_compact(source, argv[0], argv[1],
+						   opts.incremental_base, opts.flags);
 }
 
 static int cmd_multi_pack_index_verify(int argc, const char **argv,
@@ -337,7 +309,7 @@ static int cmd_multi_pack_index_verify(int argc, const char **argv,
 
 	FREE_AND_NULL(options);
 
-	return verify_midx_file(source, opts.flags);
+	return odb_source_multi_pack_index_verify(source, opts.flags);
 }
 
 static int cmd_multi_pack_index_expire(int argc, const char **argv,
@@ -366,7 +338,7 @@ static int cmd_multi_pack_index_expire(int argc, const char **argv,
 
 	FREE_AND_NULL(options);
 
-	return expire_midx_packs(source, opts.flags);
+	return odb_source_multi_pack_index_expire(source, opts.flags);
 }
 
 static int cmd_multi_pack_index_repack(int argc, const char **argv,
@@ -398,7 +370,7 @@ static int cmd_multi_pack_index_repack(int argc, const char **argv,
 
 	FREE_AND_NULL(options);
 
-	return midx_repack(source, (size_t)opts.batch_size, opts.flags);
+	return odb_source_multi_pack_index_repack(source, (size_t)opts.batch_size, opts.flags);
 }
 
 int cmd_multi_pack_index(int argc,
@@ -424,8 +396,8 @@ int cmd_multi_pack_index(int argc,
 
 	if (the_repository &&
 	    the_repository->objects &&
-	    the_repository->objects->sources)
-		opts.object_dir = xstrdup(the_repository->objects->sources->path);
+	    the_repository->objects->object_dir)
+		opts.object_dir = xstrdup(repo_get_object_directory(the_repository));
 
 	argc = parse_options(argc, argv, prefix, options,
 			     builtin_multi_pack_index_usage, 0);

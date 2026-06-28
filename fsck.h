@@ -174,6 +174,8 @@ struct fsck_options {
 	fsck_error error_func;
 	unsigned strict;
 	unsigned verbose;
+	unsigned check_full;
+	unsigned progress;
 	enum fsck_msg_type *msg_type;
 	struct oidset skip_oids;
 	struct oidset gitmodules_found;

@@ -196,7 +196,7 @@ test_expect_success 'gc.repackFilter launches repack with a filter' '
 	GIT_TRACE=$(pwd)/trace.out git -C bare.git -c gc.repackFilter=blob:none \
 		-c repack.writeBitmaps=false -c gc.cruftPacks=false gc &&
 	test_stdout_line_count = 2 ls bare.git/objects/pack/*.pack &&
-	grep -E "^trace: (built-in|exec|run_command): git repack .* --filter=blob:none ?.*" trace.out
+	grep -E "^trace: (built-in|exec|run_command): git pack-objects .* --filter=blob:none ?.*" trace.out
 '
 
 test_expect_success 'gc.repackFilterTo store filtered out objects' '
@@ -312,8 +312,6 @@ test_expect_success 'gc.bigPackThreshold ignores cruft packs' '
 	)
 '
 
-cruft_max_size_opts="git repack -d -l --cruft --cruft-expiration=2.weeks.ago"
-
 test_expect_success 'setup for --max-cruft-size tests' '
 	git init cruft--max-size &&
 	(
@@ -322,54 +320,54 @@ test_expect_success 'setup for --max-cruft-size tests' '
 	)
 '
 
+# Since gc now optimizes the object store in-process (gc -> odb_optimize ->
+# repack_run) rather than spawning "git repack", these assert that the option
+# reaches the resulting pack-objects invocation, or the expire-to outcome.
 test_expect_success '--max-cruft-size sets appropriate repack options' '
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt git -C cruft--max-size \
+	GIT_TRACE=$(pwd)/trace.txt git -C cruft--max-size \
 		gc --cruft --max-cruft-size=1M &&
-	test_subcommand $cruft_max_size_opts --max-cruft-size=1048576 <trace2.txt
+	grep -E "git pack-objects .*--max-pack-size=1048576.*--cruft" trace.txt
 '
 
 test_expect_success 'gc.maxCruftSize sets appropriate repack options' '
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt \
+	GIT_TRACE=$(pwd)/trace.txt \
 		git -C cruft--max-size -c gc.maxCruftSize=2M gc --cruft &&
-	test_subcommand $cruft_max_size_opts --max-cruft-size=2097152 <trace2.txt &&
+	grep -E "git pack-objects .*--max-pack-size=2097152.*--cruft" trace.txt &&
 
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt \
+	GIT_TRACE=$(pwd)/trace.txt \
 		git -C cruft--max-size -c gc.maxCruftSize=2M gc --cruft \
 		--max-cruft-size=3M &&
-	test_subcommand $cruft_max_size_opts --max-cruft-size=3145728 <trace2.txt
+	grep -E "git pack-objects .*--max-pack-size=3145728.*--cruft" trace.txt
 '
 
-test_expect_success '--expire-to sets repack --expire-to' '
+test_expect_success '--expire-to with --cruft writes a cruft pack' '
+	git -C cruft--max-size reflog expire --expire=now --all &&
 	rm -rf expired &&
 	mkdir expired &&
 	expire_to="$(pwd)/expired/pack" &&
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt git -C cruft--max-size gc --cruft --expire-to="$expire_to" &&
-	test_subcommand $cruft_max_size_opts --expire-to="$expire_to" <trace2.txt
+	git -C cruft--max-size gc --cruft --expire-to="$expire_to" &&
+	ls cruft--max-size/.git/objects/pack/*.mtimes
 '
 
-test_expect_success '--expire-to with --prune=now sets repack --expire-to' '
+test_expect_success '--expire-to with --prune=now writes pruned objects to the expire dir' '
+	git -C cruft--max-size reflog expire --expire=now --all &&
 	rm -rf expired &&
 	mkdir expired &&
 	expire_to="$(pwd)/expired/pack" &&
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt git -C cruft--max-size gc --cruft --prune=now --expire-to="$expire_to" &&
-	test_subcommand git repack -d -l --cruft --cruft-expiration=now --expire-to="$expire_to" <trace2.txt
+	git -C cruft--max-size gc --cruft --prune=now --expire-to="$expire_to" &&
+	ls "$expire_to"-*.pack
 '
 
-
-test_expect_success '--expire-to with --no-cruft sets repack -A' '
-	rm -rf expired &&
-	mkdir expired &&
-	expire_to="$(pwd)/expired/pack" &&
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt git -C cruft--max-size gc --no-cruft --expire-to="$expire_to" &&
-	test_subcommand git repack -d -l -A --unpack-unreachable=2.weeks.ago <trace2.txt
+test_expect_success '--no-cruft sets repack -A' '
+	GIT_TRACE=$(pwd)/trace.txt git -C cruft--max-size gc --no-cruft &&
+	grep -E "git pack-objects .*--unpack-unreachable=2.weeks.ago" trace.txt
 '
 
-test_expect_success '--expire-to with --no-cruft sets repack -a' '
-	rm -rf expired &&
-	mkdir expired &&
-	expire_to="$(pwd)/expired/pack" &&
-	GIT_TRACE2_EVENT=$(pwd)/trace2.txt git -C cruft--max-size gc --no-cruft --prune=now --expire-to="$expire_to" &&
-	test_subcommand git repack -d -l -a <trace2.txt
+test_expect_success '--no-cruft --prune=now sets repack -a' '
+	rm -f trace.txt &&
+	GIT_TRACE=$(pwd)/trace.txt git -C cruft--max-size gc --no-cruft --prune=now &&
+	grep -E "git pack-objects .*--all" trace.txt &&
+	! grep -E "git pack-objects .*--unpack-unreachable" trace.txt
 '
 
 run_and_wait_for_gc () {

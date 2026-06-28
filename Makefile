@@ -1295,6 +1295,7 @@ LIB_OBJS += repack-filtered.o
 LIB_OBJS += repack-geometry.o
 LIB_OBJS += repack-midx.o
 LIB_OBJS += repack-promisor.o
+LIB_OBJS += repack-run.o
 LIB_OBJS += replace-object.o
 LIB_OBJS += replay.o
 LIB_OBJS += repo-settings.o

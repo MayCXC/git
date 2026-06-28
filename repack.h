@@ -171,4 +171,90 @@ int write_cruft_pack(const struct write_pack_opts *opts,
 		     struct string_list *names,
 		     struct existing_packs *existing);
 
+struct config_context;
+
+/* Bits for repack_opts.pack_everything. */
+#define ALL_INTO_ONE 1
+#define LOOSEN_UNREACHABLE 2
+#define PACK_CRUFT 4
+
+#define DEFAULT_MIDX_SPLIT_FACTOR 2
+#define DEFAULT_MIDX_NEW_LAYER_THRESHOLD 8
+
+/*
+ * The fully-parsed options for a single repack. cmd_repack() fills this from
+ * the command line and configuration; the files object source fills it with
+ * maintenance defaults. Both then call repack_run(), so the repack
+ * orchestration lives in exactly one place.
+ */
+struct repack_opts {
+	int pack_everything;		/* ALL_INTO_ONE | LOOSEN_UNREACHABLE | PACK_CRUFT */
+	int write_bitmaps;		/* -1 unset, 0 no, 1 yes */
+	int use_delta_islands;
+	int run_update_server_info;
+	int midx_must_contain_cruft;
+	int delete_redundant;
+	int keep_unreachable;
+	int split_factor;		/* geometric repack factor, 0 if unset */
+	int midx_split_factor;
+	int midx_new_layer_threshold;
+	enum repack_write_midx_mode write_midx;
+	const char *unpack_unreachable;
+	const char *cruft_expiration;
+	const char *expire_to;
+	const char *filter_to;
+	unsigned long combine_cruft_below_size;
+	struct string_list keep_pack_list;
+	struct pack_objects_args po_args;
+	struct pack_objects_args cruft_po_args;
+};
+
+#define REPACK_OPTS_INIT { \
+	.write_bitmaps = -1, \
+	.run_update_server_info = 1, \
+	.midx_must_contain_cruft = 1, \
+	.midx_split_factor = DEFAULT_MIDX_SPLIT_FACTOR, \
+	.midx_new_layer_threshold = DEFAULT_MIDX_NEW_LAYER_THRESHOLD, \
+	.keep_pack_list = STRING_LIST_INIT_NODUP, \
+	.po_args = PACK_OBJECTS_ARGS_INIT, \
+	.cruft_po_args = PACK_OBJECTS_ARGS_INIT, \
+}
+
+/*
+ * Configuration callback for repack (repack.*, pack.writebitmaps, ...). Pass a
+ * struct repack_opts as the callback data: repo_config(repo, repack_config,
+ * &opts).
+ */
+int repack_config(const char *var, const char *value,
+		  const struct config_context *ctx, void *cb);
+
+/*
+ * Run a repack with the given options against the repository's files object
+ * store: build the new pack(s) with pack-objects, install them, optionally
+ * write a multi-pack index, and (with delete_redundant) prune what they
+ * replace. Returns 0 on success, non-zero otherwise. Does not release opts;
+ * call repack_opts_release() for that.
+ */
+int repack_run(struct repository *repo, struct repack_opts *opts);
+
+/*
+ * Release the resources owned by a struct repack_opts (the keep-pack list and
+ * the pack-objects argument structs).
+ */
+void repack_opts_release(struct repack_opts *opts);
+
+/* Total physical RAM in bytes, or 0 if it cannot be determined. */
+uint64_t repack_total_ram(void);
+
+/*
+ * Estimate the peak memory needed to repack `repo` whose largest existing pack
+ * is `pack`, using the given delta cache limits. Used by automatic maintenance
+ * to decide whether keeping a base pack is worthwhile. Returns 0 if it cannot
+ * be estimated.
+ */
+uint64_t repack_estimate_memory(struct repository *repo,
+				struct packed_git *pack,
+				size_t delta_base_cache_limit,
+				size_t max_delta_cache_size);
+
 #endif /* REPACK_H */

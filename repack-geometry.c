@@ -34,7 +34,7 @@ void pack_geometry_init(struct pack_geometry *geometry,
 	struct strbuf buf = STRBUF_INIT;
 	struct multi_pack_index *m = get_multi_pack_index(existing->source);
 
-	repo_for_each_pack(existing->repo, p) {
+	odb_for_each_files_pack(existing->repo->objects, p) {
 		if (geometry->midx_layer_threshold_set && m &&
 		    p->multi_pack_index) {
 			/*

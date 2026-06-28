@@ -13,6 +13,7 @@
 #include "parse-options.h"
 #include "quote.h"
 #include "packfile.h"
+#include "odb.h"
 #include "object-file.h"
 
 static unsigned long garbage;
@@ -113,31 +114,29 @@ int cmd_count_objects(int argc,
 	/* we do not take arguments other than flags for now */
 	if (argc)
 		usage_with_options(count_objects_usage, opts);
+
+	odb_prepare_sources(the_repository->objects);
+
 	if (verbose) {
 		report_garbage = real_report_garbage;
 		report_linked_checkout_garbage(the_repository);
 	}
 
-	for_each_loose_file_in_source(the_repository->objects->sources,
-				      count_loose, count_cruft, NULL, NULL);
+	odb_source_for_each_loose_object(odb_primary_source(the_repository->objects),
+					 count_loose, count_cruft, NULL, NULL);
 
 	if (verbose) {
-		struct packed_git *p;
-		unsigned long num_pack = 0;
-		off_t size_pack = 0;
+		struct odb_pack_report report = { 0 };
+		unsigned long num_pack;
+		off_t size_pack;
 		struct strbuf loose_buf = STRBUF_INIT;
 		struct strbuf pack_buf = STRBUF_INIT;
 		struct strbuf garbage_buf = STRBUF_INIT;
 
-		repo_for_each_pack(the_repository, p) {
-			if (!p->pack_local)
-				continue;
-			if (open_pack_index(p))
-				continue;
-			packed += p->num_objects;
-			size_pack += p->pack_size + p->index_size;
-			num_pack++;
-		}
+		odb_count_packs(the_repository->objects, &report);
+		packed += report.objects;
+		num_pack = report.packs;
+		size_pack = report.size;
 
 		if (human_readable) {
 			strbuf_humanise_bytes(&loose_buf, loose_size);

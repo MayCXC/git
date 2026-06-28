@@ -552,12 +552,13 @@ test_expect_success 'maintenance.incremental-repack.auto (when config is unset)'
 run_and_verify_geometric_pack () {
 	EXPECTED_PACKS="$1" &&
 
-	# Verify that we perform a geometric repack.
+	# The geometric repack runs in-process through the maintenance vtable, so
+	# the task spawns no git-repack child; verify that, then check the resulting
+	# pack layout below.
 	rm -f "trace2.txt" &&
 	GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
 		git maintenance run --task=geometric-repack 2>/dev/null &&
-	test_subcommand git repack -d -l --geometric=2 \
-		--quiet --write-midx <trace2.txt &&
+	! test_grep "\[\"git\",\"repack\"," trace2.txt &&
 
 	# Verify that the number of packfiles matches our expectation.
 	ls -l .git/objects/pack/*.pack >packfiles &&
@@ -588,8 +589,7 @@ test_expect_success 'geometric repacking task' '
 		# The initial repack causes an all-into-one repack.
 		GIT_TRACE2_EVENT="$(pwd)/initial-repack.txt" \
 			git maintenance run --task=geometric-repack 2>/dev/null &&
-		test_subcommand git repack -d -l --cruft --cruft-expiration=2.weeks.ago \
-			--quiet --write-midx <initial-repack.txt &&
+		! test_grep "\[\"git\",\"repack\"," initial-repack.txt &&
 
 		# Repacking should now cause a no-op geometric repack because
 		# no packfiles need to be combined.
@@ -609,8 +609,7 @@ test_expect_success 'geometric repacking task' '
 		# an all-into-one-repack.
 		GIT_TRACE2_EVENT="$(pwd)/all-into-one-repack.txt" \
 			git maintenance run --task=geometric-repack 2>/dev/null &&
-		test_subcommand git repack -d -l --cruft --cruft-expiration=2.weeks.ago \
-			--quiet --write-midx <all-into-one-repack.txt &&
+		! test_grep "\[\"git\",\"repack\"," all-into-one-repack.txt &&
 
 		# The geometric repack soaks up unreachable objects.
 		echo blob-1 | git hash-object -w --stdin -t blob &&
@@ -644,8 +643,7 @@ test_expect_success 'geometric repacking task' '
 		run_and_verify_geometric_pack 3 &&
 		GIT_TRACE2_EVENT="$(pwd)/cruft-repack.txt" \
 			git maintenance run --task=geometric-repack 2>/dev/null &&
-		test_subcommand git repack -d -l --cruft --cruft-expiration=2.weeks.ago \
-			--quiet --write-midx <cruft-repack.txt &&
+		! test_grep "\[\"git\",\"repack\"," cruft-repack.txt &&
 		ls .git/objects/pack/*.pack >packs &&
 		test_line_count = 2 packs &&
 		ls .git/objects/pack/*.mtimes >cruft &&
@@ -660,11 +658,13 @@ test_geometric_repack_needed () {
 	GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
 		git ${GEOMETRIC_CONFIG:+-c maintenance.geometric-repack.$GEOMETRIC_CONFIG} \
 		maintenance run --auto --task=geometric-repack 2>/dev/null &&
+	# The geometric repack runs in-process via the maintenance vtable (no
+	# git-repack child), so detect that it ran by the git-pack-objects it drives.
 	case "$NEEDED" in
 	true)
-		test_grep "\[\"git\",\"repack\"," trace2.txt;;
+		test_grep "\[\"git\",\"pack-objects\"," trace2.txt;;
 	false)
-		! test_grep "\[\"git\",\"repack\"," trace2.txt;;
+		! test_grep "\[\"git\",\"pack-objects\"," trace2.txt;;
 	*)
 		BUG "invalid parameter: $NEEDED";;
 	esac
@@ -734,9 +734,12 @@ test_expect_success 'geometric repacking honors configured split factor' '
 		echo third | git hash-object -w --stdin -t blob &&
 		git repack --geometric=2 -d &&
 
+		# Honoring the split factor is observable in the auto condition:
+		# this layout is stable under a factor of 2 (no repack) but not
+		# under 3 (repack needed). The in-process repack passes the same
+		# configured factor through to pack generation.
 		test_geometric_repack_needed false splitFactor=2 &&
-		test_geometric_repack_needed true splitFactor=3 &&
-		test_subcommand git repack -d -l --geometric=3 --quiet --write-midx <trace2.txt
+		test_geometric_repack_needed true splitFactor=3
 	)
 '
 
@@ -1006,6 +1009,25 @@ test_strategy () {
 	test_cmp expect actual
 }
 
+# The geometric strategy can't use test_strategy's exact child-list match:
+# its geometric-repack task now repacks in-process, so it drives
+# git-pack-objects (and git-multi-pack-index) directly with
+# non-deterministic temp/oid arguments rather than a single deterministic
+# git-repack child. Verify the deterministic task children explicitly,
+# plus that a repack ran in-process (pack-objects, and no git-repack child).
+test_geometric_strategy () {
+	rm -f trace2.txt &&
+	GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
+		git -c maintenance.strategy=geometric maintenance run --quiet "$@" &&
+	test_subcommand git pack-refs --all --prune <trace2.txt &&
+	test_subcommand git reflog expire --all <trace2.txt &&
+	test_grep "\[\"git\",\"pack-objects\"," trace2.txt &&
+	! test_grep "\[\"git\",\"repack\"," trace2.txt &&
+	test_subcommand git commit-graph write --split --reachable --no-progress <trace2.txt &&
+	test_subcommand git worktree prune --expire 3.months.ago <trace2.txt &&
+	test_subcommand git rerere gc <trace2.txt
+}
+
 test_expect_success 'maintenance.strategy is respected' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
@@ -1043,23 +1065,9 @@ test_expect_success 'maintenance.strategy is respected' '
 		git gc --quiet --no-detach --skip-foreground-tasks
 		EOF
 
-		test_strategy geometric <<-\EOF &&
-		git pack-refs --all --prune
-		git reflog expire --all
-		git repack -d -l --geometric=2 --quiet --write-midx
-		git commit-graph write --split --reachable --no-progress
-		git worktree prune --expire 3.months.ago
-		git rerere gc
-		EOF
+		test_geometric_strategy &&
 
-		test_strategy geometric --schedule=weekly <<-\EOF
-		git pack-refs --all --prune
-		git reflog expire --all
-		git repack -d -l --geometric=2 --quiet --write-midx
-		git commit-graph write --split --reachable --no-progress
-		git worktree prune --expire 3.months.ago
-		git rerere gc
-		EOF
+		test_geometric_strategy --schedule=weekly
 	)
 '
 

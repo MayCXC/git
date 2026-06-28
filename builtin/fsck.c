@@ -43,6 +43,8 @@ static int check_strict;
 static int keep_cache_objects;
 static struct fsck_options fsck_walk_options;
 static struct fsck_options fsck_obj_options;
+static struct progress *fsck_objects_progress;
+static uint64_t fsck_objects_nr;
 static int errors_found;
 static int write_lost_and_found;
 static int verbose;
@@ -56,9 +58,6 @@ static timestamp_t now;
 #define ERROR_PACK 04
 #define ERROR_REFS 010
 #define ERROR_COMMIT_GRAPH 020
-#define ERROR_MULTI_PACK_INDEX 040
-#define ERROR_PACK_REV_INDEX 0100
-#define ERROR_BITMAP 0200
 
 static const char *describe_object(const struct object_id *oid)
 {
@@ -465,6 +464,7 @@ static int fsck_obj_buffer(const struct object_id *oid, enum object_type type,
 	}
 	obj->flags &= ~(REACHABLE | SEEN);
 	obj->flags |= HAS_OBJ;
+	display_progress(fsck_objects_progress, ++fsck_objects_nr);
 	return fsck_obj(repo, obj, buffer, size);
 }
 
@@ -713,103 +713,6 @@ static void process_refs(struct repository *repo, struct snapshot *snap)
 	}
 }
 
-struct for_each_loose_cb {
-	struct repository *repo;
-	struct progress *progress;
-};
-
-static int fsck_loose(const struct object_id *oid, const char *path,
-		      void *cb_data)
-{
-	struct for_each_loose_cb *data = cb_data;
-	struct object *obj;
-	enum object_type type = OBJ_NONE;
-	unsigned long size;
-	void *contents = NULL;
-	int eaten;
-	struct object_info oi = OBJECT_INFO_INIT;
-	struct object_id real_oid = *null_oid(data->repo->hash_algo);
-	int err = 0;
-
-	oi.sizep = &size;
-	oi.typep = &type;
-
-	if (read_loose_object(data->repo, path, oid, &real_oid, &contents, &oi) < 0) {
-		if (contents && !oideq(&real_oid, oid))
-			err = error(_("%s: hash-path mismatch, found at: %s"),
-				    oid_to_hex(&real_oid), path);
-		else
-			err = error(_("%s: object corrupt or missing: %s"),
-				    oid_to_hex(oid), path);
-	}
-	if (err < 0) {
-		errors_found |= ERROR_OBJECT;
-		free(contents);
-		return 0; /* keep checking other objects */
-	}
-
-	if (!contents && type != OBJ_BLOB)
-		BUG("read_loose_object streamed a non-blob");
-
-	obj = parse_object_buffer(data->repo, oid, type, size,
-				  contents, &eaten);
-
-	if (!obj) {
-		errors_found |= ERROR_OBJECT;
-		error(_("%s: object could not be parsed: %s"),
-		      oid_to_hex(oid), path);
-		if (!eaten)
-			free(contents);
-		return 0; /* keep checking other objects */
-	}
-
-	obj->flags &= ~(REACHABLE | SEEN);
-	obj->flags |= HAS_OBJ;
-	if (fsck_obj(data->repo, obj, contents, size))
-		errors_found |= ERROR_OBJECT;
-
-	if (!eaten)
-		free(contents);
-	return 0; /* keep checking other objects, even if we saw an error */
-}
-
-static int fsck_cruft(const char *basename, const char *path,
-		      void *data UNUSED)
-{
-	if (!starts_with(basename, "tmp_obj_"))
-		fprintf_ln(stderr, _("bad sha1 file: %s"), path);
-	return 0;
-}
-
-static int fsck_subdir(unsigned int nr, const char *path UNUSED, void *data)
-{
-	struct for_each_loose_cb *cb_data = data;
-	struct progress *progress = cb_data->progress;
-	display_progress(progress, nr + 1);
-	return 0;
-}
-
-static void fsck_source(struct repository *repo, struct odb_source *source)
-{
-	struct progress *progress = NULL;
-	struct for_each_loose_cb cb_data = {
-		.repo = source->odb->repo,
-		.progress = progress,
-	};
-
-	if (verbose)
-		fprintf_ln(stderr, _("Checking object directory"));
-
-	if (show_progress)
-		progress = start_progress(repo,
-					  _("Checking object directories"), 256);
-
-	for_each_loose_file_in_source(source, fsck_loose,
-				      fsck_cruft, fsck_subdir, &cb_data);
-	display_progress(progress, 256);
-	stop_progress(&progress);
-}
-
 static int fsck_cache_tree(struct repository *repo, struct cache_tree *it, const char *index_path)
 {
 	int i;
@@ -916,40 +819,6 @@ static int mark_object_for_connectivity(const struct object_id *oid,
 	struct object *obj = lookup_unknown_object(repo, oid);
 	obj->flags |= HAS_OBJ;
 	return 0;
-}
-
-static int check_pack_rev_indexes(struct repository *r, int show_progress)
-{
-	struct progress *progress = NULL;
-	struct packed_git *p;
-	uint32_t pack_count = 0;
-	int res = 0;
-
-	if (show_progress) {
-		repo_for_each_pack(r, p)
-			pack_count++;
-		progress = start_delayed_progress(r,
-						  "Verifying reverse pack-indexes", pack_count);
-		pack_count = 0;
-	}
-
-	repo_for_each_pack(r, p) {
-		int load_error = load_pack_revindex_from_disk(p);
-
-		if (load_error < 0) {
-			error(_("unable to load rev-index for pack '%s'"), p->pack_name);
-			res = ERROR_PACK_REV_INDEX;
-		} else if (!load_error &&
-			   !load_pack_revindex(r, p) &&
-			   verify_pack_revindex(p)) {
-			error(_("invalid rev-index for pack '%s'"), p->pack_name);
-			res = ERROR_PACK_REV_INDEX;
-		}
-		display_progress(progress, ++pack_count);
-	}
-	stop_progress(&progress);
-
-	return res;
 }
 
 static void fsck_refs(struct repository *r)
@@ -1068,37 +937,35 @@ int cmd_fsck(int argc,
 	if (connectivity_only) {
 		odb_for_each_object(repo->objects, NULL,
 				    mark_object_for_connectivity, repo, 0);
+		/*
+		 * --connectivity-only still verifies each source's storage formats
+		 * (rev-index/bitmap/midx for files; the backing-store check for a
+		 * helper) through the odb_verify fan; a NULL object callback selects
+		 * this format-only pass, skipping the per-object content checks that
+		 * --connectivity-only is meant to avoid.
+		 */
+		if (odb_verify(repo->objects, &fsck_obj_options, NULL, NULL))
+			errors_found |= ERROR_OBJECT;
 	} else {
-		odb_prepare_alternates(repo->objects);
-		for (source = repo->objects->sources; source; source = source->next)
-			fsck_source(repo, source);
-
-		if (check_full) {
-			struct packed_git *p;
-			uint32_t total = 0, count = 0;
-			struct progress *progress = NULL;
-
-			if (show_progress) {
-				repo_for_each_pack(repo, p) {
-					if (open_pack_index(p))
-						continue;
-					total += p->num_objects;
-				}
-
-				progress = start_progress(repo,
-							  _("Checking objects"), total);
-			}
-
-			repo_for_each_pack(repo, p) {
-				/* verify gives error messages itself */
-				if (verify_pack(repo,
-						p, fsck_obj_buffer, repo,
-						progress, count))
-					errors_found |= ERROR_PACK;
-				count += p->num_objects;
-			}
-			stop_progress(&progress);
-		}
+		/*
+		 * Verify each source's stored objects through the odb vtable: the
+		 * files source scans its loose objects, a helper source asks the
+		 * helper to enumerate and check its backing store. Every object's
+		 * contents are content-checked by fsck_obj_buffer (which also marks
+		 * them HAS_OBJ so the connectivity walk below works for any
+		 * backend). The files source also verifies its own packs here
+		 * (rev-index always, pack contents under --full), so there is no
+		 * separate cross-source pack pass here.
+		 */
+		fsck_obj_options.check_full = check_full;
+		fsck_obj_options.progress = show_progress;
+		if (show_progress)
+			fsck_objects_progress = start_delayed_progress(repo,
+				_("Checking objects"), 0);
+		if (odb_verify(repo->objects, &fsck_obj_options,
+			       fsck_obj_buffer, repo))
+			errors_found |= ERROR_OBJECT;
+		stop_progress(&fsck_objects_progress);
 
 		if (fsck_finish(&fsck_obj_options))
 			errors_found |= ERROR_OBJECT;
@@ -1146,17 +1013,13 @@ int cmd_fsck(int argc,
 		free_worktrees(worktrees);
 	}
 
-	errors_found |= check_pack_rev_indexes(repo, show_progress);
-	if (verify_bitmap_files(repo))
-		errors_found |= ERROR_BITMAP;
-
 	check_connectivity(repo);
 
 	if (repo->settings.core_commit_graph) {
 		struct child_process commit_graph_verify = CHILD_PROCESS_INIT;
 
 		odb_prepare_alternates(repo->objects);
-		for (source = repo->objects->sources; source; source = source->next) {
+		for (source = odb_primary_source(repo->objects); source; source = source->next) {
 			child_process_init(&commit_graph_verify);
 			commit_graph_verify.git_cmd = 1;
 			strvec_pushl(&commit_graph_verify.args, "commit-graph",
@@ -1167,24 +1030,6 @@ int cmd_fsck(int argc,
 				strvec_push(&commit_graph_verify.args, "--no-progress");
 			if (run_command(&commit_graph_verify))
 				errors_found |= ERROR_COMMIT_GRAPH;
-		}
-	}
-
-	if (repo->settings.core_multi_pack_index) {
-		struct child_process midx_verify = CHILD_PROCESS_INIT;
-
-		odb_prepare_alternates(repo->objects);
-		for (source = repo->objects->sources; source; source = source->next) {
-			child_process_init(&midx_verify);
-			midx_verify.git_cmd = 1;
-			strvec_pushl(&midx_verify.args, "multi-pack-index",
-				     "verify", "--object-dir", source->path, NULL);
-			if (show_progress)
-				strvec_push(&midx_verify.args, "--progress");
-			else
-				strvec_push(&midx_verify.args, "--no-progress");
-			if (run_command(&midx_verify))
-				errors_found |= ERROR_MULTI_PACK_INDEX;
 		}
 	}
 

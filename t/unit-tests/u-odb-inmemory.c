@@ -380,3 +380,66 @@ void test_odb_inmemory__pack_ingest_stream(void)
 
 	strbuf_release(&report);
 }
+
+/*
+ * Maintenance vtable (A3). A source with no storage to optimize relies on the
+ * no-op default installed by odb_source_init(): optimize() succeeds without
+ * doing anything and optimize_required() reports that nothing is needed. The
+ * odb-level wrappers then fan over the local sources and dispatch through.
+ */
+void test_odb_inmemory__optimize_is_noop(void)
+{
+	struct odb_source_inmemory *source = odb_source_inmemory_new(odb);
+	struct odb_optimize_opts opts = { 0 };
+	bool required = true;
+
+	cl_must_pass(odb_source_optimize(&source->base, &opts));
+	cl_must_pass(odb_source_optimize_required(&source->base, &opts, &required));
+	cl_assert_equal_b(required, false);
+
+	/*
+	 * The in-memory source is normally an alternate, which odb_optimize
+	 * skips; register it as the primary and mark it local so the odb-level
+	 * wrappers reach its vtable.
+	 */
+	ingest_register_primary(source);
+	source->base.local = true;
+
+	required = true;
+	cl_must_pass(odb_optimize(odb, &opts));
+	cl_must_pass(odb_optimize_required(odb, &opts, &required));
+	cl_assert_equal_b(required, false);
+}
+
+/*
+ * Verify vtable (A3). A source with no format-specific integrity to check
+ * relies on the no-op default installed by odb_source_init(); odb_verify()
+ * fans over the sources and dispatches through. The in-memory source has no
+ * on-disk format, so verification succeeds trivially.
+ */
+void test_odb_inmemory__verify_is_noop(void)
+{
+	struct odb_source_inmemory *source = odb_source_inmemory_new(odb);
+
+	cl_must_pass(odb_source_verify(&source->base, NULL, NULL, NULL));
+
+	ingest_register_primary(source);
+	cl_must_pass(odb_verify(odb, NULL, NULL, NULL));
+}
+
+/*
+ * is_object_kept vtable (A3 inc 4). "Kept" is a files ".keep" pack concept; the
+ * in-memory source has no packs, so it relies on the not-kept default installed
+ * by odb_source_init() and reports every object as not kept (flags ignored).
+ */
+void test_odb_inmemory__is_object_kept_is_noop(void)
+{
+	struct odb_source_inmemory *source = odb_source_inmemory_new(odb);
+	struct object_id oid;
+	const char *end;
+
+	cl_must_pass(parse_oid_hex_algop(RANDOM_OID, &oid, &end, repo.hash_algo));
+	cl_assert(!odb_source_is_object_kept(&source->base, &oid, 0));
+
+	odb_source_free(&source->base);
+}

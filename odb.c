@@ -977,6 +977,119 @@ out:
 	return ret;
 }
 
+void odb_count_packs(struct object_database *odb, struct odb_pack_report *report)
+{
+	struct odb_source *source;
+
+	odb_prepare_alternates(odb);
+	for (source = odb_primary_source(odb); source; source = source->next)
+		odb_source_count_packs(source, report);
+}
+
+int odb_optimize(struct object_database *odb, struct odb_optimize_opts *opts)
+{
+	struct odb_source *source;
+	int ret = 0;
+
+	for (source = odb_primary_source(odb); source; source = source->next) {
+		/* Alternates are borrowed read-only stores; never optimize them. */
+		if (!source->local)
+			continue;
+		ret = odb_source_optimize(source, opts);
+		if (ret < 0)
+			break;
+	}
+
+	return ret;
+}
+
+int odb_optimize_required(struct object_database *odb,
+			  struct odb_optimize_opts *opts,
+			  bool *required)
+{
+	struct odb_source *source;
+	int ret = 0;
+
+	*required = false;
+	for (source = odb_primary_source(odb); source; source = source->next) {
+		bool source_required = false;
+
+		if (!source->local)
+			continue;
+		ret = odb_source_optimize_required(source, opts, &source_required);
+		if (ret < 0)
+			break;
+		if (source_required)
+			*required = true;
+	}
+
+	return ret;
+}
+
+int odb_verify(struct object_database *odb, struct fsck_options *o,
+	       odb_verify_cb cb, void *cb_data)
+{
+	struct odb_source *source;
+	int ret = 0;
+
+	odb_prepare_alternates(odb);
+	for (source = odb_primary_source(odb); source; source = source->next) {
+		/* Check every source; remember failure but keep reporting. */
+		int err = odb_source_verify(source, o, cb, cb_data);
+		if (err < 0)
+			ret = err;
+	}
+
+	return ret;
+}
+
+void odb_prune_cruft(struct object_database *odb, timestamp_t expire,
+		     int dry_run, int verbose)
+{
+	struct odb_source *source;
+
+	for (source = odb_primary_source(odb); source; source = source->next) {
+		/*
+		 * Cruft (stale temp files, empty fanout dirs, redundant loose
+		 * objects) is a files-storage concept; a source that stores
+		 * objects in its own backing store uses the no-op default, so the
+		 * tidy dispatches unconditionally. Only the local store is pruned;
+		 * a borrowed alternate is read-only, so only its own writer prunes
+		 * it.
+		 */
+		if (!source->local)
+			continue;
+		odb_source_prune_cruft(source, expire, dry_run, verbose);
+	}
+}
+
+void odb_mark_objects_promisor(struct object_database *odb, struct oidset *oids)
+{
+	struct odb_source *source;
+
+	for (source = odb_primary_source(odb); source; source = source->next) {
+		/*
+		 * Only the local store ingests packs; alternates are borrowed
+		 * read-only. A source with no promisor concept uses the no-op
+		 * default, so the marking dispatches unconditionally.
+		 */
+		if (!source->local)
+			continue;
+		odb_source_mark_objects_promisor(source, oids);
+	}
+}
+
+int odb_is_promisor_object(struct object_database *odb,
+			   const struct object_id *oid)
+{
+	struct odb_source *source;
+
+	for (source = odb_primary_source(odb); source; source = source->next)
+		if (odb_source_is_promisor_object(source, oid))
+			return 1;
+	return 0;
+}
+
 /*
  * Return the slot of the most-significant bit set in "val". There are various
  * ways to do this quickly with fls() or __builtin_clzl(), but speed is

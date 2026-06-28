@@ -2295,6 +2295,19 @@ int has_object_pack(struct repository *r, const struct object_id *oid)
 	return 0;
 }
 
+int packfile_store_has_kept_object(struct packfile_store *store,
+				   const struct object_id *oid, unsigned flags)
+{
+	struct packed_git **cache = packfile_store_get_kept_pack_cache(store, flags);
+	struct pack_entry e;
+
+	for (; *cache; cache++)
+		if (fill_pack_entry(oid, &e, *cache))
+			return 1;
+
+	return 0;
+}
+
 int has_object_kept_pack(struct repository *r, const struct object_id *oid,
 			 unsigned flags)
 {

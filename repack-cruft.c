@@ -11,7 +11,7 @@ static void combine_small_cruft_packs(FILE *in, off_t combine_cruft_below_size,
 	struct strbuf buf = STRBUF_INIT;
 	size_t i;
 
-	repo_for_each_pack(existing->repo, p) {
+	odb_for_each_files_pack(existing->repo->objects, p) {
 		if (!(p->is_cruft && p->pack_local))
 			continue;
 

@@ -247,6 +247,14 @@ int packfile_store_count_objects(struct packfile_store *store,
 struct packed_git **packfile_store_get_kept_pack_cache(struct packfile_store *store,
 						       unsigned flags);
 
+/*
+ * Report whether the object is present in one of this store's kept packs (a
+ * pack excluded from repacking), selected by the given `kept_pack_type` flags.
+ * Backs the files source's is_object_kept vtable method.
+ */
+int packfile_store_has_kept_object(struct packfile_store *store,
+				   const struct object_id *oid, unsigned flags);
+
 struct pack_window {
 	struct pack_window *next;
 	unsigned char *base;

@@ -12,11 +12,12 @@
 #include "parse-options.h"
 #include "path.h"
 #include "progress.h"
-#include "prune-packed.h"
 #include "replace-object.h"
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source.h"
+#include "oidset.h"
 #include "shallow.h"
 
 static const char * const prune_usage[] = {
@@ -27,32 +28,6 @@ static int show_only;
 static int verbose;
 static timestamp_t expire;
 static int show_progress = -1;
-
-static int prune_tmp_file(const char *fullpath)
-{
-	struct stat st;
-	if (lstat(fullpath, &st))
-		return error("Could not stat '%s'", fullpath);
-	if (st.st_mtime > expire)
-		return 0;
-	if (S_ISDIR(st.st_mode)) {
-		if (show_only || verbose)
-			printf("Removing stale temporary directory %s\n", fullpath);
-		if (!show_only) {
-			struct strbuf remove_dir_buf = STRBUF_INIT;
-
-			strbuf_addstr(&remove_dir_buf, fullpath);
-			remove_dir_recursively(&remove_dir_buf, 0);
-			strbuf_release(&remove_dir_buf);
-		}
-	} else {
-		if (show_only || verbose)
-			printf("Removing stale temporary file %s\n", fullpath);
-		if (!show_only)
-			unlink_or_warn(fullpath);
-	}
-	return 0;
-}
 
 static void perform_reachability_traversal(struct rev_info *revs)
 {
@@ -81,73 +56,87 @@ static int is_object_reachable(const struct object_id *oid,
 	return obj && (obj->flags & SEEN);
 }
 
-static int prune_object(const struct object_id *oid, const char *fullpath,
-			void *data)
+struct prune_collect {
+	struct oidset *unreachable;
+	struct rev_info *revs;
+};
+
+static int collect_unreachable(const struct object_id *oid,
+			       struct object_info *oi UNUSED, void *data)
 {
-	struct rev_info *revs = data;
-	struct stat st;
+	struct prune_collect *c = data;
 
-	if (is_object_reachable(oid, revs))
-		return 0;
-
-	if (lstat(fullpath, &st)) {
-		/* report errors, but do not stop pruning */
-		error("Could not stat '%s'", fullpath);
-		return 0;
-	}
-	if (st.st_mtime > expire)
-		return 0;
-	if (show_only || verbose) {
-		enum object_type type =
-			odb_read_object_info(revs->repo->objects, oid, NULL);
-		printf("%s %s\n", oid_to_hex(oid),
-		       (type > 0) ? type_name(type) : "unknown");
-	}
-	if (!show_only)
-		unlink_or_warn(fullpath);
-	return 0;
-}
-
-static int prune_cruft(const char *basename, const char *path,
-		       void *data UNUSED)
-{
-	if (starts_with(basename, "tmp_obj_"))
-		prune_tmp_file(path);
-	else
-		fprintf(stderr, "bad sha1 file: %s\n", path);
-	return 0;
-}
-
-static int prune_subdir(unsigned int nr UNUSED, const char *path,
-			void *data UNUSED)
-{
-	if (!show_only)
-		rmdir(path);
+	if (!is_object_reachable(oid, c->revs))
+		oidset_insert(c->unreachable, oid);
 	return 0;
 }
 
 /*
- * Write errors (particularly out of space) can result in
- * failed temporary packs (and more rarely indexes and other
- * files beginning with "tmp_") accumulating in the object
- * and the pack directories.
+ * The object-pruning half of "git prune", routed through the source vtable so
+ * it works on any backend: git owns reachability (mark_reachable_objects, via
+ * is_object_reachable), enumerates each local source's objects, and hands the
+ * source the set it found unreachable; the source deletes those older than
+ * `expire` using its own timestamps (the files source the loose mtime, a helper
+ * its stored time). With --dry-run / -v we report exactly the objects the
+ * source prunes (the loose-and-expired subset for files, the helper's own
+ * expired subset) instead of (or as well as) deleting them, not the whole
+ * unreachable candidate set.
  */
-static void remove_temporary_files(const char *path)
+static void prune_unreachable_objects(struct repository *repo,
+				      struct rev_info *revs)
 {
-	DIR *dir;
-	struct dirent *de;
+	struct odb_source *source;
+	struct odb_for_each_object_options opts = { 0 };
 
-	dir = opendir(path);
-	if (!dir) {
-		if (errno != ENOENT)
-			fprintf(stderr, "Unable to open directory %s: %s\n",
-				path, strerror(errno));
-		return;
+	/*
+	 * Run the reachability traversal up front: it reads objects through the
+	 * backend, which on a helper must not be interleaved with a for_each_object
+	 * listing on the same connection (doing so desyncs the helper protocol).
+	 * After this, is_object_reachable() is a pure in-memory SEEN lookup.
+	 */
+	perform_reachability_traversal(revs);
+
+	for (source = odb_primary_source(repo->objects); source; source = source->next) {
+		struct oidset unreachable = OIDSET_INIT;
+		struct prune_collect c = { &unreachable, revs };
+
+		if (!source->local)
+			continue;
+
+		odb_source_for_each_object(source, NULL, collect_unreachable,
+					   &c, &opts);
+
+		if (show_only || verbose) {
+			struct oidset removed = OIDSET_INIT;
+			struct oidset_iter iter;
+			const struct object_id *oid;
+
+			/*
+			 * Report exactly what prune removes, not the whole candidate
+			 * set: a dry-run pass records the members this source would
+			 * prune (the loose-and-expired subset for files, the helper's
+			 * own expired subset) into `removed` without deleting, so each
+			 * object's type can still be read for the report.
+			 */
+			odb_source_remove_objects(source, &unreachable, expire, 1,
+						  &removed);
+			oidset_iter_init(&removed, &iter);
+			while ((oid = oidset_iter_next(&iter))) {
+				enum object_type type =
+					odb_read_object_info(repo->objects,
+							     oid, NULL);
+				printf("%s %s\n", oid_to_hex(oid),
+				       (type > 0) ? type_name(type) : "unknown");
+			}
+			oidset_clear(&removed);
+		}
+
+		if (!show_only)
+			odb_source_remove_objects(source, &unreachable, expire,
+						  0, NULL);
+
+		oidset_clear(&unreachable);
 	}
-	while ((de = readdir(dir)) != NULL)
-		if (starts_with(de->d_name, "tmp_"))
-			prune_tmp_file(mkpath("%s/%s", path, de->d_name));
-	closedir(dir);
 }
 
 int cmd_prune(int argc,
@@ -167,7 +156,6 @@ int cmd_prune(int argc,
 			 N_("limit traversal to objects outside promisor packfiles")),
 		OPT_END()
 	};
-	char *s;
 
 	expire = TIME_MAX;
 	save_commit_buffer = 0;
@@ -198,14 +186,15 @@ int cmd_prune(int argc,
 		revs.exclude_promisor_objects = 1;
 	}
 
-	for_each_loose_file_in_source(repo->objects->sources,
-				      prune_object, prune_cruft, prune_subdir, &revs);
+	prune_unreachable_objects(repo, &revs);
 
-	prune_packed_objects(show_only ? PRUNE_PACKED_DRY_RUN : 0);
-	remove_temporary_files(repo_get_object_directory(repo));
-	s = mkpathdup("%s/pack", repo_get_object_directory(repo));
-	remove_temporary_files(s);
-	free(s);
+	/*
+	 * Tidy each local source's on-disk cruft (stale temp files, empty fanout
+	 * dirs, redundant loose objects). Dispatched through the source vtable so a
+	 * non-files backend (a helper, which has no loose tier or object directory)
+	 * is never handed a filesystem sweep of storage it does not own.
+	 */
+	odb_prune_cruft(repo->objects, expire, show_only, verbose);
 
 	if (is_repository_shallow(repo)) {
 		perform_reachability_traversal(&revs);

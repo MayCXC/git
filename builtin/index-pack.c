@@ -1958,69 +1958,17 @@ static void show_pack_info(int stat_only)
 
 static void repack_local_links(void)
 {
-	struct child_process cmd = CHILD_PROCESS_INIT;
-	FILE *out;
-	struct strbuf line = STRBUF_INIT;
-	struct oidset_iter iter;
-	struct object_id *oid;
-	char *base_name = NULL;
-
 	if (!oidset_size(&outgoing_links))
 		return;
 
-	oidset_iter_init(&outgoing_links, &iter);
-	while ((oid = oidset_iter_next(&iter))) {
-		struct object_info info = OBJECT_INFO_INIT;
-		if (odb_read_object_info_extended(the_repository->objects, oid, &info, 0))
-			/* Missing; assume it is a promisor object */
-			continue;
-		if (info.whence == OI_PACKED && info.u.packed.pack->pack_promisor)
-			continue;
-
-		if (!cmd.args.nr) {
-			base_name = mkpathdup(
-				"%s/pack/pack",
-				repo_get_object_directory(the_repository));
-			strvec_push(&cmd.args, "pack-objects");
-			strvec_push(&cmd.args,
-				    "--exclude-promisor-objects-best-effort");
-			strvec_push(&cmd.args, base_name);
-			cmd.git_cmd = 1;
-			cmd.in = -1;
-			cmd.out = -1;
-			if (start_command(&cmd))
-				die(_("could not start pack-objects to repack local links"));
-		}
-
-		if (write_in_full(cmd.in, oid_to_hex(oid), the_hash_algo->hexsz) < 0 ||
-		    write_in_full(cmd.in, "\n", 1) < 0)
-			die(_("failed to feed local object to pack-objects"));
-	}
-
-	if (!cmd.args.nr)
-		return;
-
-	close(cmd.in);
-
-	out = xfdopen(cmd.out, "r");
-	while (strbuf_getline_lf(&line, out) != EOF) {
-		unsigned char binary[GIT_MAX_RAWSZ];
-		if (line.len != the_hash_algo->hexsz ||
-		    !hex_to_bytes(binary, line.buf, line.len))
-			die(_("index-pack: Expecting full hex object ID lines only from pack-objects."));
-
-		/*
-		 * pack-objects creates the .pack and .idx files, but not the
-		 * .promisor file. Create the .promisor file, which is empty.
-		 */
-		write_special_file(the_repository, "promisor", "", NULL, binary, NULL);
-	}
-
-	fclose(out);
-	if (finish_command(&cmd))
-		die(_("could not finish pack-objects to repack local links"));
-	strbuf_release(&line);
-	free(base_name);
+	/*
+	 * The local objects an ingested promisor pack references must be
+	 * retained as promisor objects so they are not pruned. How that is
+	 * done depends on the object store, so it is the backend's job: the
+	 * files source gathers them into a ".promisor" packfile, while a
+	 * source that does not prune such objects does nothing.
+	 */
+	odb_mark_objects_promisor(the_repository->objects, &outgoing_links);
 }
 
 int cmd_index_pack(int argc,
