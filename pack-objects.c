@@ -96,7 +96,7 @@ static void prepare_in_pack_by_idx(struct packing_data *pdata)
 	 * (i.e. in_pack_idx also zero) should return NULL.
 	 */
 	mapping[cnt++] = NULL;
-	repo_for_each_pack(pdata->repo, p) {
+	odb_for_each_files_pack(pdata->repo->objects, p) {
 		if (cnt == nr) {
 			free(mapping);
 			return;

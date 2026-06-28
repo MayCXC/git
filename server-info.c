@@ -290,7 +290,7 @@ static void init_pack_info(struct repository *r, const char *infofile, int force
 	int i;
 	size_t alloc = 0;
 
-	repo_for_each_pack(r, p) {
+	odb_for_each_files_pack(r->objects, p) {
 		/* we ignore things on alternate path since they are
 		 * not available to the pullers in general.
 		 */

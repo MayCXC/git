@@ -573,7 +573,7 @@ static struct pack_list * add_pack_file(const char *filename)
 	if (strlen(filename) < 40)
 		die("Bad pack filename: %s", filename);
 
-	repo_for_each_pack(the_repository, p)
+	odb_for_each_files_pack(the_repository->objects, p)
 		if (strstr(p->pack_name, filename))
 			return add_pack(p);
 	die("Filename %s not found in packed_git", filename);
@@ -583,7 +583,7 @@ static void load_all(void)
 {
 	struct packed_git *p;
 
-	repo_for_each_pack(the_repository, p)
+	odb_for_each_files_pack(the_repository->objects, p)
 		add_pack(p);
 }
 

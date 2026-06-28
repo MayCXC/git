@@ -182,61 +182,20 @@ void packfile_store_add_pack(struct packfile_store *store,
  */
 struct packfile_list_entry *packfile_store_get_packs(struct packfile_store *store);
 
-struct repo_for_each_pack_data {
-	struct odb_source *source;
-	struct packfile_list_entry *entry;
-};
-
-static inline struct repo_for_each_pack_data repo_for_eack_pack_data_init(struct repository *repo)
-{
-	struct repo_for_each_pack_data data = { 0 };
-
-	odb_prepare_alternates(repo->objects);
-
-	for (struct odb_source *source = repo->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packfile_list_entry *entry = packfile_store_get_packs(files->packed);
-		if (!entry)
-			continue;
-		data.source = source;
-		data.entry = entry;
-		break;
-	}
-
-	return data;
-}
-
-static inline void repo_for_each_pack_data_next(struct repo_for_each_pack_data *data)
-{
-	struct odb_source *source;
-
-	data->entry = data->entry->next;
-	if (data->entry)
-		return;
-
-	for (source = data->source->next; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packfile_list_entry *entry = packfile_store_get_packs(files->packed);
-		if (!entry)
-			continue;
-		data->source = source;
-		data->entry = entry;
-		return;
-	}
-
-	data->source = NULL;
-	data->entry = NULL;
-}
+/*
+ * Iterate the packfiles connected to a repository's object database with the
+ * odb_for_each_files_pack() macro (declared in "odb/source-files.h", which this
+ * header includes). Packfiles are a files-backend concept, so the iteration
+ * lives with that backend rather than as a generic repo-level helper.
+ */
 
 /*
- * Load and iterate through all packs of the given repository. This helper
- * function will yield packfiles from all object sources connected to the
- * repository.
+ * Compatibility alias kept while the remaining repo_for_each_pack() callers are
+ * converted to iterate the files sources directly with odb_for_each_files_pack()
+ * above; removed once the last one is.
  */
 #define repo_for_each_pack(repo, p) \
-	for (struct repo_for_each_pack_data eack_pack_data = repo_for_eack_pack_data_init(repo); \
-	     ((p) = (eack_pack_data.entry ? eack_pack_data.entry->pack : NULL)); \
-	     repo_for_each_pack_data_next(&eack_pack_data))
+	odb_for_each_files_pack((repo)->objects, p)
 
 int packfile_store_read_object_stream(struct odb_read_stream **out,
 				      struct packfile_store *store,

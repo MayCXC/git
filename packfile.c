@@ -357,16 +357,14 @@ static void scan_windows(struct packed_git *p,
 
 static int unuse_one_window(struct object_database *odb)
 {
-	struct odb_source *source;
+	struct odb_source_files *files;
 	struct packfile_list_entry *e;
 	struct packed_git *lru_p = NULL;
 	struct pack_window *lru_w = NULL, *lru_l = NULL;
 
-	for (source = odb->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+	for (files = odb->files_sources; files; files = files->next_files)
 		for (e = files->packed->packs.head; e; e = e->next)
 			scan_windows(e->pack, &lru_p, &lru_w, &lru_l);
-	}
 
 	if (lru_p) {
 		munmap(lru_w->base, lru_w->len);
@@ -534,14 +532,13 @@ static void find_lru_pack(struct packed_git *p, struct packed_git **lru_p, struc
 
 static int close_one_pack(struct repository *r)
 {
-	struct odb_source *source;
+	struct odb_source_files *files;
 	struct packfile_list_entry *e;
 	struct packed_git *lru_p = NULL;
 	struct pack_window *mru_w = NULL;
 	int accept_windows_inuse = 1;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+	for (files = r->objects->files_sources; files; files = files->next_files) {
 		for (e = files->packed->packs.head; e; e = e->next) {
 			if (e->pack->pack_fd == -1)
 				continue;
@@ -1263,10 +1260,9 @@ void mark_bad_packed_object(struct packed_git *p, const struct object_id *oid)
 const struct packed_git *has_packed_and_bad(struct repository *r,
 					    const struct object_id *oid)
 {
-	struct odb_source *source;
+	struct odb_source_files *files;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+	for (files = r->objects->files_sources; files; files = files->next_files) {
 		struct packfile_list_entry *e;
 
 		for (e = files->packed->packs.head; e; e = e->next)

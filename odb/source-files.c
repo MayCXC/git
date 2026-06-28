@@ -347,3 +347,55 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 
 	return files;
 }
+
+/*
+ * Walk to the first source at or after `source` that has at least one
+ * packfile, recording it in `*out` and returning its first pack entry.
+ * Returns NULL (with `*out` cleared) once no such source remains. Each source
+ * reports its own packs through the `packs` vtable method (a non-files backend
+ * reports none), so this merges packs across sources with no branch on the
+ * backend type.
+ */
+static struct packfile_list_entry *first_files_pack(struct odb_source_files *files,
+						    struct odb_source_files **out)
+{
+	for (; files; files = files->next_files) {
+		struct packfile_list_entry *entry;
+
+		entry = packfile_store_get_packs(files->packed);
+		if (!entry)
+			continue;
+
+		*out = files;
+		return entry;
+	}
+
+	*out = NULL;
+	return NULL;
+}
+
+struct odb_files_pack_iter odb_files_pack_iter_begin(struct object_database *odb)
+{
+	struct odb_files_pack_iter iter = { 0 };
+
+	odb_prepare_alternates(odb);
+	iter.entry = first_files_pack(odb->files_sources, &iter.files);
+
+	return iter;
+}
+
+void odb_files_pack_iter_advance(struct odb_files_pack_iter *iter)
+{
+	iter->entry = iter->entry->next;
+	if (iter->entry)
+		return;
+
+	/* Exhausted this source's packs; move on to the next files source. */
+	iter->entry = first_files_pack(iter->files->next_files, &iter->files);
+}
+
+struct packed_git *odb_files_pack_iter_pack(const struct odb_files_pack_iter *iter)
+{
+	return iter->entry ? iter->entry->pack : NULL;
+}
+
