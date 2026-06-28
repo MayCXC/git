@@ -455,6 +455,7 @@ libgit_sources = [
   'refs.c',
   'refs/debug.c',
   'refs/files-backend.c',
+  'refs/helper-backend.c',
   'refs/reftable-backend.c',
   'refs/iterator.c',
   'refs/packed-backend.c',

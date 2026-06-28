@@ -412,6 +412,22 @@ struct ref_store_init_options {
 	 * references.
 	 */
 	enum log_refs_config log_all_ref_updates;
+
+	/*
+	 * The backend selector naming this store: a builtin format ("files",
+	 * "reftable") or, for the helper backend, the "git-local-<name>" program
+	 * that serves it. The helper backend names its process from this; the
+	 * builtin backends ignore it.
+	 */
+	const char *name;
+
+	/*
+	 * This store is self-contained at its own gitdir (a migration
+	 * destination), not the repository's primary ref store. The helper
+	 * backend then owns a private process for `name` at `gitdir` instead of
+	 * binding the repo-global repo->ref_local_helper.
+	 */
+	unsigned int standalone;
 };
 
 /*
@@ -609,6 +625,7 @@ struct ref_storage_be {
 extern struct ref_storage_be refs_be_files;
 extern struct ref_storage_be refs_be_reftable;
 extern struct ref_storage_be refs_be_packed;
+extern struct ref_storage_be refs_be_helper;
 
 /*
  * A representation of the reference store for the main repository or

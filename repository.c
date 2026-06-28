@@ -4,6 +4,7 @@
 #include "hook.h"
 #include "odb.h"
 #include "odb/source.h"
+#include "helper.h"
 #include "config.h"
 #include "gettext.h"
 #include "object.h"
@@ -401,6 +402,15 @@ void repo_clear(struct repository *repo)
 
 	odb_free(repo->objects);
 	repo->objects = NULL;
+
+	/*
+	 * The ref store borrows repo->ref_local_helper, so release it only after
+	 * the ref store teardown above has dropped it.
+	 */
+	if (repo->ref_local_helper) {
+		helper_process_release(repo->ref_local_helper);
+		FREE_AND_NULL(repo->ref_local_helper);
+	}
 
 	parsed_object_pool_clear(repo->parsed_objects);
 	FREE_AND_NULL(repo->parsed_objects);
