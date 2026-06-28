@@ -1173,6 +1173,7 @@ LIB_OBJS += hash-lookup.o
 LIB_OBJS += hash.o
 LIB_OBJS += hashmap.o
 LIB_OBJS += help.o
+LIB_OBJS += helper.o
 LIB_OBJS += hex.o
 LIB_OBJS += hex-ll.o
 LIB_OBJS += hook.o
