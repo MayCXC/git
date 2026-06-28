@@ -600,22 +600,24 @@ static int odb_source_loose_write_object(struct odb_source *source,
 	const struct git_hash_algo *algo = source->odb->repo->hash_algo;
 	const struct git_hash_algo *compat = source->odb->repo->compat_hash_algo;
 	struct object_id compat_oid;
+	int have_compat = 0;
 	char hdr[MAX_HEADER_LEN];
 	int hdrlen = sizeof(hdr);
 
-	/* Generate compat_oid */
+	/*
+	 * Normally odb_write_object_ext() has already computed the compat id
+	 * and passes it in; recompute here for direct callers of the source
+	 * vtable so the loose-object-idx mapping is still recorded. If the
+	 * computation fails we skip the mapping rather than persist an
+	 * uninitialized compat id, matching odb_write_object_ext() (odb.c).
+	 */
 	if (compat) {
-		if (compat_oid_in)
+		if (compat_oid_in) {
 			oidcpy(&compat_oid, compat_oid_in);
-		else if (type == OBJ_BLOB)
-			hash_object_file(compat, buf, len, type, &compat_oid);
-		else {
-			struct strbuf converted = STRBUF_INIT;
-			convert_object_file(source->odb->repo, &converted, algo, compat,
-					    buf, len, type, 0);
-			hash_object_file(compat, converted.buf, converted.len,
-					 type, &compat_oid);
-			strbuf_release(&converted);
+			have_compat = 1;
+		} else if (!repo_compute_compat_oid(source->odb->repo, buf, len,
+						    type, &compat_oid)) {
+			have_compat = 1;
 		}
 	}
 
@@ -627,8 +629,8 @@ static int odb_source_loose_write_object(struct odb_source *source,
 		return 0;
 	if (write_loose_object(loose, oid, hdr, hdrlen, buf, len, 0, flags))
 		return -1;
-	if (compat)
-		return repo_add_loose_object_map(loose, oid, &compat_oid);
+	if (have_compat)
+		return repo_add_loose_object_map(source->odb, loose, oid, &compat_oid);
 	return 0;
 }
 
@@ -646,11 +648,15 @@ int force_object_loose(struct odb_source *source,
 	int hdrlen;
 	int ret;
 
-	for (struct odb_source *s = source->odb->sources; s; s = s->next) {
-		struct odb_source_files *files = odb_source_files_downcast(s);
-		if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0))
+	/*
+	 * If the object is already stored loose in any files source there is
+	 * nothing to do. Walk object_database.files_sources rather than the
+	 * generic source list so a non-files source (e.g. a helper alternate)
+	 * is never downcast.
+	 */
+	for (struct odb_source_files *f = source->odb->files_sources; f; f = f->next_files)
+		if (!odb_source_read_object_info(&f->loose->base, oid, NULL, 0))
 			return 0;
-	}
 
 	oi.typep = &type;
 	oi.sizep = &len;
@@ -665,7 +671,7 @@ int force_object_loose(struct odb_source *source,
 	hdrlen = format_object_header(hdr, sizeof(hdr), type, len);
 	ret = write_loose_object(files->loose, oid, hdr, hdrlen, buf, len, mtime, 0);
 	if (!ret && compat)
-		ret = repo_add_loose_object_map(files->loose, oid, &compat_oid);
+		ret = repo_add_loose_object_map(source->odb, files->loose, oid, &compat_oid);
 	free(buf);
 
 	return ret;
@@ -744,7 +750,6 @@ static void odb_source_loose_free(struct odb_source *source)
 {
 	struct odb_source_loose *loose = odb_source_loose_downcast(source);
 	odb_source_loose_clear_cache(loose);
-	loose_object_map_clear(&loose->map);
 	chdir_notify_unregister(NULL, odb_source_loose_reparent, loose);
 	odb_source_release(&loose->base);
 	free(loose);

@@ -357,7 +357,34 @@ static void *get_delta(struct object_entry *entry)
 	unsigned long size, base_size, delta_size;
 	void *buf, *base_buf, *delta_buf;
 	enum object_type type;
+	struct object_id stored_base;
+	void *stored_delta;
+	unsigned long stored_clen, stored_raw_len;
 
+	/*
+	 * If a source stores this object as a git-format delta against the same
+	 * base we are packing it against, emit those exact COMPRESSED bytes rather
+	 * than recomputing and recompressing the delta (the send-from-a-helper
+	 * path; check_object() set the entry up as a reused delta). The base and the
+	 * raw (uncompressed) length must match the delta we planned -- a guard
+	 * against a stored delta encoded against a different base -- else we fall
+	 * through and recompute. On a match, record the compressed length in
+	 * entry->z_delta_size so write_no_reuse_object emits the bytes verbatim and
+	 * skips do_compress: compressed once at receive, zero recompress on send.
+	 */
+	if (odb_read_object_delta(the_repository->objects, &entry->idx.oid,
+				  &stored_base, &stored_delta, &stored_clen,
+				  &stored_raw_len) > 0) {
+		if (oideq(&stored_base, &DELTA(entry)->idx.oid) &&
+		    stored_raw_len == DELTA_SIZE(entry)) {
+			entry->z_delta_size = stored_clen;
+			return stored_delta;
+		}
+		free(stored_delta);
+	}
+
+	/* Recomputed below: a raw delta that write_no_reuse_object compresses. */
+	entry->z_delta_size = 0;
 	buf = odb_read_object(the_repository->objects, &entry->idx.oid,
 			      &type, &size);
 	if (!buf)
@@ -1556,53 +1583,15 @@ static int want_cruft_object_mtime(struct repository *r,
 {
 	struct odb_source *source;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packed_git **cache = packfile_store_get_kept_pack_cache(files->packed, flags);
-
-		for (; *cache; cache++) {
-			struct packed_git *p = *cache;
-			off_t ofs;
-			uint32_t candidate_mtime;
-
-			ofs = find_pack_entry_one(oid, p);
-			if (!ofs)
-				continue;
-
-			/*
-			 * We have a copy of the object 'oid' in a non-cruft
-			 * pack. We can avoid packing an additional copy
-			 * regardless of what the existing copy's mtime is since
-			 * it is outside of a cruft pack.
-			 */
-			if (!p->is_cruft)
-				return 0;
-
-			/*
-			 * If we have a copy of the object 'oid' in a cruft
-			 * pack, then either read the cruft pack's mtime for
-			 * that object, or, if that can't be loaded, assume the
-			 * pack's mtime itself.
-			 */
-			if (!load_pack_mtimes(p)) {
-				uint32_t pos;
-				if (offset_to_pack_pos(p, ofs, &pos) < 0)
-					continue;
-				candidate_mtime = nth_packed_mtime(p, pos);
-			} else {
-				candidate_mtime = p->mtime;
-			}
-
-			/*
-			 * We have a surviving copy of the object in a cruft
-			 * pack whose mtime is greater than or equal to the one
-			 * we are considering. We can thus avoid packing an
-			 * additional copy of that object.
-			 */
-			if (mtime <= candidate_mtime)
-				return 0;
-		}
-	}
+	/*
+	 * A surviving copy in any source (its kept packs, cruft or not) lets us
+	 * avoid packing an additional copy. Each source answers for its own
+	 * storage through the vtable; sources without packfiles report none.
+	 */
+	odb_prepare_alternates(r->objects);
+	for (source = odb_primary_source(r->objects); source; source = source->next)
+		if (odb_source_cruft_object_preserved(source, oid, flags, mtime))
+			return 0;
 
 	return -1;
 }
@@ -1742,20 +1731,22 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 				     uint32_t found_mtime)
 {
 	int want;
-	struct packfile_list_entry *e;
 	struct odb_source *source;
 
 	if (!exclude && local) {
 		/*
-		 * Note that we start iterating at `sources->next` so that we
-		 * skip the local object source.
+		 * Under --local, exclude any object that is also available in a
+		 * borrowed (non-local) source. Ask each non-local source through
+		 * the object-info vtable rather than reaching into its packs, so
+		 * this holds for any backend.
 		 */
-		struct odb_source *source = the_repository->objects->sources->next;
-		for (; source; source = source->next) {
-			struct odb_source_files *files = odb_source_files_downcast(source);
-			if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0))
+		odb_prepare_alternates(the_repository->objects);
+		for (source = odb_primary_source(the_repository->objects)->next; source;
+		     source = source->next)
+			if (!odb_source_read_object_info(source, oid, NULL,
+							 OBJECT_INFO_QUICK |
+							 OBJECT_INFO_SKIP_FETCH_OBJECT))
 				return 0;
-		}
 	}
 
 	/*
@@ -1773,27 +1764,25 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 		*found_offset = 0;
 	}
 
-	odb_prepare_alternates(the_repository->objects);
+	/*
+	 * Locate a pack that holds the object through the object-info vtable,
+	 * which dispatches to the backend: the files source reports the
+	 * containing pack and offset (consulting its multi-pack-index and packs
+	 * and updating its own MRU order), while a source with no packfiles
+	 * (e.g. a helper) reports the object as not packed, so it is read and
+	 * recompressed fresh. This is what lets a non-files object store be
+	 * served without the pack-reuse machinery having to know which sources
+	 * are files-backed.
+	 */
+	{
+		struct object_info info = OBJECT_INFO_INIT;
 
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct multi_pack_index *m = get_multi_pack_index(source);
-		struct pack_entry e;
-
-		if (m && fill_midx_entry(m, oid, &e)) {
-			want = want_object_in_pack_one(e.p, oid, exclude, found_pack, found_offset, found_mtime);
-			if (want != -1)
-				return want;
-		}
-	}
-
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-
-		for (e = files->packed->packs.head; e; e = e->next) {
-			struct packed_git *p = e->pack;
-			want = want_object_in_pack_one(p, oid, exclude, found_pack, found_offset, found_mtime);
-			if (!exclude && want > 0)
-				packfile_list_prepend(&files->packed->packs, p);
+		if (!odb_read_object_info_extended(the_repository->objects, oid, &info,
+						   OBJECT_INFO_QUICK |
+						   OBJECT_INFO_SKIP_FETCH_OBJECT) &&
+		    info.whence == OI_PACKED) {
+			want = want_object_in_pack_one(info.u.packed.pack, oid, exclude,
+						       found_pack, found_offset, found_mtime);
 			if (want != -1)
 				return want;
 		}
@@ -2241,7 +2230,17 @@ static void check_object(struct object_entry *entry, uint32_t object_index)
 {
 	unsigned long canonical_size;
 	enum object_type type;
-	struct object_info oi = {.typep = &type, .sizep = &canonical_size};
+	/*
+	 * Also request the delta base and raw delta length: a source that stores
+	 * the object as a delta (a helper) reports them, which lets us reuse the
+	 * stored delta on the wire (see below). They stay cleared for objects
+	 * that are not stored as a delta.
+	 */
+	struct object_id delta_base = {0};
+	unsigned long reuse_delta_len = 0;
+	struct object_info oi = {.typep = &type, .sizep = &canonical_size,
+				 .delta_base_oid = &delta_base,
+				 .delta_size = &reuse_delta_len};
 
 	if (IN_PACK(entry)) {
 		struct packed_git *p = IN_PACK(entry);
@@ -2387,6 +2386,37 @@ static void check_object(struct object_entry *entry, uint32_t object_index)
 			type = -1;
 		}
 	}
+
+	/*
+	 * Not in a local pack, but the object's source may store it as a
+	 * git-format delta (a helper). Reuse that stored delta on the wire
+	 * instead of resolving and recomputing it, the symmetric analog of the
+	 * in-pack reuse above: the info read just reported the base and the raw
+	 * delta length, and can_reuse_delta() confirms the base is in the pack
+	 * (or known to the receiver). The delta bytes are fetched at write time
+	 * (write_no_reuse_object -> get_delta), so nothing is held here. Gated on
+	 * !IN_PACK so a packed object whose in-pack read gave up is never mistaken
+	 * for a source-stored delta.
+	 */
+	if (!IN_PACK(entry) && reuse_delta && !entry->preferred_base &&
+	    type > 0 && !is_null_oid(&delta_base)) {
+		struct object_entry *base_entry;
+
+		if (can_reuse_delta(&delta_base, entry, &base_entry)) {
+			oe_set_type(entry, OBJ_REF_DELTA);
+			SET_SIZE(entry, reuse_delta_len);	/* delta size */
+			SET_DELTA_SIZE(entry, reuse_delta_len);
+			if (base_entry) {
+				SET_DELTA(entry, base_entry);
+				entry->delta_sibling_idx = base_entry->delta_child_idx;
+				SET_DELTA_CHILD(base_entry, entry);
+			} else {
+				SET_DELTA_EXT(entry, &delta_base);
+			}
+			return;
+		}
+	}
+
 	oe_set_type(entry, type);
 	if (entry->type_valid) {
 		SET_SIZE(entry, canonical_size);
@@ -2452,12 +2482,14 @@ static void drop_reused_delta(struct object_entry *entry)
 
 	oi.sizep = &size;
 	oi.typep = &type;
-	if (packed_object_info(IN_PACK(entry), entry->in_pack_offset, &oi) < 0) {
+	if (!IN_PACK(entry) ||
+	    packed_object_info(IN_PACK(entry), entry->in_pack_offset, &oi) < 0) {
 		/*
-		 * We failed to get the info from this pack for some reason;
-		 * fall back to odb_read_object_info, which may find another copy.
-		 * And if that fails, the error will be recorded in oe_type(entry)
-		 * and dealt with in prepare_pack().
+		 * Either there is no local pack to read from (a source-reused
+		 * delta, e.g. from a helper, whose chain we are breaking) or the
+		 * pack read failed; fall back to odb_read_object_info, which finds
+		 * another copy. And if that fails, the error will be recorded in
+		 * oe_type(entry) and dealt with in prepare_pack().
 		 */
 		oe_set_type(entry,
 			    odb_read_object_info(the_repository->objects,
@@ -4000,7 +4032,7 @@ static void stdin_packs_read_input(struct rev_info *revs,
 		strbuf_reset(&buf);
 	}
 
-	repo_for_each_pack(the_repository, p) {
+	odb_for_each_files_pack(the_repository->objects, p) {
 		struct stdin_pack_info *info;
 
 		info = strmap_get(&packs, pack_basename(p));
@@ -4135,14 +4167,17 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 		if (!want_object_in_pack_mtime(oid, 0, &pack, &offset, mtime))
 			return;
 		if (!pack && type == OBJ_BLOB) {
-			struct odb_source *source = the_repository->objects->sources;
-			int found = 0;
-
-			for (; !found && source; source = source->next) {
-				struct odb_source_files *files = odb_source_files_downcast(source);
-				if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0))
-					found = 1;
-			}
+			struct object_info info = OBJECT_INFO_INIT;
+			/*
+			 * The object is in no pack; treat it as present only if
+			 * it exists outside packs (loose for the files backend,
+			 * the backend's own store for a non-files source). A
+			 * pack-only hit does not count, matching the historical
+			 * loose-only check.
+			 */
+			int found = odb_read_object_info_extended(the_repository->objects,
+								  oid, &info, 0) >= 0 &&
+				    info.whence != OI_PACKED;
 
 			/*
 			 * If a traversed tree has a missing blob then we want
@@ -4267,7 +4302,7 @@ static void enumerate_and_traverse_cruft_objects(struct string_list *fresh_packs
 	 * Re-mark only the fresh packs as kept so that objects in
 	 * unknown packs do not halt the reachability traversal early.
 	 */
-	repo_for_each_pack(the_repository, p)
+	odb_for_each_files_pack(the_repository->objects, p)
 		p->pack_keep_in_core = 0;
 	mark_pack_kept_in_core(fresh_packs, 1);
 
@@ -4304,7 +4339,7 @@ static void read_cruft_objects(void)
 	string_list_sort(&discard_packs);
 	string_list_sort(&fresh_packs);
 
-	repo_for_each_pack(the_repository, p) {
+	odb_for_each_files_pack(the_repository->objects, p) {
 		const char *pack_name = pack_basename(p);
 		struct string_list_item *item;
 
@@ -4485,29 +4520,25 @@ static int add_object_in_unpacked_pack(const struct object_id *oid,
 
 static void add_objects_in_unpacked_packs(void)
 {
-	struct odb_source *source;
 	time_t mtime;
-	struct odb_for_each_object_options opts = {
-		.flags = ODB_FOR_EACH_OBJECT_PACK_ORDER |
-			 ODB_FOR_EACH_OBJECT_LOCAL_ONLY |
-			 ODB_FOR_EACH_OBJECT_SKIP_IN_CORE_KEPT_PACKS |
-			 ODB_FOR_EACH_OBJECT_SKIP_ON_DISK_KEPT_PACKS,
-	};
 	struct object_info oi = {
 		.mtimep = &mtime,
 	};
+	enum odb_for_each_object_flags flags =
+		ODB_FOR_EACH_OBJECT_PACK_ORDER |
+		ODB_FOR_EACH_OBJECT_LOCAL_ONLY |
+		ODB_FOR_EACH_OBJECT_BULK_ONLY |
+		ODB_FOR_EACH_OBJECT_SKIP_IN_CORE_KEPT_PACKS |
+		ODB_FOR_EACH_OBJECT_SKIP_ON_DISK_KEPT_PACKS;
 
-	odb_prepare_alternates(to_pack.repo->objects);
-	for (source = to_pack.repo->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-
-		if (!source->local)
-			continue;
-
-		if (packfile_store_for_each_object(files->packed, &oi,
-						   add_object_in_unpacked_pack, NULL, &opts))
-			die(_("cannot open pack index"));
-	}
+	/*
+	 * Enumerate objects in local, non-kept packs across every source
+	 * (BULK_ONLY skips the loose tier; LOCAL_ONLY skips alternates). A
+	 * non-files source contributes nothing.
+	 */
+	if (odb_for_each_object(to_pack.repo->objects, &oi,
+				add_object_in_unpacked_pack, NULL, flags))
+		die(_("cannot open pack index"));
 }
 
 static int add_loose_object(const struct object_id *oid, const char *path,
@@ -4548,8 +4579,8 @@ static int add_loose_object(const struct object_id *oid, const char *path,
  */
 static void add_unreachable_loose_objects(struct rev_info *revs)
 {
-	for_each_loose_file_in_source(the_repository->objects->sources,
-				      add_loose_object, NULL, NULL, revs);
+	odb_source_for_each_loose_object(odb_primary_source(the_repository->objects),
+					 add_loose_object, NULL, NULL, revs);
 }
 
 static int has_sha1_pack_kept_or_nonlocal(const struct object_id *oid)
@@ -4560,7 +4591,7 @@ static int has_sha1_pack_kept_or_nonlocal(const struct object_id *oid)
 	if (last_found && find_pack_entry_one(oid, last_found))
 		return 1;
 
-	repo_for_each_pack(the_repository, p) {
+	odb_for_each_files_pack(the_repository->objects, p) {
 		/*
 		 * We have already checked `last_found`, so there is no need to
 		 * re-check here.
@@ -4606,7 +4637,7 @@ static void loosen_unused_packed_objects(void)
 	uint32_t loosened_objects_nr = 0;
 	struct object_id oid;
 
-	repo_for_each_pack(the_repository, p) {
+	odb_for_each_files_pack(the_repository->objects, p) {
 		if (!p->pack_local || p->pack_keep || p->pack_keep_in_core)
 			continue;
 
@@ -4618,7 +4649,7 @@ static void loosen_unused_packed_objects(void)
 			if (!packlist_find(&to_pack, &oid) &&
 			    !has_sha1_pack_kept_or_nonlocal(&oid) &&
 			    !loosened_object_can_be_discarded(&oid, p->mtime)) {
-				if (force_object_loose(the_repository->objects->sources,
+				if (force_object_loose(odb_primary_source(the_repository->objects),
 						       &oid, p->mtime))
 					die(_("unable to force loose object"));
 				loosened_objects_nr++;
@@ -4900,7 +4931,7 @@ static void add_extra_kept_packs(const struct string_list *names)
 	if (!names->nr)
 		return;
 
-	repo_for_each_pack(the_repository, p) {
+	odb_for_each_files_pack(the_repository->objects, p) {
 		const char *name = basename(p->pack_name);
 		int i;
 
@@ -5339,7 +5370,7 @@ int cmd_pack_objects(int argc,
 	if (ignore_packed_keep_on_disk) {
 		struct packed_git *p;
 
-		repo_for_each_pack(the_repository, p)
+		odb_for_each_files_pack(the_repository->objects, p)
 			if (p->pack_local && p->pack_keep)
 				break;
 		if (!p) /* no keep-able packs found */
@@ -5353,7 +5384,7 @@ int cmd_pack_objects(int argc,
 		 */
 		struct packed_git *p;
 
-		repo_for_each_pack(the_repository, p) {
+		odb_for_each_files_pack(the_repository->objects, p) {
 			if (!p->pack_local) {
 				have_non_local_packs = 1;
 				break;

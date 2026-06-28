@@ -430,6 +430,20 @@ off_t get_delta_base(struct packed_git *p, struct pack_window **w_curs,
 		     off_t *curpos, enum object_type type,
 		     off_t delta_obj_offset);
 
+/*
+ * Read the stored git-format delta of the object at obj_offset WITHOUT resolving
+ * OR inflating it: its base oid into *base and the COMPRESSED delta bytes into
+ * *delta (caller frees) with the compressed length in *clen and the uncompressed
+ * delta length in *raw_len. Returns 1 when the object is an OFS/REF delta, 0 when
+ * it is stored whole (no delta), a negative value on error. The bytes are the
+ * verbatim deflate stream git itself copies for pack reuse, so an already-resolved
+ * pack can be copied delta-and-all into another object store with no recompress;
+ * the in-pack companion to a source's read_object_delta.
+ */
+int packed_object_compressed_delta(struct packed_git *p, off_t obj_offset,
+				   struct object_id *base, void **delta,
+				   unsigned long *clen, unsigned long *raw_len);
+
 int packfile_read_object_stream(struct odb_read_stream **out,
 				const struct object_id *oid,
 				struct packed_git *pack,

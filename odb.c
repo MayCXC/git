@@ -834,6 +834,24 @@ void *odb_read_object(struct object_database *odb,
 	return data;
 }
 
+int odb_read_object_delta(struct object_database *odb,
+			  const struct object_id *oid,
+			  struct object_id *base_oid,
+			  void **delta, unsigned long *delta_len,
+			  unsigned long *raw_len)
+{
+	struct odb_source *source;
+
+	odb_prepare_alternates(odb);
+	for (source = odb_primary_source(odb); source; source = source->next) {
+		int ret = odb_source_read_object_delta(source, oid, base_oid,
+						       delta, delta_len, raw_len);
+		if (ret)
+			return ret;	/* found (1) or error (<0) */
+	}
+	return 0;
+}
+
 void *odb_read_object_peeled(struct object_database *odb,
 			     const struct object_id *oid,
 			     enum object_type required_type,

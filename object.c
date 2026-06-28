@@ -1,6 +1,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include <execinfo.h>
 #include "gettext.h"
 #include "hex.h"
 #include "object.h"

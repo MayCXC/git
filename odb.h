@@ -304,6 +304,23 @@ void *odb_read_object_peeled(struct object_database *odb,
 			     struct object_id *oid_ret);
 
 /*
+ * If any source stores `oid` as a git-format delta, return its base oid, the
+ * COMPRESSED delta bytes (the caller owns `*delta` and frees it), the compressed
+ * length in `*delta_len`, and the uncompressed delta length in `*raw_len` --
+ * without resolving or inflating. The read companion to a source's write_prepared:
+ * the pack-objects send path reuses the compressed delta verbatim (its
+ * z_delta_size cached-delta path) instead of recomputing it, and a push migrate
+ * copies it straight in. Returns 1 when a stored delta was found, 0 when no source
+ * stores the object as a delta (resolved, or absent here), a negative value on
+ * error.
+ */
+int odb_read_object_delta(struct object_database *odb,
+			  const struct object_id *oid,
+			  struct object_id *base_oid,
+			  void **delta, unsigned long *delta_len,
+			  unsigned long *raw_len);
+
+/*
  * Add an object file to the in-memory object store, without writing it
  * to disk.
  *

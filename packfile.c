@@ -20,6 +20,7 @@
 #include "tree.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/source-files.h"
 #include "odb/streaming.h"
 #include "midx.h"
 #include "commit-graph.h"
@@ -1773,6 +1774,84 @@ static void *unpack_compressed_entry(struct packed_git *p,
 	return buffer;
 }
 
+int packed_object_compressed_delta(struct packed_git *p, off_t obj_offset,
+				   struct object_id *base, void **delta,
+				   unsigned long *clen, unsigned long *raw_len)
+{
+	struct pack_window *w_curs = NULL;
+	off_t curpos = obj_offset;
+	enum object_type type;
+	unsigned long size;
+	uint32_t pos;
+	off_t next;
+	size_t left;
+	unsigned char *buf, *dst;
+	int ret = -1;
+
+	type = unpack_object_header(p, &w_curs, &curpos, &size);
+	if (type != OBJ_OFS_DELTA && type != OBJ_REF_DELTA) {
+		/* Stored whole (a base or a non-delta object), not as a delta. */
+		ret = 0;
+		goto out;
+	}
+	/*
+	 * Read the base oid (by-value curpos, so it does not advance), then
+	 * advance curpos past the base reference to the start of the compressed
+	 * delta payload. The caller already knows this object's own oid (from the
+	 * pack index), so it stores the delta verbatim against `base`: the in-pack
+	 * companion to a delta-storing source's read_object_delta.
+	 */
+	if (get_delta_base_oid(p, &w_curs, curpos, base, type, obj_offset) < 0)
+		goto out;
+	if (!get_delta_base(p, &w_curs, &curpos, type, obj_offset))
+		goto out;
+	/*
+	 * The compressed git-format delta runs from curpos (the deflate stream,
+	 * after the entry header and base ref) to the next entry's offset -- the
+	 * verbatim extent git itself copies for pack reuse (write_reused_pack_one).
+	 * Copy it raw, WITHOUT inflating: it is reused as-is (a send pack's
+	 * z_delta_size cached-delta path, or a push migrate's put-raw). `size` from
+	 * the entry header is the delta's uncompressed length.
+	 */
+	if (offset_to_pack_pos(p, obj_offset, &pos) < 0)
+		goto out;
+	next = pack_pos_to_offset(p, pos + 1);
+	if (next <= curpos)
+		goto out;
+	/*
+	 * Verify the entry CRC before handing its bytes back verbatim, so a caller
+	 * reusing the delta (e.g. pack-objects --no-reuse-object) refuses corrupt
+	 * data rather than copying it through -- the same guard write_reuse_object
+	 * makes for its own verbatim copy, and the check the inflating read path used
+	 * to provide here. Only with a CRC-bearing index (v2+) and when the caller
+	 * asked (do_check_packed_object_crc); ret stays -1 (corrupt) so the caller
+	 * falls back to a resolving read that re-detects it.
+	 */
+	if (do_check_packed_object_crc && p->index_version > 1 &&
+	    check_pack_crc(p, &w_curs, obj_offset, next - obj_offset,
+			   pack_pos_to_index(p, pos)))
+		goto out;
+	*clen = (unsigned long)(next - curpos);
+	left = (size_t)(next - curpos);
+	buf = xmalloc(left);
+	dst = buf;
+	while (left) {
+		unsigned long avail;
+		unsigned char *src = use_pack(p, &w_curs, curpos, &avail);
+		size_t n = (avail < left) ? avail : left;
+		memcpy(dst, src, n);
+		dst += n;
+		curpos += n;
+		left -= n;
+	}
+	*delta = buf;
+	*raw_len = size;
+	ret = 1;
+out:
+	unuse_pack(&w_curs);
+	return ret;
+}
+
 static void write_pack_access_log(struct packed_git *p, off_t obj_offset)
 {
 	static struct trace_key pack_access = TRACE_KEY_INIT(PACK_ACCESS);
@@ -2281,18 +2360,28 @@ struct packed_git **packfile_store_get_kept_pack_cache(struct packfile_store *st
 
 int has_object_pack(struct repository *r, const struct object_id *oid)
 {
-	struct odb_source *source;
-	struct pack_entry e;
+	struct object_info oi = OBJECT_INFO_INIT;
 
-	odb_prepare_alternates(r->objects);
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		int ret = find_pack_entry(files->packed, oid, &e);
-		if (ret)
-			return ret;
-	}
+	/*
+	 * Whether an object is stored in packed form is reported abstractly via
+	 * object_info.whence, so this works for any backend without reaching
+	 * into the files-specific packfile store. Files sources consult their
+	 * packs before loose objects, so an object present in both still reports
+	 * OI_PACKED, matching the historical packs-only lookup. Stay local:
+	 * callers only ask about objects already present, so skip both fetching
+	 * a missing object and repreparing sources on a miss. Skip the in-memory
+	 * source too: it synthesizes the empty tree and empty blob and never
+	 * holds packs, so consulting it would mask an object that genuinely
+	 * lives in a pack (e.g. a packed empty tree, which prune-packed must then
+	 * be able to unlink in loose form).
+	 */
+	if (odb_read_object_info_extended(r->objects, oid, &oi,
+					  OBJECT_INFO_QUICK |
+					  OBJECT_INFO_SKIP_FETCH_OBJECT |
+					  OBJECT_INFO_SKIP_CACHED) < 0)
+		return 0;
 
-	return 0;
+	return oi.whence == OI_PACKED;
 }
 
 int packfile_store_has_kept_object(struct packfile_store *store,
@@ -2312,20 +2401,16 @@ int has_object_kept_pack(struct repository *r, const struct object_id *oid,
 			 unsigned flags)
 {
 	struct odb_source *source;
-	struct pack_entry e;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packed_git **cache;
-
-		cache = packfile_store_get_kept_pack_cache(files->packed, flags);
-
-		for (; *cache; cache++) {
-			struct packed_git *p = *cache;
-			if (fill_pack_entry(oid, &e, p))
-				return 1;
-		}
-	}
+	/*
+	 * "Kept" (a pack excluded from repacking) is a files-pack property; the
+	 * is_object_kept vtable method answers it per source, so non-files
+	 * backends report 0 without a downcast here. The files source checks its
+	 * kept-pack cache via packfile_store_has_kept_object().
+	 */
+	for (source = odb_primary_source(r->objects); source; source = source->next)
+		if (odb_source_is_object_kept(source, oid, flags))
+			return 1;
 
 	return 0;
 }
@@ -2379,6 +2464,7 @@ struct packfile_store_for_each_object_wrapper_data {
 	const struct object_info *request;
 	odb_for_each_object_cb cb;
 	void *cb_data;
+	int provide_location;
 };
 
 static int packfile_store_for_each_object_wrapper(const struct object_id *oid,
@@ -2397,6 +2483,19 @@ static int packfile_store_for_each_object_wrapper(const struct object_id *oid,
 			mark_bad_packed_object(pack, oid);
 			return -1;
 		}
+
+		return data->cb(oid, &oi, data->cb_data);
+	} else if (data->provide_location) {
+		/*
+		 * No object info was requested, but the caller asked for the
+		 * on-disk location. We already know it from the pack index, so
+		 * hand it over without reading the object.
+		 */
+		struct object_info oi = OBJECT_INFO_INIT;
+
+		oi.whence = OI_PACKED;
+		oi.u.packed.pack = pack;
+		oi.u.packed.offset = nth_packed_object_offset(pack, index_pos);
 
 		return data->cb(oid, &oi, data->cb_data);
 	} else {
@@ -2586,6 +2685,7 @@ int packfile_store_for_each_object(struct packfile_store *store,
 		.request = request,
 		.cb = cb,
 		.cb_data = cb_data,
+		.provide_location = !!(opts->flags & ODB_FOR_EACH_OBJECT_PROVIDE_LOCATION),
 	};
 	struct packfile_list_entry *e;
 	int pack_errors = 0, ret;

@@ -918,7 +918,7 @@ int odb_source_loose_write_stream(struct odb_source_loose *loose,
 	err = finalize_object_file_flags(loose->base.odb->repo, tmp_file.buf, filename.buf,
 					 FOF_SKIP_COLLISION_CHECK);
 	if (!err && compat)
-		err = repo_add_loose_object_map(loose, oid, &compat_oid);
+		err = repo_add_loose_object_map(loose->base.odb, loose, oid, &compat_oid);
 cleanup:
 	strbuf_release(&tmp_file);
 	strbuf_release(&filename);

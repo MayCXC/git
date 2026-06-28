@@ -1427,6 +1427,12 @@ static int odb_source_files_multi_pack_index_repack(struct odb_source *source,
 	return midx_repack(source, batch_size, flags);
 }
 
+static int odb_source_files_read_compat_map(struct odb_source *source)
+{
+	/* A files source's compat idx lives in its own loose object directory. */
+	return loose_source_read_compat_map(odb_source_files_downcast(source)->loose);
+}
+
 static int odb_source_files_prune_cruft(struct odb_source *source,
 					timestamp_t expire,
 					int dry_run, int verbose)
@@ -1456,6 +1462,41 @@ static int odb_source_files_prune_cruft(struct odb_source *source,
 	return 0;
 }
 
+/*
+ * Read the stored git-format delta of a packed object without resolving or
+ * inflating it: a loose object is whole (return 0), but a packed OFS/REF delta
+ * returns its base and COMPRESSED delta bytes (with both lengths). pack-objects
+ * reuses these verbatim on send instead of recomputing the delta with diff_delta
+ * (its base-match guard keeps it correct), and a push quarantine's migrate copies
+ * them straight into a helper, deltas intact and compressed, without re-resolving
+ * or recompressing the pack.
+ */
+static int odb_source_files_read_object_delta(struct odb_source *source,
+					      const struct object_id *oid,
+					      struct object_id *base_oid,
+					      void **delta,
+					      unsigned long *delta_len,
+					      unsigned long *raw_len)
+{
+	struct odb_source_files *files = odb_source_files_downcast(source);
+	struct packfile_list_entry *entry;
+
+	for (entry = packfile_store_get_packs(files->packed); entry;
+	     entry = entry->next) {
+		struct packed_git *p = entry->pack;
+		off_t ofs;
+
+		if (open_pack_index(p))
+			continue;
+		ofs = find_pack_entry_one(oid, p);
+		if (ofs)
+			return packed_object_compressed_delta(p, ofs, base_oid,
+							      delta, delta_len,
+							      raw_len);
+	}
+	return 0;  /* not packed -> loose -> stored whole, not a delta */
+}
+
 struct odb_source_files *odb_source_files_new(struct object_database *odb,
 					      const char *path,
 					      bool local)
@@ -1480,6 +1521,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.find_abbrev_len = odb_source_files_find_abbrev_len;
 	files->base.freshen_object = odb_source_files_freshen_object;
 	files->base.write_object = odb_source_files_write_object;
+	files->base.read_object_delta = odb_source_files_read_object_delta;
 	files->base.write_object_stream = odb_source_files_write_object_stream;
 	files->base.begin_transaction = odb_source_files_begin_transaction;
 	files->base.begin_pack_ingest = odb_source_files_begin_pack_ingest;
@@ -1496,6 +1538,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 	files->base.multi_pack_index_verify = odb_source_files_multi_pack_index_verify;
 	files->base.multi_pack_index_expire = odb_source_files_multi_pack_index_expire;
 	files->base.multi_pack_index_repack = odb_source_files_multi_pack_index_repack;
+	files->base.read_compat_map = odb_source_files_read_compat_map;
 	files->base.has_received_pack = odb_source_files_has_received_pack;
 	files->base.is_object_kept = odb_source_files_is_object_kept;
 	files->base.cruft_object_preserved = odb_source_files_cruft_object_preserved;

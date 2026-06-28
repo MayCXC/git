@@ -26,6 +26,7 @@
 #include "commit-reach.h"
 #include "date.h"
 #include "object-file-convert.h"
+#include "loose.h"
 #include "prio-queue.h"
 
 static int get_oid_oneline(struct repository *r, const char *, struct object_id *,
@@ -698,6 +699,30 @@ static int get_oid_basic(struct repository *r, const char *str, int len,
 			free(real_ref);
 		}
 		return 0;
+	}
+
+	/*
+	 * A full object id under the compatibility algorithm
+	 * (extensions.compatObjectFormat) is shorter than the storage hexsz, so
+	 * it would otherwise be treated as an abbreviation. Resolve it directly
+	 * through the object database's storage<->compat map, which works for
+	 * any backend; only fall through to abbreviation handling when it is not
+	 * a known compat object id (so a same-length storage abbreviation still
+	 * resolves).
+	 */
+	if (r->compat_hash_algo && len == r->compat_hash_algo->hexsz) {
+		struct object_id compat_oid, storage_oid;
+		if (!get_oid_hex_algop(str, &compat_oid, r->compat_hash_algo) &&
+		    !repo_loose_object_map_oid(r, &compat_oid, r->hash_algo, &storage_oid)) {
+			/*
+			 * Return the compat-algorithm id (not the storage id it
+			 * maps to) so the read path converts the object into its
+			 * compat representation; the map lookup above only
+			 * confirms it is a known object.
+			 */
+			oidcpy(oid, &compat_oid);
+			return 0;
+		}
 	}
 
 	/* basic@{time or number or -number} format to query ref-log */
