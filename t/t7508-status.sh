@@ -1681,6 +1681,19 @@ test_expect_success '--no-optional-locks prevents index update' '
 	! test_is_magic_mtime .git/index
 '
 
+test_expect_success '--no-optional-locks prevents index update from diff' '
+	test_commit optional-locks-one &&
+	test_commit optional-locks-two &&
+	# Two entries whose stat data no longer matches but whose contents do,
+	# which is what makes diff want to write the refreshed index back.
+	test-tool chmtime +10 optional-locks-one.t optional-locks-two.t &&
+	test_set_magic_mtime .git/index &&
+	git --no-optional-locks diff &&
+	test_is_magic_mtime .git/index &&
+	git diff &&
+	! test_is_magic_mtime .git/index
+'
+
 test_expect_success 'racy timestamps will be fixed for clean worktree' '
 	echo content >racy-dirty &&
 	echo content >racy-racy &&
