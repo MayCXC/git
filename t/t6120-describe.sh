@@ -173,6 +173,19 @@ test_expect_success 'describe --dirty with --work-tree' '
 	test_grep -E "^A-8-g[0-9a-f]+$" out
 '
 
+test_expect_success 'describe --dirty honors --no-optional-locks' '
+	# Stat data that no longer matches while the contents still do is what
+	# makes the dirtiness check want to write the refreshed index back.
+	test-tool chmtime +10 file &&
+	git describe --dirty &&
+	test-tool chmtime +10 file &&
+	test_set_magic_mtime .git/index &&
+	git --no-optional-locks describe --dirty &&
+	test_is_magic_mtime .git/index &&
+	git describe --dirty &&
+	! test_is_magic_mtime .git/index
+'
+
 test_expect_success 'set-up dirty work tree' '
 	echo >>file
 '
