@@ -25,6 +25,26 @@ static int append_loose_object(const struct object_id *oid,
 	return 0;
 }
 
+/*
+ * Record an object this source has just written, so that it is visible to the
+ * quick existence check, which answers from the cache alone. Subdirectories
+ * that have not been scanned yet pick the object up when they are, so only a
+ * live one needs updating.
+ */
+static void odb_source_loose_cache_add(struct odb_source_loose *loose,
+				       const struct object_id *oid)
+{
+	int subdir_nr = oid->hash[0];
+	size_t word_bits = bitsizeof(loose->subdir_seen[0]);
+	size_t word_index = subdir_nr / word_bits;
+	size_t mask = (size_t)1u << (subdir_nr % word_bits);
+
+	if (!loose->cache || !(loose->subdir_seen[word_index] & mask))
+		return;
+
+	oidtree_insert(loose->cache, oid, NULL);
+}
+
 static struct oidtree *odb_source_loose_cache(struct odb_source_loose *loose,
 					      const struct object_id *oid)
 {
@@ -837,6 +857,8 @@ static int odb_source_loose_write_object(struct odb_source *source,
 
 	if (write_loose_object(loose, oid, hdr, hdrlen, buf, len, mtime, flags))
 		return -1;
+
+	odb_source_loose_cache_add(loose, oid);
 
 	if (compat_oid)
 		return repo_add_loose_object_map(loose, oid, compat_oid);
