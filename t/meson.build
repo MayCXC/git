@@ -7,6 +7,7 @@ clar_test_suites = [
   'unit-tests/u-list-objects-filter-options.c',
   'unit-tests/u-mem-pool.c',
   'unit-tests/u-odb-inmemory.c',
+  'unit-tests/u-odb-loose.c',
   'unit-tests/u-oid-array.c',
   'unit-tests/u-oidmap.c',
   'unit-tests/u-oidtree.c',
