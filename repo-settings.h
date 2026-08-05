@@ -61,6 +61,13 @@ struct repo_settings {
 	 * accessor.
 	 */
 	int mmap_prevents_delete;
+	/*
+	 * Whether reading a file from the working directory is faster than
+	 * obtaining the same contents from a pack. It is not where a
+	 * filesystem is slow with its stat, open, mmap and close calls.
+	 * Lazily loaded via accessor.
+	 */
+	int fast_working_directory;
 
 	size_t delta_base_cache_limit;
 	size_t packed_git_window_size;
@@ -78,6 +85,7 @@ struct repo_settings {
 	.fetch_negotiation_algorithm = FETCH_NEGOTIATION_CONSECUTIVE, \
 	.warn_ambiguous_refs = -1, \
 	.mmap_prevents_delete = -1, \
+	.fast_working_directory = -1, \
 	.delta_base_cache_limit = DEFAULT_DELTA_BASE_CACHE_LIMIT, \
 	.packed_git_window_size = DEFAULT_PACKED_GIT_WINDOW_SIZE, \
 	.packed_git_limit = DEFAULT_PACKED_GIT_LIMIT, \
@@ -91,6 +99,8 @@ void repo_settings_clear(struct repository *r);
 int repo_settings_get_warn_ambiguous_refs(struct repository *repo);
 /* Read the value for "core.mmapPreventsDelete". */
 int repo_settings_get_mmap_prevents_delete(struct repository *repo);
+/* Read the value for "core.fastWorkingDirectory". */
+int repo_settings_get_fast_working_directory(struct repository *repo);
 /* Read the value for "core.hooksPath". */
 const char *repo_settings_get_hooks_path(struct repository *repo);
 
