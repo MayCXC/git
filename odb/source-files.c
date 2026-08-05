@@ -55,12 +55,26 @@ static int odb_source_files_read_object_info(struct odb_source *source,
 					     enum object_info_flags flags)
 {
 	struct odb_source_files *files = odb_source_files_downcast(source);
+	int packed, loose;
 
-	if (!odb_source_read_object_info(&files->packed->base, oid, oi, flags) ||
-	    !odb_source_read_object_info(&files->loose->base, oid, oi, flags))
-		return 0;
+	packed = odb_source_read_object_info(&files->packed->base, oid, oi, flags);
+	if (packed == ODB_SOURCE_READ_OK)
+		return ODB_SOURCE_READ_OK;
 
-	return -1;
+	loose = odb_source_read_object_info(&files->loose->base, oid, oi, flags);
+	if (loose == ODB_SOURCE_READ_OK)
+		return ODB_SOURCE_READ_OK;
+
+	/*
+	 * Either half holding the object and failing to read it is worth
+	 * telling the caller about, since it decides whether asking again
+	 * could produce a different answer.
+	 */
+	if (packed == ODB_SOURCE_READ_UNREADABLE ||
+	    loose == ODB_SOURCE_READ_UNREADABLE)
+		return ODB_SOURCE_READ_UNREADABLE;
+
+	return ODB_SOURCE_READ_MISSING;
 }
 
 static int odb_source_files_read_object_stream(struct odb_read_stream **out,
