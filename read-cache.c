@@ -74,6 +74,7 @@
 #define CACHE_EXT_ENDOFINDEXENTRIES 0x454F4945	/* "EOIE" */
 #define CACHE_EXT_INDEXENTRYOFFSETTABLE 0x49454F54 /* "IEOT" */
 #define CACHE_EXT_SPARSE_DIRECTORIES 0x73646972 /* "sdir" */
+#define CACHE_EXT_SYSTEM 0x53595354 /* "SYST" */
 
 /* changes that can be kept in $GIT_DIR/index (basically all extensions) */
 #define EXTMASK (RESOLVE_UNDO_CHANGED | CACHE_TREE_CHANGED | \
@@ -306,7 +307,8 @@ static int ce_modified_check_fs(struct index_state *istate,
 	return 0;
 }
 
-static int ce_match_stat_basic(const struct cache_entry *ce, struct stat *st)
+static int ce_match_stat_basic(const struct index_state *istate,
+			       const struct cache_entry *ce, struct stat *st)
 {
 	unsigned int changed = 0;
 
@@ -339,7 +341,8 @@ static int ce_match_stat_basic(const struct cache_entry *ce, struct stat *st)
 		BUG("unsupported ce_mode: %o", ce->ce_mode);
 	}
 
-	changed |= match_stat_data(&ce->ce_stat_data, st);
+	changed |= match_stat_data(&ce->ce_stat_data, st,
+				   !istate->foreign_system);
 
 	/* Racily smudged entry? */
 	if (!ce->ce_stat_data.sd_size) {
@@ -377,7 +380,7 @@ int match_stat_data_racy(const struct index_state *istate,
 {
 	if (is_racy_stat(istate, sd))
 		return MTIME_CHANGED;
-	return match_stat_data(sd, st);
+	return match_stat_data(sd, st, !istate->foreign_system);
 }
 
 int ie_match_stat(struct index_state *istate,
@@ -413,7 +416,7 @@ int ie_match_stat(struct index_state *istate,
 	if (ce_intent_to_add(ce))
 		return DATA_CHANGED | TYPE_CHANGED | MODE_CHANGED;
 
-	changed = ce_match_stat_basic(ce, st);
+	changed = ce_match_stat_basic(istate, ce, st);
 
 	/*
 	 * Within 1 second of this sequence:
@@ -1729,6 +1732,36 @@ static int verify_hdr(const struct cache_header *hdr, unsigned long size)
 	return 0;
 }
 
+/*
+ * The system this Git is running on, as the index records it. Owner and inode
+ * are numbered by whoever produced them, so an index carrying another system's
+ * name carries values this one cannot compare against its own lstat().
+ */
+static const char *system_name(void)
+{
+	static struct strbuf sb = STRBUF_INIT;
+	struct utsname uts;
+	const char *name;
+
+	if (sb.len)
+		return sb.buf;
+	/*
+	 * A test cannot arrange to be another operating system, so let it say
+	 * it is one. Reading and writing both go through here, so a test that
+	 * sets this while writing produces an index the ordinary path then
+	 * treats as another system's.
+	 */
+	name = getenv("GIT_TEST_SYSTEM_NAME");
+	if (name && *name) {
+		strbuf_addstr(&sb, name);
+		return sb.buf;
+	}
+	if (uname(&uts) < 0)
+		return NULL;
+	strbuf_addstr(&sb, uts.sysname);
+	return sb.buf;
+}
+
 static int read_index_extension(struct index_state *istate,
 				const char *ext, const char *data, unsigned long sz)
 {
@@ -1757,6 +1790,13 @@ static int read_index_extension(struct index_state *istate,
 		/* no content, only an indicator */
 		istate->sparse_index = INDEX_COLLAPSED;
 		break;
+	case CACHE_EXT_SYSTEM: {
+		const char *sys = system_name();
+
+		if (sys && sz == strlen(sys) && !memcmp(data, sys, sz))
+			istate->foreign_system = 0;
+		break;
+	}
 	default:
 		if (*ext < 'A' || 'Z' < *ext)
 			return error(_("index uses %.4s extension, which we do not understand"),
@@ -2248,6 +2288,15 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	CALLOC_ARRAY(istate->cache, istate->cache_alloc);
 	istate->initialized = 1;
 
+	/*
+	 * Assume another system until the extension below says otherwise. A Git
+	 * that does not know the extension drops it when it rewrites the index,
+	 * so its absence is what a foreign writer leaves behind and cannot be
+	 * told apart from an index this system has not written yet. Both want
+	 * the same caution.
+	 */
+	istate->foreign_system = 1;
+
 	p.istate = istate;
 	p.mmap = mmap;
 	p.mmap_size = mmap_size;
@@ -2575,7 +2624,7 @@ static void ce_smudge_racily_clean_entry(struct index_state *istate,
 
 	if (lstat(ce->name, &st) < 0)
 		return;
-	if (ce_match_stat_basic(ce, &st))
+	if (ce_match_stat_basic(istate, ce, &st))
 		return;
 	if (ce_modified_check_fs(istate, ce, &st)) {
 		/* This is "racily clean"; smudge it.  Note that this
@@ -3049,6 +3098,21 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 			ret = -1;
 			goto out;
 		}
+	}
+	/*
+	 * Written whatever else is being written, like the sparse indicator
+	 * above: an index that omits it reads back as another system's the next
+	 * time, which is exactly the caution this is meant to lift.
+	 */
+	if (system_name()) {
+		const char *sys = system_name();
+
+		if (write_index_ext_header(f, eoie_c, CACHE_EXT_SYSTEM,
+					   strlen(sys)) < 0) {
+			ret = -1;
+			goto out;
+		}
+		hashwrite(f, sys, strlen(sys));
 	}
 
 	/*

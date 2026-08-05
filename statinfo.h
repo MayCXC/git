@@ -59,8 +59,14 @@ void fake_lstat_data(const struct stat_data *sd, struct stat *st);
  * since sd was filled.  If there are differences, return a
  * combination of MTIME_CHANGED, CTIME_CHANGED, OWNER_CHANGED,
  * INODE_CHANGED, and DATA_CHANGED.
+ *
+ * Pass trust_identity as false when sd came from another system, which
+ * numbered the owner, inode and device for itself and did not agree those
+ * numbers with this one; comparing them then reports a change for every file.
+ * Pass it as true when this system filled sd, so the numbers are its own.
  */
-int match_stat_data(const struct stat_data *sd, struct stat *st);
+int match_stat_data(const struct stat_data *sd, struct stat *st,
+		    int trust_identity);
 
 void stat_validity_clear(struct stat_validity *sv);
 

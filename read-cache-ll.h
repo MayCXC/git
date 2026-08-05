@@ -176,7 +176,15 @@ struct index_state {
 		 drop_cache_tree : 1,
 		 updated_workdir : 1,
 		 updated_skipworktree : 1,
-		 fsmonitor_has_run_once : 1;
+		 fsmonitor_has_run_once : 1,
+		 /*
+		  * Set when this index was not written by a Git running on
+		  * this system, so the owner and inode it recorded name
+		  * something in another system's numbering and comparing them
+		  * against a local lstat() compares values that were never
+		  * about the same thing.
+		  */
+		 foreign_system : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
