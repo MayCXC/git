@@ -212,6 +212,9 @@ include shared.mak
 #
 # Define USE_STDEV below if you want git to care about the underlying device
 # change being considered an inode change from the update-index perspective.
+# It only chooses the default for core.trustStdev, which says the same thing
+# for one repository, and is slated for removal; see Documentation/
+# BreakingChanges.adoc.
 #
 # Define NO_ST_BLOCKS_IN_STRUCT_STAT if your platform does not have st_blocks
 # field that counts the on-disk footprint in 512-byte blocks.
