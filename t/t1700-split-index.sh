@@ -16,6 +16,13 @@ sane_unset GIT_TEST_SPLIT_INDEX
 sane_unset GIT_TEST_FSMONITOR
 sane_unset GIT_TEST_INDEX_THREADS
 
+# The index records the system that wrote it, so its checksum would otherwise
+# differ between a Linux and a Darwin run and no hard coded value could suit
+# both. Pin it rather than dropping it, since dropping it would leave these
+# tests exercising an index shape no ordinary write produces.
+GIT_TEST_SYSTEM_NAME=t1700
+export GIT_TEST_SYSTEM_NAME
+
 # Create a file named as $1 with content read from stdin.
 # Set the file's mtime to a few seconds in the past to avoid racy situations.
 create_non_racy_file () {
@@ -25,17 +32,17 @@ create_non_racy_file () {
 
 test_expect_success 'setup' '
 	test_oid_cache <<-EOF
-	own_v3 sha1:8299b0bcd1ac364e5f1d7768efb62fa2da79a339
-	own_v3 sha256:38a6d2925e3eceec33ad7b34cbff4e0086caa0daf28f31e51f5bd94b4a7af86b
+	own_v3 sha1:6989cdd4ee7de6388277027cf0a562bd023ce8cc
+	own_v3 sha256:fa4b3b64768c729ba7cea6b37fb8fb949676696a8119e32393e938d4b6fd87f2
 
-	base_v3 sha1:39d890139ee5356c7ef572216cebcd27aa41f9df
-	base_v3 sha256:c9baeadf905112bf6c17aefbd7d02267afd70ded613c30cafed2d40cb506e1ed
+	base_v3 sha1:ad5ace95a4556157a509dfce44f88ff0bba10a3d
+	base_v3 sha256:7c3a0319eefb13b2d8ffd4cbee548db8ffea0acb0784007cb42cd8357717cb4e
 
-	own_v4 sha1:432ef4b63f32193984f339431fd50ca796493569
-	own_v4 sha256:6738ac6319c25b694afa7bcc313deb182d1a59b68bf7a47b4296de83478c0420
+	own_v4 sha1:e62f26348b81c9d1986662709766f3632eebab16
+	own_v4 sha256:3d0f67a27d22772a4939209df33c6349c1ea3871bc33f72334f4b18823a7ee0d
 
-	base_v4 sha1:508851a7f0dfa8691e9f69c7f055865389012491
-	base_v4 sha256:3177d4adfdd4b6904f7e921d91d715a471c0dde7cf6a4bba574927f02b699508
+	base_v4 sha1:64ca049aba958062f4d3132d8e97cd13345e12bd
+	base_v4 sha256:d6b080924c7a7bbe3d7e66a4b1c3be41a76ed0f45bf3a26e4dfff081e7844584
 	EOF
 '
 
