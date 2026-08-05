@@ -136,6 +136,14 @@ core.mmapPreventsDelete::
 	filesystems, while one Git can reach such a filesystem and an
 	ordinary one at once. False by default.
 
+core.fastWorkingDirectory::
+	If true, reading a file from the working directory is at least
+	as fast as obtaining the same contents from a pack, so Git
+	reads the file. Where a filesystem is slow with its stat,
+	open, mmap and close calls, setting this to false lets Git
+	read from an already open pack instead when it does not need
+	the contents in a file of their own. True by default.
+
 core.splitIndex::
 	If true, the split-index feature of the index will be used.
 	See linkgit:git-update-index[1]. False by default.

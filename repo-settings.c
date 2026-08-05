@@ -209,6 +209,29 @@ int repo_settings_get_mmap_prevents_delete(struct repository *repo)
 	return repo->settings.mmap_prevents_delete;
 }
 
+int repo_settings_get_fast_working_directory(struct repository *repo)
+{
+	prepare_repo_settings(repo);
+	if (repo->settings.fast_working_directory < 0)
+		repo_cfg_bool(repo, "core.fastworkingdirectory",
+			      &repo->settings.fast_working_directory,
+			      /*
+			       * NO_FAST_WORKING_DIRECTORY chose this when Git
+			       * was compiled, so honour it as the default and
+			       * keep the answer the same for anyone who sets
+			       * nothing. It names a property of a filesystem
+			       * rather than of the build, so it goes away with
+			       * the next breaking version.
+			       */
+#if defined(NO_FAST_WORKING_DIRECTORY) && !defined(WITH_BREAKING_CHANGES)
+			      0
+#else
+			      1
+#endif
+			      );
+	return repo->settings.fast_working_directory;
+}
+
 const char *repo_settings_get_hooks_path(struct repository *repo)
 {
 	if (!repo->settings.hooks_path)
