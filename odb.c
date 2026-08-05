@@ -567,17 +567,28 @@ static int do_oid_object_info_extended(struct object_database *odb,
 
 	while (1) {
 		struct odb_source *source;
+		int unreadable = 0;
 
-		for (source = odb->sources; source; source = source->next)
-			if (!odb_source_read_object_info(source, real, oi, flags))
+		for (source = odb->sources; source; source = source->next) {
+			int ret = odb_source_read_object_info(source, real, oi, flags);
+
+			if (!ret)
 				return 0;
+			if (ret == ODB_SOURCE_READ_UNREADABLE)
+				unreadable = 1;
+		}
 
 		/*
 		 * When the object hasn't been found we try a second read and
 		 * tell the sources so. This may cause them to invalidate
 		 * caches or reload on-disk state.
+		 *
+		 * A source that found the object and could not read it has
+		 * answered the question already, so there is nothing for a
+		 * second read to discover and the damage would be described
+		 * to the user once per attempt.
 		 */
-		if (!(flags & OBJECT_INFO_QUICK)) {
+		if (!(flags & OBJECT_INFO_QUICK) && !unreadable) {
 			for (source = odb->sources; source; source = source->next)
 				if (!odb_source_read_object_info(source, real, oi,
 								 flags | OBJECT_INFO_SECOND_READ))
