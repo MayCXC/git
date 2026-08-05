@@ -443,7 +443,7 @@ static void mark_colliding_entries(const struct checkout *state,
 				   struct cache_entry *ce, struct stat *st)
 {
 	struct repo_config_values *cfg = repo_config_values(the_repository);
-	int trust_ino = cfg->check_stat;
+	int trust_ino = cfg->check_stat && !state->istate->foreign_system;
 
 #if defined(GIT_WINDOWS_NATIVE) || defined(__CYGWIN__)
 	trust_ino = 0;
@@ -471,7 +471,8 @@ static void mark_colliding_entries(const struct checkout *state,
 		if (dup->ce_flags & (CE_MATCHED | CE_VALID | CE_SKIP_WORKTREE))
 			continue;
 
-		if ((trust_ino && !match_stat_data(&dup->ce_stat_data, st)) ||
+		if ((trust_ino && !match_stat_data(&dup->ce_stat_data, st,
+						   trust_ino)) ||
 		    paths_collide(ce->name, dup->name)) {
 			dup->ce_flags |= CE_MATCHED;
 			break;

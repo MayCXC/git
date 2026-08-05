@@ -160,7 +160,7 @@ static int test_if_untracked_cache_is_supported(void)
 	avoid_racy();
 	fd = create_file("newfile");
 	xstat_mtime_dir(&st);
-	if (!match_stat_data(&base, &st)) {
+	if (!match_stat_data(&base, &st, 1)) {
 		close(fd);
 		fputc('\n', stderr);
 		fprintf_ln(stderr,_("directory stat info does not "
@@ -173,7 +173,7 @@ static int test_if_untracked_cache_is_supported(void)
 	avoid_racy();
 	xmkdir("new-dir");
 	xstat_mtime_dir(&st);
-	if (!match_stat_data(&base, &st)) {
+	if (!match_stat_data(&base, &st, 1)) {
 		close(fd);
 		fputc('\n', stderr);
 		fprintf_ln(stderr, _("directory stat info does not change "
@@ -187,7 +187,7 @@ static int test_if_untracked_cache_is_supported(void)
 	write_or_die(fd, "data", 4);
 	close(fd);
 	xstat_mtime_dir(&st);
-	if (match_stat_data(&base, &st)) {
+	if (match_stat_data(&base, &st, 1)) {
 		fputc('\n', stderr);
 		fprintf_ln(stderr, _("directory stat info changes "
 				     "after updating a file"));
@@ -198,7 +198,7 @@ static int test_if_untracked_cache_is_supported(void)
 	avoid_racy();
 	close(create_file("new-dir/new"));
 	xstat_mtime_dir(&st);
-	if (match_stat_data(&base, &st)) {
+	if (match_stat_data(&base, &st, 1)) {
 		fputc('\n', stderr);
 		fprintf_ln(stderr, _("directory stat info changes after "
 				     "adding a file inside subdirectory"));
@@ -209,7 +209,7 @@ static int test_if_untracked_cache_is_supported(void)
 	avoid_racy();
 	xunlink("newfile");
 	xstat_mtime_dir(&st);
-	if (!match_stat_data(&base, &st)) {
+	if (!match_stat_data(&base, &st, 1)) {
 		fputc('\n', stderr);
 		fprintf_ln(stderr, _("directory stat info does not "
 				     "change after deleting a file"));
@@ -222,7 +222,7 @@ static int test_if_untracked_cache_is_supported(void)
 	xunlink("new-dir/new");
 	xrmdir("new-dir");
 	xstat_mtime_dir(&st);
-	if (!match_stat_data(&base, &st)) {
+	if (!match_stat_data(&base, &st, 1)) {
 		fputc('\n', stderr);
 		fprintf_ln(stderr, _("directory stat info does not "
 				     "change after deleting a directory"));
