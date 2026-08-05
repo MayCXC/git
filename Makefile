@@ -162,6 +162,9 @@ include shared.mak
 #
 # Define NO_FAST_WORKING_DIRECTORY if accessing objects in pack files is
 # generally faster on your platform than accessing the working directory.
+# It only chooses the default for core.fastWorkingDirectory, which says the
+# same thing for one repository, and is slated for removal; see Documentation/
+# BreakingChanges.adoc.
 #
 # Define NO_TRUSTABLE_FILEMODE if your filesystem may claim to support
 # the executable mode bit, but doesn't really do so.

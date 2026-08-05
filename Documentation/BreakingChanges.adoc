@@ -257,6 +257,13 @@ system configuration.
   repository and MMAP_PREVENTS_DELETE will be removed. NO_MMAP stays, since
   whether this Git can map a file at all is settled when it is built.
 
+* The NO_FAST_WORKING_DIRECTORY build knob says that reading a file from the
+  working directory is slower than obtaining the same contents from a pack.
+  How quickly a working directory answers is a property of the filesystem
+  holding it, and one Git reaches a slow filesystem and a fast one at once, so
+  `core.fastWorkingDirectory` says it per repository and
+  NO_FAST_WORKING_DIRECTORY will be removed.
+
 * Support for grafting commits has long been superseded by git-replace(1).
   Grafts are inferior to replacement refs:
 +

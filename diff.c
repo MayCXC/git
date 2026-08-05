@@ -43,15 +43,10 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "read-cache-ll.h"
+#include "repo-settings.h"
 #include "setup.h"
 #include "strmap.h"
 #include "ws.h"
-
-#ifdef NO_FAST_WORKING_DIRECTORY
-#define FAST_WORKING_DIRECTORY 0
-#else
-#define FAST_WORKING_DIRECTORY 1
-#endif
 
 static int diff_detect_rename_default;
 static int diff_indent_heuristic = 1;
@@ -4411,16 +4406,16 @@ static int reuse_worktree_file(struct index_state *istate,
 		return 0;
 
 	/* We want to avoid the working directory if our caller
-	 * doesn't need the data in a normal file, this system
-	 * is rather slow with its stat/open/mmap/close syscalls,
-	 * and the object is contained in a pack file.  The pack
-	 * is probably already open and will be faster to obtain
-	 * the data through than the working directory.  Loose
-	 * objects however would tend to be slower as they need
-	 * to be individually opened and inflated.
+	 * doesn't need the data in a normal file, the filesystem
+	 * holding this repository is rather slow with its
+	 * stat/open/mmap/close syscalls, and the object is contained
+	 * in a pack file.  The pack is probably already open and will
+	 * be faster to obtain the data through than the working
+	 * directory.  Loose objects however would tend to be slower as
+	 * they need to be individually opened and inflated.
 	 */
-	if (!FAST_WORKING_DIRECTORY && !want_file &&
-	    has_object_pack(istate->repo, oid))
+	if (!repo_settings_get_fast_working_directory(istate->repo) &&
+	    !want_file && has_object_pack(istate->repo, oid))
 		return 0;
 
 	/*
