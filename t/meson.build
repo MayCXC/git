@@ -250,6 +250,7 @@ integration_tests = [
   't1601-index-bogus.sh',
   't1700-split-index.sh',
   't1701-racy-split-index.sh',
+  't1703-index-trust-stdev.sh',
   't1800-hook.sh',
   't1900-repo-info.sh',
   't1901-repo-structure.sh',

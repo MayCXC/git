@@ -242,6 +242,14 @@ system configuration.
 
 === Removals
 
+* The USE_STDEV build knob decides whether the device number recorded in the
+  index is compared against the working tree. Whether that number stays the
+  same for a file is a property of the filesystem holding the repository, and
+  one Git reaches several filesystems, so a single answer chosen when Git was
+  compiled cannot suit all of them. `core.trustStdev` says the same thing per
+  repository and USE_STDEV will be removed once it has been available for long
+  enough that a build relying on it has somewhere to go.
+
 * Support for grafting commits has long been superseded by git-replace(1).
   Grafts are inferior to replacement refs:
 +
