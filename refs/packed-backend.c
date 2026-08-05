@@ -8,6 +8,7 @@
 #include "../hash.h"
 #include "../hex.h"
 #include "../refs.h"
+#include "../repo-settings.h"
 #include "refs-internal.h"
 #include "packed-backend.h"
 #include "../iterator.h"
@@ -40,13 +41,20 @@ enum mmap_strategy {
 	MMAP_OK
 };
 
+/*
+ * NO_MMAP says this Git cannot map a file at all, which is settled when it is
+ * built. Whether a mapped file can still be deleted or renamed over is settled
+ * by the filesystem the repository sits on, so it is asked of the repository.
+ */
+static enum mmap_strategy mmap_strategy_for(struct repository *repo)
+{
 #if defined(NO_MMAP)
-static enum mmap_strategy mmap_strategy = MMAP_NONE;
-#elif defined(MMAP_PREVENTS_DELETE)
-static enum mmap_strategy mmap_strategy = MMAP_TEMPORARY;
+	return MMAP_NONE;
 #else
-static enum mmap_strategy mmap_strategy = MMAP_OK;
+	return repo_settings_get_mmap_prevents_delete(repo) ?
+		MMAP_TEMPORARY : MMAP_OK;
 #endif
+}
 
 struct packed_ref_store;
 
@@ -542,7 +550,13 @@ static int refname_contains_nul(struct strbuf *refname)
 
 #define SMALL_FILE_SIZE (32*1024)
 
-static int allocate_snapshot_buffer(struct snapshot *snapshot, int fd, struct stat *st)
+/*
+ * The store is passed rather than reached through the snapshot, because fsck
+ * reads a `packed-refs` file into a snapshot that belongs to no store.
+ */
+static int allocate_snapshot_buffer(struct packed_ref_store *refs,
+				    struct snapshot *snapshot, int fd,
+				    struct stat *st)
 {
 	ssize_t bytes_read;
 	size_t size;
@@ -551,11 +565,12 @@ static int allocate_snapshot_buffer(struct snapshot *snapshot, int fd, struct st
 	if (!size)
 		return 0;
 
-	if (mmap_strategy == MMAP_NONE || size <= SMALL_FILE_SIZE) {
+	if (mmap_strategy_for(refs->base.repo) == MMAP_NONE ||
+	    size <= SMALL_FILE_SIZE) {
 		snapshot->buf = xmalloc(size);
 		bytes_read = read_in_full(fd, snapshot->buf, size);
 		if (bytes_read < 0 || bytes_read != size)
-			die_errno("couldn't read %s", snapshot->refs->path);
+			die_errno("couldn't read %s", refs->path);
 		snapshot->mmapped = 0;
 	} else {
 		snapshot->buf = xmmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -601,7 +616,7 @@ static int load_contents(struct snapshot *snapshot)
 	if (fstat(fd, &st) < 0)
 		die_errno("couldn't stat %s", snapshot->refs->path);
 
-	ret = allocate_snapshot_buffer(snapshot, fd, &st);
+	ret = allocate_snapshot_buffer(snapshot->refs, snapshot, fd, &st);
 
 	close(fd);
 	return ret;
@@ -785,7 +800,7 @@ static struct snapshot *create_snapshot(struct packed_ref_store *refs)
 		verify_buffer_safe(snapshot);
 	}
 
-	if (mmap_strategy != MMAP_OK && snapshot->mmapped) {
+	if (mmap_strategy_for(refs->base.repo) != MMAP_OK && snapshot->mmapped) {
 		/*
 		 * We don't want to leave the file mmapped, so we are
 		 * forced to make a copy now:
@@ -2129,7 +2144,7 @@ static int packed_fsck(struct ref_store *ref_store,
 		goto cleanup;
 	}
 
-	if (!allocate_snapshot_buffer(&snapshot, fd, &st)) {
+	if (!allocate_snapshot_buffer(refs, &snapshot, fd, &st)) {
 		struct fsck_ref_report report = { 0 };
 		report.path = "packed-refs";
 		ret = fsck_report_ref(o, &report,
