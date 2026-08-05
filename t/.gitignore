@@ -2,5 +2,6 @@
 /test-results
 /.prove
 /chainlinttmp
+/greplinttmp
 /mesontmp
 /out/
