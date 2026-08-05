@@ -1659,6 +1659,17 @@ static int create_stash(int argc, const char **argv, const char *prefix UNUSED,
 			      NULL, 0);
 	if (!ret)
 		printf_ln("%s", oid_to_hex(&info.w_commit));
+	else if (ret > 0)
+		/*
+		 * do_create_stash() refreshes the index before deciding, so it
+		 * can find nothing to stash where the check above found
+		 * something, and it reports that with a positive value rather
+		 * than an error.  That is the same "nothing to stash" the check
+		 * above reports by returning 0, and do_push_stash() already
+		 * treats it as success, so say so here too instead of failing
+		 * with no output.
+		 */
+		ret = 0;
 
 	free_stash_info(&info);
 	strbuf_release(&stash_msg_buf);

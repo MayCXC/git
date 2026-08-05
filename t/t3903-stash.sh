@@ -640,6 +640,17 @@ test_expect_success 'stash create - no changes' '
 	test_must_be_empty actual
 '
 
+test_expect_success 'stash create - only a stat change' '
+	git stash clear &&
+	test_when_finished "git reset --hard HEAD" &&
+	git reset --hard &&
+	test-tool chmtime +10 file &&
+	test_expect_code 1 git diff-files --quiet &&
+	git stash create >actual 2>err &&
+	test_must_be_empty actual &&
+	test_must_be_empty err
+'
+
 test_expect_success 'stash branch - no stashes on stack, stash-like argument' '
 	git stash clear &&
 	test_when_finished "git reset --hard HEAD" &&
