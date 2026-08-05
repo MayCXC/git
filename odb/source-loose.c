@@ -248,13 +248,13 @@ static int odb_source_loose_read_object_info(struct odb_source *source,
 	static struct strbuf buf = STRBUF_INIT;
 
 	/*
-	 * The second read shouldn't cause new loose objects to show up, unless
-	 * there was a race condition with a secondary process. We don't care
-	 * about this case though, so we simply skip reading loose objects a
-	 * second time.
+	 * In case the first read didn't surface the object, we have to drop
+	 * what we know about the object directory. This may cause us to
+	 * discover objects that have been written since the last time we have
+	 * prepared the loose object store.
 	 */
 	if (flags & OBJECT_INFO_SECOND_READ)
-		return -1;
+		odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
 
 	odb_loose_path(loose, &buf, oid);
 	return read_object_info_from_path(loose, buf.buf, oid, oi, flags);
