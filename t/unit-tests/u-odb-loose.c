@@ -51,3 +51,28 @@ void test_odb_loose__quick_sees_an_object_we_wrote(void)
 	cl_must_pass(odb_source_read_object_info(&source->base, &oid, NULL,
 						 OBJECT_INFO_QUICK));
 }
+
+/*
+ * The second read exists so a source can pick up state that changed after the
+ * first one. A loose object written in between is exactly such a change, so
+ * declining the second read reports an object absent for the whole lookup
+ * rather than for one pass of it.
+ */
+void test_odb_loose__second_read_sees_a_new_object(void)
+{
+	struct odb_source_loose *source = odb_source_loose_new(odb, objdir.buf, true);
+	const char *content = "second read";
+	size_t len = strlen(content);
+	struct object_id oid;
+	struct object_info oi = { 0 };
+
+	hash_object_file(the_repository->hash_algo, content, len, OBJ_BLOB, &oid);
+
+	cl_must_fail(odb_source_read_object_info(&source->base, &oid, &oi, 0));
+
+	cl_must_pass(odb_source_write_object(&source->base, content, len,
+					     OBJ_BLOB, &oid, NULL, NULL, 0));
+
+	cl_must_pass(odb_source_read_object_info(&source->base, &oid, &oi,
+						 OBJECT_INFO_SECOND_READ));
+}
