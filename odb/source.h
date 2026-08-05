@@ -367,9 +367,26 @@ static inline void odb_source_prepare(struct odb_source *source,
 	source->prepare(source, flags);
 }
 
+enum odb_source_read_result {
+	ODB_SOURCE_READ_OK = 0,
+	ODB_SOURCE_READ_MISSING = -1,
+	ODB_SOURCE_READ_UNREADABLE = -2,
+};
+
 /*
  * Read an object from the object database source identified by its object ID.
- * Returns 0 on success, a negative error code otherwise.
+ *
+ * Returns:
+ *
+ * - ODB_SOURCE_READ_OK on success
+ * - ODB_SOURCE_READ_MISSING when the source does not hold the object
+ * - ODB_SOURCE_READ_UNREADABLE when it holds the object but cannot use it
+ *
+ * The last two are both failures, and a caller that only asks whether the read
+ * succeeded may treat them alike. They differ for a caller deciding whether to
+ * ask again: a source that found the object and could not read it will answer
+ * the same however many times it is asked, and has already described the
+ * damage to the user.
  */
 static inline int odb_source_read_object_info(struct odb_source *source,
 					      const struct object_id *oid,

@@ -111,12 +111,14 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 		struct stat st;
 
 		if ((!oi || (!oi->disk_sizep && !oi->mtimep)) && (flags & OBJECT_INFO_QUICK)) {
-			ret = quick_has_loose(loose, oid) ? 0 : -1;
+			ret = quick_has_loose(loose, oid) ? ODB_SOURCE_READ_OK :
+							    ODB_SOURCE_READ_MISSING;
 			goto out;
 		}
 
 		if (lstat(path, &st) < 0) {
-			ret = -1;
+			ret = errno == ENOENT ? ODB_SOURCE_READ_MISSING :
+						ODB_SOURCE_READ_UNREADABLE;
 			goto out;
 		}
 
@@ -127,21 +129,24 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 				*oi->mtimep = st.st_mtime;
 		}
 
-		ret = 0;
+		ret = ODB_SOURCE_READ_OK;
 		goto out;
 	}
 
 	fd = git_open(path);
 	if (fd < 0) {
-		if (errno != ENOENT)
+		if (errno != ENOENT) {
 			error_errno(_("unable to open loose object %s"), oid_to_hex(oid));
-		ret = -1;
+			ret = ODB_SOURCE_READ_UNREADABLE;
+		} else {
+			ret = ODB_SOURCE_READ_MISSING;
+		}
 		goto out;
 	}
 
 	if (fstat(fd, &st)) {
 		close(fd);
-		ret = -1;
+		ret = ODB_SOURCE_READ_UNREADABLE;
 		goto out;
 	}
 
@@ -155,7 +160,7 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 	map = xmmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
 	close(fd);
 	if (!map) {
-		ret = -1;
+		ret = ODB_SOURCE_READ_UNREADABLE;
 		goto out;
 	}
 
@@ -184,7 +189,7 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 		if (oi->contentp) {
 			*oi->contentp = unpack_loose_rest(&stream, hdr, *oi->sizep, oid);
 			if (!*oi->contentp) {
-				ret = -1;
+				ret = ODB_SOURCE_READ_UNREADABLE;
 				goto corrupt;
 			}
 		}
@@ -200,12 +205,20 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 		goto corrupt;
 	}
 
-	ret = 0;
+	ret = ODB_SOURCE_READ_OK;
 
 corrupt:
 	if (ret && (flags & OBJECT_INFO_DIE_IF_CORRUPT))
 		die(_("loose object %s (stored in %s) is corrupt"),
 		    oid_to_hex(oid), path);
+
+	/*
+	 * The object is here, it just cannot be read, and saying so tells the
+	 * caller not to come back for it. Reading it again would find the same
+	 * damage and describe it to the user a second time.
+	 */
+	if (ret)
+		ret = ODB_SOURCE_READ_UNREADABLE;
 
 out:
 	if (stream_to_end)
