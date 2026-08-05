@@ -54,6 +54,13 @@ struct repo_settings {
 
 	int core_multi_pack_index;
 	int warn_ambiguous_refs; /* lazily loaded via accessor */
+	/*
+	 * Whether a file that is currently mmapped can still be deleted or
+	 * replaced by rename(). Where it cannot, Git copies a file's contents
+	 * and unmaps it rather than holding the mapping. Lazily loaded via
+	 * accessor.
+	 */
+	int mmap_prevents_delete;
 
 	size_t delta_base_cache_limit;
 	size_t packed_git_window_size;
@@ -70,6 +77,7 @@ struct repo_settings {
 	.core_untracked_cache = UNTRACKED_CACHE_KEEP, \
 	.fetch_negotiation_algorithm = FETCH_NEGOTIATION_CONSECUTIVE, \
 	.warn_ambiguous_refs = -1, \
+	.mmap_prevents_delete = -1, \
 	.delta_base_cache_limit = DEFAULT_DELTA_BASE_CACHE_LIMIT, \
 	.packed_git_window_size = DEFAULT_PACKED_GIT_WINDOW_SIZE, \
 	.packed_git_limit = DEFAULT_PACKED_GIT_LIMIT, \
@@ -81,6 +89,8 @@ void repo_settings_clear(struct repository *r);
 
 /* Read the value for "core.warnAmbiguousRefs". */
 int repo_settings_get_warn_ambiguous_refs(struct repository *repo);
+/* Read the value for "core.mmapPreventsDelete". */
+int repo_settings_get_mmap_prevents_delete(struct repository *repo);
 /* Read the value for "core.hooksPath". */
 const char *repo_settings_get_hooks_path(struct repository *repo);
 

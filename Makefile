@@ -135,6 +135,9 @@ include shared.mak
 #
 # Define MMAP_PREVENTS_DELETE if a file that is currently mmapped cannot be
 # deleted or cannot be replaced using rename().
+# It only chooses the default for core.mmapPreventsDelete, which says the same
+# thing for one repository, and is slated for removal; see Documentation/
+# BreakingChanges.adoc.
 #
 # Define NO_POLL_H if you don't have poll.h.
 #
