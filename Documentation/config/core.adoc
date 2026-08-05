@@ -118,6 +118,16 @@ core.trustctime::
 	crawlers and some backup systems).
 	See linkgit:git-update-index[1]. True by default.
 
+core.trustStdev::
+	If true, the device number recorded in the index is compared
+	against the working tree, so that a file arriving on a
+	different device counts as changed. Filesystems whose clients
+	each decide the device number for themselves, network
+	filesystems among them, give a different answer to each client
+	and to the same client over time, and one Git can reach such a
+	filesystem and an ordinary one at once. False by default, and
+	ignored when `core.checkStat` is `minimal`.
+
 core.splitIndex::
 	If true, the split-index feature of the index will be used.
 	See linkgit:git-update-index[1]. False by default.
@@ -139,7 +149,7 @@ core.checkStat::
 	since Git looked at it.  When this configuration variable is
 	set to `minimal`, sub-second part of mtime and ctime, the
 	uid and gid of the owner of the file, the inode number (and
-	the device number, if Git was compiled to use it), are
+	the device number, if `core.trustStdev` is set), are
 	excluded from the check among these fields, leaving only the
 	whole-second part of mtime (and ctime, if `core.trustCtime`
 	is set) and the filesize to be checked.

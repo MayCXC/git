@@ -128,6 +128,12 @@ struct repo_config_values {
 	enum object_creation_mode object_creation_mode;
 	int apply_sparse_checkout;
 	int trust_ctime;
+	/*
+	 * Whether st_dev keeps the same value for a file over time. It does not
+	 * on a filesystem whose clients each name the device for themselves, so
+	 * this belongs to the repository rather than to the build.
+	 */
+	int trust_stdev;
 	int check_stat;
 	int zlib_compression_level;
 	int pack_compression_level;

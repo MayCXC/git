@@ -332,6 +332,10 @@ int git_default_core_config(const char *var, const char *value,
 		cfg->trust_ctime = git_config_bool(var, value);
 		return 0;
 	}
+	if (!strcmp(var, "core.truststdev")) {
+		cfg->trust_stdev = git_config_bool(var, value);
+		return 0;
+	}
 	if (!strcmp(var, "core.checkstat")) {
 		if (!value)
 			return config_error_nonbool(var);
@@ -763,6 +767,17 @@ void repo_config_values_init(struct repo_config_values *cfg)
 	cfg->has_symlinks = platform_has_symlinks();
 	cfg->branch_track = BRANCH_TRACK_REMOTE;
 	cfg->trust_ctime = 1;
+	/*
+	 * USE_STDEV chose this at build time, so honour it as the default and
+	 * keep the answer the same for anyone who sets neither. It names a
+	 * property of a filesystem rather than of the build, so it goes away
+	 * with the next breaking version and core.trustStdev says it instead.
+	 */
+#if defined(USE_STDEV) && !defined(WITH_BREAKING_CHANGES)
+	cfg->trust_stdev = 1;
+#else
+	cfg->trust_stdev = 0;
+#endif
 	cfg->check_stat = 1;
 	cfg->zlib_compression_level = Z_BEST_SPEED;
 	cfg->pack_compression_level = Z_DEFAULT_COMPRESSION;

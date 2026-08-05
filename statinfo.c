@@ -95,16 +95,16 @@ int match_stat_data(const struct stat_data *sd, struct stat *st,
 			changed |= INODE_CHANGED;
 	}
 
-#ifdef USE_STDEV
 	/*
 	 * st_dev breaks on network filesystems where different
 	 * clients will have different views of what "device"
-	 * the filesystem is on
+	 * the filesystem is on, and one Git can reach such a
+	 * filesystem and an ordinary one at the same time, so
+	 * whether to compare it belongs to the repository.
 	 */
-	if (cfg->check_stat && trust_identity &&
+	if (cfg->check_stat && trust_identity && cfg->trust_stdev &&
 	    sd->sd_dev != (unsigned int) st->st_dev)
 			changed |= INODE_CHANGED;
-#endif
 
 	if (sd->sd_size != munge_st_size(st->st_size))
 		changed |= DATA_CHANGED;
