@@ -61,26 +61,33 @@ void fake_lstat_data(const struct stat_data *sd, struct stat *st)
 	st->st_size = sd->sd_size;
 }
 
-int match_stat_data(const struct stat_data *sd, struct stat *st)
+/*
+ * Where the identity is not this system's, every entry reports a change, and
+ * each one is then verified by hashing its contents. That answers correctly,
+ * and pays for the whole worktree to say so.
+ */
+int match_stat_data(const struct stat_data *sd, struct stat *st,
+		    int trust_identity)
 {
 	int changed = 0;
 	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	if (sd->sd_mtime.sec != (unsigned int)st->st_mtime)
 		changed |= MTIME_CHANGED;
-	if (cfg->trust_ctime && cfg->check_stat &&
+	if (cfg->trust_ctime && cfg->check_stat && trust_identity &&
 	    sd->sd_ctime.sec != (unsigned int)st->st_ctime)
 		changed |= CTIME_CHANGED;
 
 #ifdef USE_NSEC
-	if (cfg->check_stat && sd->sd_mtime.nsec != ST_MTIME_NSEC(*st))
+	if (cfg->check_stat && trust_identity &&
+	    sd->sd_mtime.nsec != ST_MTIME_NSEC(*st))
 		changed |= MTIME_CHANGED;
-	if (cfg->trust_ctime && cfg->check_stat &&
+	if (cfg->trust_ctime && cfg->check_stat && trust_identity &&
 	    sd->sd_ctime.nsec != ST_CTIME_NSEC(*st))
 		changed |= CTIME_CHANGED;
 #endif
 
-	if (cfg->check_stat) {
+	if (cfg->check_stat && trust_identity) {
 		if (sd->sd_uid != (unsigned int) st->st_uid ||
 			sd->sd_gid != (unsigned int) st->st_gid)
 			changed |= OWNER_CHANGED;
@@ -94,7 +101,8 @@ int match_stat_data(const struct stat_data *sd, struct stat *st)
 	 * clients will have different views of what "device"
 	 * the filesystem is on
 	 */
-	if (cfg->check_stat && sd->sd_dev != (unsigned int) st->st_dev)
+	if (cfg->check_stat && trust_identity &&
+	    sd->sd_dev != (unsigned int) st->st_dev)
 			changed |= INODE_CHANGED;
 #endif
 
@@ -117,7 +125,11 @@ int stat_validity_check(struct stat_validity *sv, const char *path)
 		return sv->sd == NULL;
 	if (!sv->sd)
 		return 0;
-	return S_ISREG(st.st_mode) && !match_stat_data(sv->sd, &st);
+	/*
+	 * A stat_validity records a file this process stat()ed itself, so its
+	 * identity is this system's and can be compared.
+	 */
+	return S_ISREG(st.st_mode) && !match_stat_data(sv->sd, &st, 1);
 }
 
 void stat_validity_update(struct stat_validity *sv, int fd)
