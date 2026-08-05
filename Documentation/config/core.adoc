@@ -128,6 +128,14 @@ core.trustStdev::
 	filesystem and an ordinary one at once. False by default, and
 	ignored when `core.checkStat` is `minimal`.
 
+core.mmapPreventsDelete::
+	If true, a file that is currently mmapped cannot be deleted or
+	replaced using rename(), so Git copies the contents of the
+	`packed-refs` file and unmaps it rather than holding the
+	mapping open. Windows behaves this way, and so do some network
+	filesystems, while one Git can reach such a filesystem and an
+	ordinary one at once. False by default.
+
 core.splitIndex::
 	If true, the split-index feature of the index will be used.
 	See linkgit:git-update-index[1]. False by default.

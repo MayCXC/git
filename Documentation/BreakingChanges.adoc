@@ -250,6 +250,13 @@ system configuration.
   repository and USE_STDEV will be removed once it has been available for long
   enough that a build relying on it has somewhere to go.
 
+* The MMAP_PREVENTS_DELETE build knob says that a file which is currently
+  mmapped cannot be deleted or replaced by rename(). That is a property of the
+  filesystem holding the repository rather than of the build, and one Git
+  reaches both kinds at once, so `core.mmapPreventsDelete` says it per
+  repository and MMAP_PREVENTS_DELETE will be removed. NO_MMAP stays, since
+  whether this Git can map a file at all is settled when it is built.
+
 * Support for grafting commits has long been superseded by git-replace(1).
   Grafts are inferior to replacement refs:
 +

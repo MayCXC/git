@@ -186,6 +186,29 @@ int repo_settings_get_warn_ambiguous_refs(struct repository *repo)
 	return repo->settings.warn_ambiguous_refs;
 }
 
+int repo_settings_get_mmap_prevents_delete(struct repository *repo)
+{
+	prepare_repo_settings(repo);
+	if (repo->settings.mmap_prevents_delete < 0)
+		repo_cfg_bool(repo, "core.mmappreventsdelete",
+			      &repo->settings.mmap_prevents_delete,
+			      /*
+			       * MMAP_PREVENTS_DELETE chose this when Git was
+			       * compiled, so honour it as the default and keep
+			       * the answer the same for anyone who sets
+			       * nothing. It names a property of a filesystem
+			       * rather than of the build, so it goes away with
+			       * the next breaking version.
+			       */
+#if defined(MMAP_PREVENTS_DELETE) && !defined(WITH_BREAKING_CHANGES)
+			      1
+#else
+			      0
+#endif
+			      );
+	return repo->settings.mmap_prevents_delete;
+}
+
 const char *repo_settings_get_hooks_path(struct repository *repo)
 {
 	if (!repo->settings.hooks_path)
