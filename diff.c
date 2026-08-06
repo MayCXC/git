@@ -7824,7 +7824,12 @@ size_t fill_textconv(struct repository *r,
 	if (!*outbuf)
 		die("unable to read files to diff");
 
-	if (driver->textconv_cache && df->oid_valid) {
+	/*
+	 * Storing the result saves running the filter again for the same blob,
+	 * so it is worth a ref update, but only where one is wanted: the entry
+	 * is a cache, and recomputing it costs nothing but time.
+	 */
+	if (driver->textconv_cache && df->oid_valid && use_optional_locks()) {
 		/* ignore errors, as we might be in a readonly repository */
 		notes_cache_put(driver->textconv_cache, &df->oid, *outbuf,
 				size);

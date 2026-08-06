@@ -62,6 +62,20 @@ test_expect_success 'cached textconv does not run helper' '
 	! test -r helper.out
 '
 
+test_expect_success 'no textconv cache is stored with --no-optional-locks' '
+	git update-ref -d refs/notes/textconv/magic &&
+	rm -f helper.out &&
+	git --no-optional-locks diff HEAD^ HEAD >actual &&
+	test_cmp expect actual &&
+	test_path_is_file helper.out &&
+	test_must_fail git rev-parse --verify -q refs/notes/textconv/magic &&
+	# nothing was stored, so the helper runs again
+	rm -f helper.out &&
+	git --no-optional-locks diff HEAD^ HEAD >actual &&
+	test_cmp expect actual &&
+	test_path_is_file helper.out
+'
+
 cat >expect <<EOF
 diff --git a/bar.bin b/bar.bin
 index $bar1..$bar2 100644
