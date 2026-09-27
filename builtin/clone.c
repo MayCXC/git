@@ -663,7 +663,8 @@ static int git_sparse_checkout_init(const char *repo)
 static int checkout(int submodule_progress,
 		    struct list_objects_filter_options *filter_options,
 		    int filter_submodules,
-		    enum ref_storage_format ref_storage_format)
+		    const char *submodule_ref_storage,
+		    const char *object_storage)
 {
 	struct object_id oid;
 	char *head;
@@ -749,9 +750,13 @@ static int checkout(int submodule_progress,
 			strvec_push(&cmd.args, "--no-fetch");
 		}
 
-		if (ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
+		if (submodule_ref_storage)
 			strvec_pushf(&cmd.args, "--ref-storage-format=%s",
-				     ref_storage_format_to_name(ref_storage_format));
+				     submodule_ref_storage);
+
+		if (object_storage)
+			strvec_pushf(&cmd.args, "--object-storage=%s",
+				     object_storage);
 
 		if (filter_submodules && filter_options->choice)
 			strvec_pushf(&cmd.args, "--filter=%s",
@@ -919,7 +924,7 @@ int cmd_clone(int argc,
 	int submodule_progress;
 	int filter_submodules = 0;
 	int hash_algo;
-	enum ref_storage_format ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN;
+	char *submodule_ref_storage = NULL;
 	const int do_not_override_repo_unix_permissions = -1;
 	int option_reject_shallow = -1; /* unspecified */
 	int deepen = 0;
@@ -1059,9 +1064,23 @@ int cmd_clone(int argc,
 		option_single_branch = deepen ? 1 : 0;
 
 	if (ref_storage_format_uri) {
-		ref_storage_format = ref_storage_format_by_uri(ref_storage_format_uri, NULL);
+		enum ref_storage_format ref_storage_format =
+			ref_storage_format_by_uri(ref_storage_format_uri, NULL);
+
 		if (ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
 			die(_("unknown ref storage format '%s'"), ref_storage_format_uri);
+
+		/*
+		 * Submodules take the ref storage format of the superproject
+		 * without the payload locating its references, but a helper
+		 * named by the payload keeps the references of each repository
+		 * it serves apart.
+		 */
+		if (ref_storage_format == REF_STORAGE_FORMAT_HELPER)
+			submodule_ref_storage = xstrdup(ref_storage_format_uri);
+		else
+			submodule_ref_storage =
+				xstrdup(ref_storage_format_to_name(ref_storage_format));
 	}
 
 	if (option_mirror) {
@@ -1671,7 +1690,8 @@ int cmd_clone(int argc,
 	err = checkout(submodule_progress,
 		       &filter_options,
 		       filter_submodules,
-		       ref_storage_format);
+		       submodule_ref_storage,
+		       object_storage_uri);
 
 	list_objects_filter_release(&filter_options);
 
@@ -1691,6 +1711,7 @@ int cmd_clone(int argc,
 	free(dir);
 	free(path);
 	free(source_storage);
+	free(submodule_ref_storage);
 	free(repo_to_free);
 	junk_mode = JUNK_LEAVE_ALL;
 

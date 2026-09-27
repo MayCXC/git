@@ -911,4 +911,56 @@ test_expect_success 'fast-import writes a pack into the files store of the helpe
 	assert_object_in_helper imported "$blob"
 '
 
+test_expect_success 'setup a superproject with a submodule' '
+	git init subsrc &&
+	test_commit -C subsrc sub-content &&
+	git init supersrc &&
+	test_commit -C supersrc super-content &&
+	git -C supersrc -c protocol.file.allow=always \
+		submodule add "$(pwd)/subsrc" sub &&
+	git -C supersrc commit -m "add submodule"
+'
+
+test_expect_success 'clone --recurse-submodules stores the objects of submodules in the helper' '
+	test_when_finished "rm -rf superclone" &&
+	git -c protocol.file.allow=always clone --object-storage=testgit \
+		--recurse-submodules supersrc superclone &&
+	echo helper://testgit >expect &&
+	git -C superclone/sub config extensions.objectStorage >actual &&
+	test_cmp expect actual &&
+	test_path_is_file superclone/sub/sub-content.t &&
+	git -C superclone/sub gc &&
+	assert_files_store_empty superclone/sub &&
+	assert_object_in_helper superclone/sub "$(git -C subsrc rev-parse HEAD)" &&
+	git -C superclone/sub fsck
+'
+
+test_expect_success 'submodule update --object-storage stores the objects of new submodules in the helper' '
+	test_when_finished "rm -rf superclone" &&
+	git clone supersrc superclone &&
+	git -C superclone -c protocol.file.allow=always \
+		submodule update --init --object-storage=testgit &&
+	echo helper://testgit >expect &&
+	git -C superclone/sub config extensions.objectStorage >actual &&
+	test_cmp expect actual &&
+	git -C superclone/sub fsck
+'
+
+test_expect_success 'submodule add --object-storage stores the objects of the submodule in the helper' '
+	test_when_finished "rm -rf superadd" &&
+	git init superadd &&
+	git -C superadd -c protocol.file.allow=always \
+		submodule add --object-storage=testgit "$(pwd)/subsrc" sub &&
+	echo helper://testgit >expect &&
+	git -C superadd/sub config extensions.objectStorage >actual &&
+	test_cmp expect actual &&
+	git -C superadd/sub fsck
+'
+
+test_expect_success 'submodule update refuses an unknown object storage' '
+	test_must_fail git -C supersrc submodule update --init \
+		--object-storage=db://.git 2>err &&
+	test_grep "unknown object storage" err
+'
+
 test_done

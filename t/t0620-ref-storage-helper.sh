@@ -671,4 +671,41 @@ test_expect_success 'refs migrate into the helper keeps the objects it stores' '
 	git -C objectsfirst fsck
 '
 
+test_expect_success 'setup a superproject with a submodule' '
+	git init subsrc &&
+	test_commit -C subsrc sub-content &&
+	git init supersrc &&
+	test_commit -C supersrc super-content &&
+	git -C supersrc -c protocol.file.allow=always \
+		submodule add "$(pwd)/subsrc" sub &&
+	git -C supersrc commit -m "add submodule"
+'
+
+test_expect_success 'clone --recurse-submodules keeps the references of submodules in the helper' '
+	test_when_finished "rm -rf superclone" &&
+	git -c protocol.file.allow=always clone \
+		--ref-storage-format=helper://testgit \
+		--recurse-submodules supersrc superclone &&
+	echo helper://testgit >expect &&
+	git -C superclone/sub config extensions.refStorage >actual &&
+	test_cmp expect actual &&
+	test_path_is_dir superclone/.git/modules/sub/helper-refs &&
+	git -C subsrc rev-parse HEAD >expect &&
+	git -C superclone/sub rev-parse HEAD >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'submodule update --ref-storage-format keeps references in the helper' '
+	test_when_finished "rm -rf superclone" &&
+	git clone supersrc superclone &&
+	git -C superclone -c protocol.file.allow=always \
+		submodule update --init --ref-storage-format=testgit &&
+	echo helper://testgit >expect &&
+	git -C superclone/sub config extensions.refStorage >actual &&
+	test_cmp expect actual &&
+	git -C subsrc rev-parse HEAD >expect &&
+	git -C superclone/sub rev-parse HEAD >actual &&
+	test_cmp expect actual
+'
+
 test_done
