@@ -1345,10 +1345,14 @@ int is_pseudo_ref(const char *refname);
 
 /*
  * Migrate the ref storage format used by the repository to the
- * specified one.
+ * specified one. The payload is the one of the new format's reference
+ * storage URI, like the name of a helper; a format that keeps references
+ * as files in a directory takes none, and keeps the alternate directory
+ * the repository uses, if any.
  */
 int repo_migrate_ref_storage_format(struct repository *repo,
 				    enum ref_storage_format format,
+				    const char *payload,
 				    unsigned int flags,
 				    struct strbuf *err);
 

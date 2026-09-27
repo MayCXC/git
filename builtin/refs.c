@@ -42,6 +42,7 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 	};
 	const char *format_str = NULL;
 	enum ref_storage_format format;
+	char *payload = NULL;
 	unsigned int flags = 0;
 	struct option options[] = {
 		OPT_STRING_F(0, "ref-storage-format", &format_str, N_("format"),
@@ -65,19 +66,20 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 	if (!format_str)
 		usage(_("missing --ref-storage-format=<format>"));
 
-	format = ref_storage_format_by_name(format_str);
+	format = ref_storage_format_by_uri(format_str, &payload);
 	if (format == REF_STORAGE_FORMAT_UNKNOWN) {
 		err = error(_("unknown ref storage format '%s'"), format_str);
 		goto out;
 	}
 
-	if (repo->ref_storage_format == format) {
-		err = error(_("repository already uses '%s' format"),
-			    ref_storage_format_to_name(format));
+	if (repo->ref_storage_format == format &&
+	    (!payload || (repo->ref_storage_payload &&
+			  !strcmp(payload, repo->ref_storage_payload)))) {
+		err = error(_("repository already uses '%s' format"), format_str);
 		goto out;
 	}
 
-	if (repo_migrate_ref_storage_format(repo, format, flags, &errbuf) < 0) {
+	if (repo_migrate_ref_storage_format(repo, format, payload, flags, &errbuf) < 0) {
 		err = error("%s", errbuf.buf);
 		goto out;
 	}
@@ -86,6 +88,7 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 
 out:
 	strbuf_release(&errbuf);
+	free(payload);
 	return err;
 }
 

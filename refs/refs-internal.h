@@ -406,6 +406,14 @@ struct ref_store;
 struct ref_store_init_options {
 	/* The kind of operations that the ref_store is allowed to perform. */
 	unsigned int access_flags;
+
+	/*
+	 * The store is not one of the repository's own but stands alone at
+	 * its gitdir, like the destination of a migration. The helper backend
+	 * then runs a process of its own for it, rather than sharing the
+	 * repository's.
+	 */
+	unsigned int standalone;
 };
 
 /*

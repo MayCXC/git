@@ -60,6 +60,8 @@ struct helper_ref_store {
 	struct helper_process *wt_hp;
 	struct strmap worktree_helpers;
 	unsigned int store_flags;
+	/* main_hp is this store's own process rather than the repository's. */
+	unsigned int owns_main_hp;
 
 	/*
 	 * Options used when writing references. These are parsed from the
@@ -212,6 +214,31 @@ static struct ref_store *helper_ref_store_init(struct repository *repo,
 	refs->store_flags = opts->access_flags;
 	strmap_init(&refs->worktree_helpers);
 
+	if (opts->standalone) {
+		/*
+		 * A store standing alone at its gitdir, like a migration
+		 * destination, runs a private process there and has no linked
+		 * worktrees.
+		 */
+		refs->main_hp = xcalloc(1, sizeof(*refs->main_hp));
+		helper_process_init(refs->main_hp, name, gitdir,
+				    ref_helper_capabilities);
+		refs->owns_main_hp = 1;
+		return &refs->base;
+	}
+
+	/*
+	 * The repository's process was started for the helper of its ref
+	 * store at the time. Only a migration changes that helper, after
+	 * releasing the store the process served, so a process for another
+	 * helper has no store left and gives way to this one's.
+	 */
+	if (repo->ref_local_helper && repo->ref_local_helper->name &&
+	    strcmp(repo->ref_local_helper->name, name)) {
+		helper_process_release(repo->ref_local_helper);
+		FREE_AND_NULL(repo->ref_local_helper);
+	}
+
 	/*
 	 * Set up helper processes matching reftable's two-backend model.
 	 *
@@ -251,10 +278,15 @@ static void helper_ref_store_release(struct ref_store *ref_store)
 		(struct helper_ref_store *)ref_store;
 
 	/*
-	 * main_hp is repo->ref_local_helper, which the repository releases
-	 * after its ref stores. wt_hp is owned by this ref store (allocated in
-	 * init for linked worktrees), so release it here.
+	 * main_hp is normally repo->ref_local_helper, which the repository
+	 * releases after its ref stores; a standalone store owns its own.
+	 * wt_hp is owned by this ref store (allocated in init for linked
+	 * worktrees), so release it here.
 	 */
+	if (refs->owns_main_hp) {
+		helper_process_release(refs->main_hp);
+		FREE_AND_NULL(refs->main_hp);
+	}
 	if (refs->wt_hp) {
 		helper_process_release(refs->wt_hp);
 		free(refs->wt_hp);

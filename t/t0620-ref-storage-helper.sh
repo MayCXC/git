@@ -504,4 +504,123 @@ test_expect_success 'create with a reflog message and no old precondition is not
 	)
 '
 
+# Record every ref with its value or symref target, and the reflogs of HEAD
+# and the branches, to compare a repository before and after a migration.
+snapshot_refs () {
+	git -C "$1" for-each-ref --include-root-refs \
+		--format="%(refname) %(objectname) %(symref)" >"$2" &&
+	for ref in HEAD refs/heads/main refs/heads/other
+	do
+		git -C "$1" reflog show --format="%H %gs" $ref >>"$2" || return 1
+	done
+}
+
+setup_migration_repo () {
+	git init --ref-storage-format="$2" "$1" &&
+	test_commit -C "$1" first &&
+	test_commit -C "$1" second &&
+	git -C "$1" branch other HEAD~ &&
+	git -C "$1" tag -a -m annotated v1 &&
+	snapshot_refs "$1" expect
+}
+
+for from in files reftable
+do
+	test_expect_success "refs migrate: $from -> helper" '
+		test_when_finished "rm -rf repo" &&
+		setup_migration_repo repo $from &&
+		git -C repo refs migrate --ref-storage-format=testgit &&
+		echo helper://testgit >expect-format &&
+		git -C repo config extensions.refStorage >actual-format &&
+		test_cmp expect-format actual-format &&
+		snapshot_refs repo actual &&
+		test_cmp expect actual &&
+		echo "this repository uses the helper format" >expect-stub &&
+		test_cmp expect-stub repo/.git/refs/heads &&
+		test_path_is_missing repo/.git/packed-refs &&
+		test_path_is_missing repo/.git/reftable &&
+		ls repo/.git >entries &&
+		test_grep ! ref_migration entries
+	'
+
+	test_expect_success "refs migrate: helper -> $from" '
+		test_when_finished "rm -rf repo" &&
+		setup_migration_repo repo helper://testgit &&
+		git -C repo refs migrate --ref-storage-format=$from &&
+		echo $from >expect-format &&
+		git -C repo rev-parse --show-ref-storage-format >actual-format &&
+		test_cmp expect-format actual-format &&
+		if test $from = files
+		then
+			test_must_fail git -C repo config extensions.refStorage
+		else
+			echo $from >expect-config &&
+			git -C repo config extensions.refStorage >actual-config &&
+			test_cmp expect-config actual-config
+		fi &&
+		snapshot_refs repo actual &&
+		test_cmp expect actual &&
+		test_path_is_missing repo/.git/helper-refs &&
+		test_path_is_missing repo/.git/helper-reflogs
+	'
+done
+
+test_expect_success 'refs migrate: helper -> another helper' '
+	test_when_finished "rm -rf repo bin" &&
+	mkdir bin &&
+	ln -s "$TEST_DIRECTORY/t0620/git-local-testgit" bin/git-local-testgit2 &&
+	setup_migration_repo repo helper://testgit &&
+	(
+		PATH="$(pwd)/bin:$PATH" &&
+		export PATH &&
+		git -C repo refs migrate --ref-storage-format=testgit2 &&
+		echo helper://testgit2 >expect-format &&
+		git -C repo config extensions.refStorage >actual-format &&
+		test_cmp expect-format actual-format &&
+		snapshot_refs repo actual
+	) &&
+	test_cmp expect actual
+'
+
+test_expect_success 'refs migrate: --no-reflog drops reflogs into the helper' '
+	test_when_finished "rm -rf repo" &&
+	setup_migration_repo repo files &&
+	git -C repo refs migrate --ref-storage-format=testgit --no-reflog &&
+	git -C repo rev-parse refs/heads/main refs/heads/other &&
+	git -C repo reflog --all >reflogs &&
+	test_must_be_empty reflogs
+'
+
+test_expect_success 'refs migrate: --dry-run to a helper leaves the source unchanged' '
+	test_when_finished "rm -rf repo" &&
+	setup_migration_repo repo files &&
+	git -C repo refs migrate --ref-storage-format=testgit --dry-run >out &&
+	test_grep "dry-run migration" out &&
+	dir=$(sed -n "s/.*found at .\(.*\).$/\1/p" out) &&
+	test_path_is_file "repo/$dir/helper-refs/refs_heads_main" &&
+	test_must_fail git -C repo config extensions.refStorage &&
+	test_path_is_missing repo/.git/helper-refs &&
+	snapshot_refs repo actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'refs migrate: an unknown helper fails and leaves the source intact' '
+	test_when_finished "rm -rf repo" &&
+	setup_migration_repo repo files &&
+	test_must_fail git -C repo refs migrate --ref-storage-format=nonexistent 2>err &&
+	test_grep "unable to start helper .nonexistent." err &&
+	test_must_fail git -C repo config extensions.refStorage &&
+	snapshot_refs repo actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'refs migrate: migration to the same helper fails' '
+	test_when_finished "rm -rf repo" &&
+	create_ref_helper_repo repo &&
+	test_must_fail git -C repo refs migrate --ref-storage-format=testgit 2>err &&
+	test_grep "already uses .testgit. format" err &&
+	test_must_fail git -C repo refs migrate --ref-storage-format=helper://testgit 2>err &&
+	test_grep "already uses .helper://testgit. format" err
+'
+
 test_done

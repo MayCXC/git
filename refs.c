@@ -6,6 +6,7 @@
 #include "abspath.h"
 #include "advice.h"
 #include "config.h"
+#include "dir.h"
 #include "environment.h"
 #include "strmap.h"
 #include "gettext.h"
@@ -3306,6 +3307,64 @@ static int migrate_one_reflog(const char *refname, void *cb_data)
 					migrate_one_reflog_entry, migration_data);
 }
 
+/*
+ * Copy every reference from one ref store into another that holds none yet,
+ * with their reflogs unless REPO_MIGRATE_REF_STORAGE_FORMAT_SKIP_REFLOG is
+ * given.
+ */
+static int copy_refs(struct ref_store *from, struct ref_store *to,
+		     unsigned int flags, struct strbuf *errbuf)
+{
+	struct refs_for_each_ref_options for_each_ref_opts = {
+		.flags = REFS_FOR_EACH_INCLUDE_ROOT_REFS | REFS_FOR_EACH_INCLUDE_BROKEN,
+	};
+	struct migration_data data = {
+		.old_refs = from,
+		.errbuf = errbuf,
+		.sb = STRBUF_INIT,
+		.name = STRBUF_INIT,
+		.mail = STRBUF_INIT,
+	};
+	int ret;
+
+	data.transaction = ref_store_transaction_begin(to, REF_TRANSACTION_FLAG_INITIAL,
+						       errbuf);
+	if (!data.transaction) {
+		ret = -1;
+		goto done;
+	}
+
+	/*
+	 * We need to use `refs_for_each_ref_ext()` here so that we can
+	 * also include broken refs and symrefs. These would otherwise be
+	 * skipped silently.
+	 *
+	 * Ideally, we would do this call while locking the old ref storage
+	 * such that there cannot be any concurrent modifications. We do not
+	 * have the infra for that though, and the "files" backend does not
+	 * allow for a central lock due to its design. It's thus on the user to
+	 * ensure that there are no concurrent writes.
+	 */
+	ret = refs_for_each_ref_ext(from, migrate_one_ref, &data, &for_each_ref_opts);
+	if (ret < 0)
+		goto done;
+
+	if (!(flags & REPO_MIGRATE_REF_STORAGE_FORMAT_SKIP_REFLOG)) {
+		ret = refs_for_each_reflog(from, migrate_one_reflog, &data);
+		if (ret < 0)
+			goto done;
+	}
+
+	ret = ref_transaction_commit(data.transaction, errbuf);
+
+done:
+	ref_transaction_free(data.transaction);
+	strbuf_release(&data.sb);
+	strbuf_release(&data.name);
+	strbuf_release(&data.mail);
+	return ret;
+}
+
 static int move_files(const char *from_path, const char *to_path, struct strbuf *errbuf)
 {
 	struct strbuf from_buf = STRBUF_INIT, to_buf = STRBUF_INIT;
@@ -3390,24 +3449,46 @@ static int has_worktrees(struct repository *repo)
 
 int repo_migrate_ref_storage_format(struct repository *repo,
 				    enum ref_storage_format format,
+				    const char *payload,
 				    unsigned int flags,
 				    struct strbuf *errbuf)
 {
-	struct ref_store *old_refs = NULL, *new_refs = NULL;
-	struct refs_for_each_ref_options for_each_ref_opts = {
-		.flags = REFS_FOR_EACH_INCLUDE_ROOT_REFS | REFS_FOR_EACH_INCLUDE_BROKEN,
+	const struct ref_storage_be *be = find_ref_storage_backend(format);
+	struct ref_store_init_options init_opts = {
+		.access_flags = REF_STORE_ALL_CAPS,
+		.standalone = 1,
 	};
-	struct ref_transaction *transaction = NULL;
+	struct ref_store *old_refs = NULL, *new_refs = NULL, *final_refs = NULL;
 	struct strbuf new_gitdir = STRBUF_INIT;
-	struct migration_data data = {
-		.sb = STRBUF_INIT,
-		.name = STRBUF_INIT,
-		.mail = STRBUF_INIT,
-	};
+	char *new_payload = NULL;
+	const char *new_dir;
 	int did_migrate_refs = 0;
 	int ret;
 
-	if (repo->ref_storage_format == format) {
+	if (!be)
+		BUG("reference backend is unknown");
+
+	/*
+	 * A backend that keeps references as files in a directory takes the
+	 * alternate directory the repository keeps them in, if any, which the
+	 * migration leaves where it is. Any other backend takes the payload it
+	 * is given, like the name of the helper a "helper://<name>" destination
+	 * runs.
+	 */
+	if (be->uses_refdir) {
+		if (payload) {
+			strbuf_addstr(errbuf, "migrating to an alternate reference directory is not supported");
+			ret = -1;
+			goto done;
+		}
+		new_payload = xstrdup_or_null(repo_alternate_refdir(repo));
+	} else {
+		new_payload = xstrdup_or_null(payload);
+	}
+
+	if (repo->ref_storage_format == format &&
+	    !strcmp(new_payload ? new_payload : "",
+		    repo->ref_storage_payload ? repo->ref_storage_payload : "")) {
 		strbuf_addstr(errbuf, "current and new ref storage format are equal");
 		ret = -1;
 		goto done;
@@ -3448,11 +3529,18 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 	 *      in the new ref storage it's okay(ish) if we now get interrupted
 	 *      as there is an equivalent copy of all refs available.
 	 *
-	 *   6. Move the new ref storage files into place.
+	 *   6. Move the new ref storage files into place. A backend that does
+	 *      not keep references as files in a directory cannot be moved,
+	 *      so its references are copied into a store at the gitdir instead.
 	 *
 	 *  7. Change the repository format to the new ref format.
 	 */
-	strbuf_addf(&new_gitdir, "%s/%s", old_refs->gitdir, "ref_migration.XXXXXX");
+	/*
+	 * The new ref storage belongs in the alternate directory it shares with
+	 * the old one, and otherwise in the gitdir.
+	 */
+	new_dir = be->uses_refdir && new_payload ? old_refs->gitdir : repo->gitdir;
+	strbuf_addf(&new_gitdir, "%s/%s", new_dir, "ref_migration.XXXXXX");
 	if (!mkdtemp(new_gitdir.buf)) {
 		strbuf_addf(errbuf, "cannot create migration directory: %s",
 			    strerror(errno));
@@ -3460,43 +3548,17 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		goto done;
 	}
 
-	new_refs = ref_store_init(repo, format, new_gitdir.buf,
-				  REF_STORE_ALL_CAPS);
+	/*
+	 * The new ref store is none of the repository's own yet, so it takes
+	 * the payload of the new format rather than the repository's, and
+	 * stands alone at the migration directory.
+	 */
+	new_refs = be->init(repo, new_payload, new_gitdir.buf, &init_opts);
 	ret = ref_store_create_on_disk(new_refs, 0, errbuf);
 	if (ret < 0)
 		goto done;
 
-	transaction = ref_store_transaction_begin(new_refs, REF_TRANSACTION_FLAG_INITIAL,
-						  errbuf);
-	if (!transaction)
-		goto done;
-
-	data.old_refs = old_refs;
-	data.transaction = transaction;
-	data.errbuf = errbuf;
-
-	/*
-	 * We need to use `refs_for_each_ref_ext()` here so that we can
-	 * also include broken refs and symrefs. These would otherwise be
-	 * skipped silently.
-	 *
-	 * Ideally, we would do this call while locking the old ref storage
-	 * such that there cannot be any concurrent modifications. We do not
-	 * have the infra for that though, and the "files" backend does not
-	 * allow for a central lock due to its design. It's thus on the user to
-	 * ensure that there are no concurrent writes.
-	 */
-	ret = refs_for_each_ref_ext(old_refs, migrate_one_ref, &data, &for_each_ref_opts);
-	if (ret < 0)
-		goto done;
-
-	if (!(flags & REPO_MIGRATE_REF_STORAGE_FORMAT_SKIP_REFLOG)) {
-		ret = refs_for_each_reflog(old_refs, migrate_one_reflog, &data);
-		if (ret < 0)
-			goto done;
-	}
-
-	ret = ref_transaction_commit(transaction, errbuf);
+	ret = copy_refs(old_refs, new_refs, flags, errbuf);
 	if (ret < 0)
 		goto done;
 	did_migrate_refs = 1;
@@ -3532,19 +3594,47 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 	if (ret < 0)
 		goto done;
 
-	ret = move_files(new_gitdir.buf, old_refs->gitdir, errbuf);
-	if (ret < 0)
-		goto done;
+	if (be->uses_refdir) {
+		ret = move_files(new_gitdir.buf, new_dir, errbuf);
+		if (ret < 0)
+			goto done;
 
-	if (rmdir(new_gitdir.buf) < 0)
-		warning_errno(_("could not remove temporary migration directory '%s'"),
-			      new_gitdir.buf);
+		if (rmdir(new_gitdir.buf) < 0)
+			warning_errno(_("could not remove temporary migration directory '%s'"),
+				      new_gitdir.buf);
+	} else {
+		/*
+		 * Whatever keeps these references may keep other data at the
+		 * gitdir too, like a helper that stores objects there as well,
+		 * which moving its files into place would overwrite. Copy the
+		 * references into a store at the gitdir instead.
+		 */
+		new_refs = be->init(repo, new_payload, new_gitdir.buf, &init_opts);
+		final_refs = be->init(repo, new_payload, repo->gitdir, &init_opts);
+		ret = ref_store_create_on_disk(final_refs, 0, errbuf);
+		if (ret < 0)
+			goto done;
+
+		ret = copy_refs(new_refs, final_refs, flags, errbuf);
+		if (ret < 0)
+			goto done;
+
+		ref_store_release(final_refs);
+		FREE_AND_NULL(final_refs);
+		ref_store_release(new_refs);
+		FREE_AND_NULL(new_refs);
+
+		if (remove_dir_recursively(&new_gitdir, 0) < 0)
+			warning_errno(_("could not remove temporary migration directory '%s'"),
+				      new_gitdir.buf);
+	}
 
 	/*
 	 * We have migrated the repository, so we now need to adjust the
 	 * repository format so that clients will use the new ref store.
 	 * We also need to swap out the repository's main ref store.
 	 */
+	repo_set_ref_storage_format(repo, format, new_payload);
 	initialize_repository_version(repo, hash_algo_by_ptr(repo->hash_algo), format, 1);
 
 	/*
@@ -3565,15 +3655,16 @@ done:
 			    new_gitdir.buf);
 	}
 
+	if (final_refs) {
+		ref_store_release(final_refs);
+		free(final_refs);
+	}
 	if (new_refs) {
 		ref_store_release(new_refs);
 		free(new_refs);
 	}
-	ref_transaction_free(transaction);
 	strbuf_release(&new_gitdir);
-	strbuf_release(&data.sb);
-	strbuf_release(&data.name);
-	strbuf_release(&data.mail);
+	free(new_payload);
 	return ret;
 }
 
