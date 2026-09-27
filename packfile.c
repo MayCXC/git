@@ -1401,6 +1401,22 @@ int packed_object_info_with_index_pos(struct odb_source_packed *source,
 		type = unpack_object_header(p, &w_curs, &curpos, &size);
 	}
 
+	if (oi->delta_sizep) {
+		off_t pos = obj_offset;
+		size_t in_pack_size;
+		enum object_type in_pack_type =
+			unpack_object_header(p, &w_curs, &pos, &in_pack_size);
+
+		if (in_pack_type == OBJ_OFS_DELTA || in_pack_type == OBJ_REF_DELTA)
+			*oi->delta_sizep = in_pack_size;
+		else if (in_pack_type > OBJ_NONE)
+			*oi->delta_sizep = 0;
+		else {
+			ret = -1;
+			goto out;
+		}
+	}
+
 	if (!oi->contentp && oi->sizep) {
 		if (type == OBJ_OFS_DELTA || type == OBJ_REF_DELTA) {
 			off_t tmp_pos = curpos;

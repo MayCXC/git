@@ -203,9 +203,10 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	Reply with `<type> <size>` followed by the _<size>_ bytes of the
 	contents of the object, or `missing` if there is no such object. A
 	helper storing the object as a delta against another may add the
-	object ID of that other object to the first line, as
-	`<type> <size> <delta-base>`, which Git shows as the delta base of the
-	object.
+	object ID of that other object and the size of the delta to the first
+	line, as `<type> <size> <delta-base> <delta-size>`, which Git shows as
+	the delta base of the object, and which lets linkgit:git-pack-objects[1]
+	send the delta as it is stored when it sends the delta base too.
 
 `info <oid>`::
 	Reply as `get` does, without the contents. Git sends it only to a
@@ -248,6 +249,17 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	only to a helper advertising `put-raw`, as it moves the objects of a
 	packfile into the helper, and otherwise sends `put`; it sends
 	_<replace>_ only to a helper advertising `replace`.
+
+`get-raw <oid>`::
+	Reply with the object as the helper stores it, in the form `put-raw`
+	gives it: `<type> <size> <delta-base> <compressed-size>` followed by
+	the _<compressed-size>_ bytes, or `missing` if there is no such object.
+	A helper that does not keep the compressed bytes of an object may
+	compress its contents to reply. Git sends it, only to a helper
+	advertising `get-raw`, when linkgit:git-pack-objects[1] writes the
+	object into a packfile, so that the object goes into the packfile
+	without being inflated and compressed again, and otherwise sends
+	`get`.
 
 `list-objects [--promisor-only] [<prefix>]`::
 	List the objects stored whose IDs start with the hexadecimal

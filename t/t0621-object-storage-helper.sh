@@ -690,6 +690,64 @@ test_expect_success 'clone --no-local serves a pack generated from the helper' '
 	git -C served fsck
 '
 
+test_expect_success 'setup a helper repository storing a delta' '
+	create_helper_repo sender &&
+	test_seq 1 300 >sender/f &&
+	git -C sender add f &&
+	git -C sender commit -m one &&
+	test_seq 1 301 >sender/f &&
+	git -C sender commit -am two &&
+	git -C sender gc &&
+	git -C sender cat-file --batch-all-objects \
+		--batch-check="%(objectname) %(deltabase)" >objects &&
+	grep -v " $ZERO_OID\$" objects >deltas &&
+	test_line_count = 1 deltas
+'
+
+test_expect_success 'a pack generated from the helper carries its stored delta as it is' '
+	test_when_finished "rm -rf received sendlog" &&
+	read delta base <deltas &&
+	echo HEAD |
+	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/sendlog" \
+		git -C sender pack-objects --revs --stdout >sent.pack &&
+	test_grep "^get-raw $delta\$" sendlog &&
+	test_grep ! "^get $delta\$" sendlog &&
+	test_grep "^get-raw $base\$" sendlog &&
+	git init received &&
+	git -C received index-pack --stdin <sent.pack &&
+	echo $base >expect &&
+	echo $delta | git -C received cat-file --batch-check="%(deltabase)" >actual &&
+	test_cmp expect actual &&
+	git -C received fsck --strict
+'
+
+test_expect_success 'a helper without get-raw has its objects packed from their contents' '
+	test_when_finished "rm -rf received sendlog" &&
+	read delta base <deltas &&
+	echo HEAD |
+	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/sendlog" \
+	GIT_LOCAL_TESTGIT_CAPABILITIES="get info put have list-objects" \
+		git -C sender pack-objects --revs --stdout >sent.pack &&
+	test_grep ! "^get-raw " sendlog &&
+	test_grep "^get $delta\$" sendlog &&
+	git init received &&
+	git -C received index-pack --stdin <sent.pack &&
+	git -C received cat-file -e $delta &&
+	git -C received fsck --strict
+'
+
+test_expect_success 'pack-objects --no-reuse-delta computes the deltas of the helper anew' '
+	test_when_finished "rm -rf received sendlog" &&
+	read delta base <deltas &&
+	echo HEAD |
+	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/sendlog" \
+		git -C sender pack-objects --revs --no-reuse-delta --stdout >sent.pack &&
+	test_grep ! "^get-raw $delta\$" sendlog &&
+	git init received &&
+	git -C received index-pack --stdin <sent.pack &&
+	git -C received fsck --strict
+'
+
 test_expect_success 'a local clone of the helper repository fetches its objects' '
 	test_when_finished "rm -rf localclone" &&
 	git clone store localclone &&

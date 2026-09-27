@@ -43,6 +43,7 @@ enum object_helper_capability {
 	OBJECT_HELPER_REPLACE = (1 << 13),
 	OBJECT_HELPER_FRESHEN = (1 << 14),
 	OBJECT_HELPER_PRUNE = (1 << 15),
+	OBJECT_HELPER_GET_RAW = (1 << 16),
 };
 
 static const struct helper_capability object_helper_capabilities[] = {
@@ -62,6 +63,7 @@ static const struct helper_capability object_helper_capabilities[] = {
 	{ "replace", OBJECT_HELPER_REPLACE },
 	{ "freshen", OBJECT_HELPER_FRESHEN },
 	{ "prune", OBJECT_HELPER_PRUNE },
+	{ "get-raw", OBJECT_HELPER_GET_RAW },
 	{ NULL },
 };
 
@@ -124,16 +126,20 @@ static int parse_type_and_size(const char *p, enum object_type *type,
 
 /*
  * Parse the header of an "info" or "get" reply, "<type> <size>", followed by
- * " <delta-base>" for an object the helper stores as a delta against another.
- * Returns 1 for an object, 0 for "missing" and -1 for anything else.
+ * " <delta-base> <delta-size>" for an object the helper stores as a delta
+ * against another. Returns 1 for an object, 0 for "missing" and -1 for
+ * anything else.
  */
 static int parse_object_header(struct odb_source_helper *helper,
 			       const char *line, enum object_type *type,
-			       size_t *size, struct object_id *delta_base)
+			       size_t *size, struct object_id *delta_base,
+			       size_t *delta_size)
 {
 	const struct git_hash_algo *algo = helper->base.odb->repo->hash_algo;
 	struct object_id base;
+	uintmax_t parsed;
 	const char *p;
+	char *end;
 
 	if (!strcmp(line, "missing"))
 		return 0;
@@ -143,12 +149,21 @@ static int parse_object_header(struct odb_source_helper *helper,
 	if (!*p) {
 		if (delta_base)
 			oidclr(delta_base, algo);
+		if (delta_size)
+			*delta_size = 0;
 		return 1;
 	}
-	if (*p != ' ' || parse_oid_hex_algop(p + 1, &base, &p, algo) || *p)
+	if (*p != ' ' || parse_oid_hex_algop(p + 1, &base, &p, algo) ||
+	    *p != ' ')
+		return -1;
+	errno = 0;
+	parsed = strtoumax(p + 1, &end, 10);
+	if (errno || end == p + 1 || *end || !parsed || parsed > SIZE_MAX)
 		return -1;
 	if (delta_base)
 		oidcpy(delta_base, &base);
+	if (delta_size)
+		*delta_size = parsed;
 	return 1;
 }
 
@@ -222,7 +237,8 @@ static enum odb_read_status helper_read_object(struct odb_source_helper *helper,
 	}
 
 	found = parse_object_header(helper, line.buf, &type, &size,
-				    oi ? oi->delta_base_oid : NULL);
+				    oi ? oi->delta_base_oid : NULL,
+				    oi ? oi->delta_sizep : NULL);
 	if (found <= 0) {
 		ret = found ? ODB_READ_ERROR : ODB_READ_NOT_FOUND;
 		if (found && errmsg)
@@ -329,7 +345,7 @@ static int helper_read_object_stream(struct odb_source_helper *helper,
 		strbuf_release(&line);
 		return -1;
 	}
-	found = parse_object_header(helper, line.buf, &type, &size, NULL);
+	found = parse_object_header(helper, line.buf, &type, &size, NULL, NULL);
 	strbuf_release(&line);
 	if (found <= 0) {
 		if (found)
@@ -388,6 +404,67 @@ static int odb_source_helper_read_object_stream(struct odb_stream **out,
 	if (!helper_read_object_stream(helper, out, oid))
 		return 0;
 	return odb_source_read_object_stream(out, &helper->files->base, oid);
+}
+
+/*
+ * Read the object as the helper stores it, which "get-raw" answers as
+ * "put-raw" gives it: "<type> <size> <delta-base> <compressed-size>", with a
+ * <delta-base> of "0" for an object stored whole, followed by the
+ * compressed bytes.
+ */
+static int odb_source_helper_read_object_raw(struct odb_source *source,
+					     const struct object_id *oid,
+					     struct packed_raw_entry *entry)
+{
+	struct odb_source_helper *helper = odb_source_helper_downcast(source);
+	const struct git_hash_algo *algo = source->odb->repo->hash_algo;
+	struct helper_process *hp;
+	struct strbuf line = STRBUF_INIT;
+	uintmax_t data_len;
+	const char *p;
+	char *end;
+	int ret = -1;
+
+	memset(entry, 0, sizeof(*entry));
+	if (!capable(helper, OBJECT_HELPER_GET_RAW))
+		return 1;
+
+	hp = started(helper);
+	helper_process_send(hp, "get-raw %s\n", oid_to_hex(oid));
+	if (helper_process_readline(hp, &line) == EOF) {
+		drop_connection(helper);
+		goto out;
+	}
+	if (!strcmp(line.buf, "missing")) {
+		ret = 1;
+		goto out;
+	}
+
+	if (parse_type_and_size(line.buf, &entry->type, &entry->size, &p) ||
+	    *p++ != ' ')
+		goto malformed;
+	if (skip_prefix(p, "0 ", &p))
+		oidclr(&entry->delta_base, algo);
+	else if (parse_oid_hex_algop(p, &entry->delta_base, &p, algo) ||
+		 *p++ != ' ')
+		goto malformed;
+	errno = 0;
+	data_len = strtoumax(p, &end, 10);
+	if (errno || end == p || *end || data_len > SIZE_MAX)
+		goto malformed;
+
+	entry->data_len = data_len;
+	entry->data = read_payload(helper, entry->data_len);
+	if (entry->data)
+		ret = 0;
+	goto out;
+
+malformed:
+	error(_("helper '%s' sent a malformed reply: %s"), hp->name, line.buf);
+	drop_connection(helper);
+out:
+	strbuf_release(&line);
+	return ret;
 }
 
 struct listed_object {
@@ -516,7 +593,8 @@ static int for_each_helper_object(struct odb_source_helper *helper,
 
 		if (!request) {
 			ret = cb(oid, NULL, cb_data);
-		} else if (request->contentp || request->delta_base_oid) {
+		} else if (request->contentp || request->delta_base_oid ||
+			   request->delta_sizep) {
 			/* The listing tells neither contents nor deltas. */
 			oi = *request;
 			if (helper_read_object(helper, &objects[i].oid, &oi, 0, NULL) < 0) {
@@ -1807,6 +1885,7 @@ struct odb_source_helper *odb_source_helper_new(struct object_database *odb,
 	helper->base.prune = odb_source_helper_prune;
 	helper->base.read_object_info = odb_source_helper_read_object_info;
 	helper->base.read_object_stream = odb_source_helper_read_object_stream;
+	helper->base.read_object_raw = odb_source_helper_read_object_raw;
 	helper->base.for_each_object = odb_source_helper_for_each_object;
 	helper->base.count_objects = odb_source_helper_count_objects;
 	helper->base.find_abbrev_len = odb_source_helper_find_abbrev_len;

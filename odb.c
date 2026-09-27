@@ -730,6 +730,20 @@ int odb_read_object_info(struct object_database *odb,
 	return type;
 }
 
+int odb_read_object_raw(struct object_database *odb,
+			const struct object_id *oid,
+			struct packed_raw_entry *entry)
+{
+	struct odb_source *source;
+
+	for (source = odb->sources; source; source = source->next) {
+		int ret = odb_source_read_object_raw(source, oid, entry);
+		if (ret <= 0)
+			return ret;
+	}
+	return 1;
+}
+
 int odb_pretend_object(struct object_database *odb,
 		       void *buf, size_t len, enum object_type type,
 		       struct object_id *oid)

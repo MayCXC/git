@@ -173,6 +173,24 @@ struct odb_source {
 				  const struct object_id *oid);
 
 	/*
+	 * This callback is expected to read the object identified by the
+	 * given ID as the source stores it, the way a packfile entry keeps an
+	 * object: its compressed contents, or a compressed delta against
+	 * another object. This lets the object be handed on as it is stored,
+	 * without inflating and compressing it again.
+	 *
+	 * This callback is optional. Sources whose objects git-pack-objects(1)
+	 * reads from their packfiles itself shall leave it unset.
+	 *
+	 * The callback is expected to return 0 on success, in which case the
+	 * caller frees `entry->data`, a positive value in case the source does
+	 * not store the object, and a negative error code otherwise.
+	 */
+	int (*read_object_raw)(struct odb_source *source,
+			       const struct object_id *oid,
+			       struct packed_raw_entry *entry);
+
+	/*
 	 * This callback is expected to iterate over all objects stored in this
 	 * source and invoke the callback function for each of them. It is
 	 * valid to yield the same object multiple time. A non-zero exit code
@@ -464,6 +482,21 @@ static inline int odb_source_read_object_stream(struct odb_stream **out,
 						const struct object_id *oid)
 {
 	return source->read_object_stream(out, source, oid);
+}
+
+/*
+ * Read the given object as the source stores it, the way a packfile entry
+ * keeps an object. Returns 0 on success, in which case the caller frees
+ * `entry->data`, a positive value in case the source does not store the
+ * object this way, and a negative error code otherwise.
+ */
+static inline int odb_source_read_object_raw(struct odb_source *source,
+					     const struct object_id *oid,
+					     struct packed_raw_entry *entry)
+{
+	if (!source->read_object_raw)
+		return 1;
+	return source->read_object_raw(source, oid, entry);
 }
 
 /*

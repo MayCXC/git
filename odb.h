@@ -13,6 +13,7 @@ struct cached_object_entry;
 struct list_objects_filter_options;
 struct odb_source_inmemory;
 struct packed_git;
+struct packed_raw_entry;
 struct repository;
 struct strbuf;
 struct strvec;
@@ -406,6 +407,12 @@ struct object_info {
 	 */
 	struct object_id *delta_base_oid;
 
+	/*
+	 * The size of the delta the object is stored as, in case it is stored
+	 * as a delta, and zero otherwise.
+	 */
+	size_t *delta_sizep;
+
 	/* The object contents. Ownership of memory goes over to the caller. */
 	void **contentp;
 
@@ -506,6 +513,18 @@ enum odb_read_status odb_read_object_info_extended(struct object_database *odb,
 int odb_read_object_info(struct object_database *odb,
 			 const struct object_id *oid,
 			 size_t *sizep);
+
+/*
+ * Read the given object as the source storing it keeps it, the way a
+ * packfile entry keeps an object (see `struct packed_raw_entry`), so that it
+ * can be handed on without inflating and compressing it again. Returns 0 on
+ * success, in which case the caller frees `entry->data`, a positive value in
+ * case no source stores the object this way outside of its packfiles, and a
+ * negative error code otherwise.
+ */
+int odb_read_object_raw(struct object_database *odb,
+			const struct object_id *oid,
+			struct packed_raw_entry *entry);
 
 enum odb_has_object_flags {
 	/* Retry packed storage after checking packed and loose storage */
