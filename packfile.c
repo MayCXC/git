@@ -252,6 +252,28 @@ struct packed_git *parse_pack_index(struct repository *r, unsigned char *sha1,
 	return p;
 }
 
+struct packed_git *packed_git_from_index(struct repository *r,
+					 const char *pack_name,
+					 void *index, size_t index_size,
+					 off_t pack_size)
+{
+	const unsigned int hashsz = r->hash_algo->rawsz;
+	size_t alloc = st_add(strlen(pack_name), 1);
+	struct packed_git *p = alloc_packed_git(r, alloc);
+
+	memcpy(p->pack_name, pack_name, alloc); /* includes NUL */
+	if (load_idx(pack_name, hashsz, index, index_size, p)) {
+		free(p);
+		return NULL;
+	}
+	/* The index ends with the checksum of the pack and its own. */
+	hashcpy(p->hash, (unsigned char *)index + index_size - 2 * hashsz,
+		r->hash_algo);
+	p->pack_size = pack_size;
+	p->in_memory = 1;
+	return p;
+}
+
 static void scan_windows(struct packed_git *p,
 	struct packed_git **lru_p,
 	struct pack_window **lru_w,
@@ -331,7 +353,10 @@ int close_pack_fd(struct packed_git *p)
 void close_pack_index(struct packed_git *p)
 {
 	if (p->index_data) {
-		munmap((void *)p->index_data, p->index_size);
+		if (p->in_memory)
+			free((void *)p->index_data);
+		else
+			munmap((void *)p->index_data, p->index_size);
 		p->index_data = NULL;
 	}
 }
@@ -343,7 +368,10 @@ static void close_pack_revindex(struct packed_git *p)
 	if (!p->revindex_map)
 		return;
 
-	munmap((void *)p->revindex_map, p->revindex_size);
+	if (p->in_memory)
+		free((void *)p->revindex_map);
+	else
+		munmap((void *)p->revindex_map, p->revindex_size);
 	p->revindex_map = NULL;
 	p->revindex_data = NULL;
 }

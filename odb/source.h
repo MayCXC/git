@@ -5,6 +5,7 @@
 #include "object.h"
 #include "odb.h"
 #include "odb/transaction.h"
+#include "strbuf.h"
 
 enum odb_source_type {
 	/*
@@ -36,8 +37,8 @@ enum odb_source_type {
 const char *odb_source_type_to_name(enum odb_source_type type);
 
 struct object_id;
+struct odb_pack_bitmap;
 struct odb_stream;
-struct strbuf;
 struct strvec;
 
 struct odb_create_on_disk_options {
@@ -369,7 +370,50 @@ struct odb_source {
 	 */
 	int (*prune)(struct odb_source *source,
 		     const struct odb_prune_options *opts);
+
+	/*
+	 * This callback is expected to read the reachability bitmap the source
+	 * stores for its objects, as git-pack-objects(1) wrote it for a pack
+	 * holding them, along with the index and the reverse index of that
+	 * pack, which relate the bits to the objects, and the size the pack
+	 * had.
+	 *
+	 * This callback is optional. Sources that keep their bitmaps beside
+	 * their packs shall leave it unset.
+	 *
+	 * The callback is expected to return 0 when it read a bitmap, a
+	 * positive value when the source stores none, and a negative error code
+	 * otherwise.
+	 */
+	int (*read_pack_bitmap)(struct odb_source *source,
+				struct odb_pack_bitmap *out);
 };
+
+/*
+ * The reachability bitmap of a pack, which a source keeping its objects
+ * elsewhere than in that pack may store for them. The buffers hold what the
+ * '.bitmap', '.idx' and '.rev' files of the pack held; the reverse index is
+ * empty when the pack had none.
+ */
+struct odb_pack_bitmap {
+	struct strbuf bitmap;
+	struct strbuf index;
+	struct strbuf rev_index;
+	off_t pack_size;
+};
+
+#define ODB_PACK_BITMAP_INIT { \
+	.bitmap = STRBUF_INIT, \
+	.index = STRBUF_INIT, \
+	.rev_index = STRBUF_INIT, \
+}
+
+static inline void odb_pack_bitmap_release(struct odb_pack_bitmap *bitmap)
+{
+	strbuf_release(&bitmap->bitmap);
+	strbuf_release(&bitmap->index);
+	strbuf_release(&bitmap->rev_index);
+}
 
 /*
  * Allocate and initialize a new source for the given object database located
@@ -680,6 +724,19 @@ static inline int odb_source_prune(struct odb_source *source,
 	if (!source->prune)
 		return 0;
 	return source->prune(source, opts);
+}
+
+/*
+ * Read the reachability bitmap the source stores for its objects. Returns 0
+ * when it read one, a positive value when the source stores none, and a
+ * negative error code otherwise.
+ */
+static inline int odb_source_read_pack_bitmap(struct odb_source *source,
+					      struct odb_pack_bitmap *out)
+{
+	if (!source->read_pack_bitmap)
+		return 1;
+	return source->read_pack_bitmap(source, out);
 }
 
 #endif

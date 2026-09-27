@@ -8,10 +8,11 @@
 # "<type> <size>", followed by " <delta-base> <delta-size>" for an object
 # that arrived as a delta, a .raw file holding the compressed bytes of an
 # object that arrived by "put-raw", and a .promisor marker for promisor
-# objects), refs in helper-refs/, reflogs in helper-reflogs/ (refnames
-# encode '/' as '_').
+# objects), the reachability bitmap in helper-bitmap/, refs in
+# helper-refs/, reflogs in helper-reflogs/ (refnames encode '/' as '_').
 
 OBJDIR="$1/helper-objects"
+BITMAPDIR="$1/helper-bitmap"
 REFDIR="$1/helper-refs"
 REFLOGDIR="$1/helper-reflogs"
 mkdir -p "$OBJDIR" "$REFDIR" "$REFLOGDIR"
@@ -30,7 +31,7 @@ ON_COMMAND="${GIT_LOCAL_TESTGIT_ON_COMMAND:-}"
 # can exercise what git does without one.
 CAPABILITIES="${GIT_LOCAL_TESTGIT_CAPABILITIES:-get info put put-raw \
 replace get-raw put-stream have freshen list-objects promisor refresh \
-optimize prune verify read list transaction create remove reflog \
+optimize prune verify bitmap read list transaction create remove reflog \
 reflog-read-reverse}"
 
 while IFS= read -r line
@@ -254,6 +255,45 @@ do
 			fi
 		done
 		echo "$rc"
+		;;
+	put-bitmap\ *)
+		# put-bitmap <pack-size> <index-size> <reverse-index-size>
+		# <bitmap-size>, then the three one after another. git waits for
+		# the reply, so read them at once and split them up.
+		set -- $line
+		isize="$3" rsize="$4" bsize="$5"
+		rm -rf "$BITMAPDIR"
+		mkdir "$BITMAPDIR"
+		head -c $(($isize + $rsize + $bsize)) >"$BITMAPDIR/all"
+		if head -c "$isize" "$BITMAPDIR/all" >"$BITMAPDIR/idx" &&
+		   tail -c +$(($isize + 1)) "$BITMAPDIR/all" |
+		   head -c "$rsize" >"$BITMAPDIR/rev" &&
+		   tail -c +$(($isize + $rsize + 1)) "$BITMAPDIR/all" \
+			>"$BITMAPDIR/bitmap" &&
+		   rm "$BITMAPDIR/all" &&
+		   echo "$2" >"$BITMAPDIR/size"
+		then
+			echo ok
+		else
+			rm -rf "$BITMAPDIR"
+			echo "error cannot store the bitmap"
+		fi
+		;;
+	get-bitmap)
+		if test -f "$BITMAPDIR/size"
+		then
+			printf '%s %d %d %d\n' "$(cat "$BITMAPDIR/size")" \
+				"$(wc -c <"$BITMAPDIR/idx")" \
+				"$(wc -c <"$BITMAPDIR/rev")" \
+				"$(wc -c <"$BITMAPDIR/bitmap")"
+			cat "$BITMAPDIR/idx" "$BITMAPDIR/rev" "$BITMAPDIR/bitmap"
+		else
+			echo missing
+		fi
+		;;
+	remove-bitmap)
+		rm -rf "$BITMAPDIR"
+		echo ok
 		;;
 	read\ *)
 		refname="${line#read }"

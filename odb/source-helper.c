@@ -44,6 +44,7 @@ enum object_helper_capability {
 	OBJECT_HELPER_FRESHEN = (1 << 14),
 	OBJECT_HELPER_PRUNE = (1 << 15),
 	OBJECT_HELPER_GET_RAW = (1 << 16),
+	OBJECT_HELPER_BITMAP = (1 << 17),
 };
 
 static const struct helper_capability object_helper_capabilities[] = {
@@ -64,6 +65,7 @@ static const struct helper_capability object_helper_capabilities[] = {
 	{ "freshen", OBJECT_HELPER_FRESHEN },
 	{ "prune", OBJECT_HELPER_PRUNE },
 	{ "get-raw", OBJECT_HELPER_GET_RAW },
+	{ "bitmap", OBJECT_HELPER_BITMAP },
 	{ NULL },
 };
 
@@ -1330,12 +1332,116 @@ static int drain_files_store(struct odb_source_helper *helper)
 }
 
 /*
+ * Whether to write a reachability bitmap for the objects of the helper, as
+ * git-repack(1) decides when it packs all objects into one pack: as
+ * repack.writeBitmaps says, and by default in a bare repository, unless
+ * some objects are borrowed from alternates and would be missing from the
+ * pack. Returns 1 to write one, -1 to write one unless pack-objects finds it
+ * cannot, without saying so, and 0 not to.
+ */
+static int want_bitmap(struct odb_source_helper *helper)
+{
+	struct repository *repo = helper->base.odb->repo;
+	int write_bitmaps;
+
+	if (!capable(helper, OBJECT_HELPER_BITMAP))
+		return 0;
+	if (repo_config_get_bool(repo, "repack.writebitmaps", &write_bitmaps) &&
+	    repo_config_get_bool(repo, "pack.writebitmaps", &write_bitmaps))
+		write_bitmaps = is_bare_repository(repo) ? -1 : 0;
+	if (write_bitmaps && odb_has_alternates(repo->objects)) {
+		warning(_("disabling bitmap writing, as some objects are not being packed"));
+		write_bitmaps = 0;
+	}
+	return write_bitmaps;
+}
+
+/*
+ * Read the reachability bitmap pack-objects wrote beside `pack`, if it
+ * wrote one, with the index and reverse index of the pack.
+ */
+static int read_pack_bitmap_files(struct packed_git *pack,
+				  struct odb_pack_bitmap *out)
+{
+	struct strbuf path = STRBUF_INIT;
+	size_t len;
+	int ret = 0;
+
+	if (!strip_suffix(pack->pack_name, ".pack", &len))
+		BUG("pack_name does not end in .pack");
+
+	strbuf_addf(&path, "%.*s.bitmap", (int)len, pack->pack_name);
+	if (!file_exists(path.buf))
+		goto out;
+	if (strbuf_read_file(&out->bitmap, path.buf, 0) < 0) {
+		ret = error_errno(_("unable to read %s"), path.buf);
+		goto out;
+	}
+
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%.*s.idx", (int)len, pack->pack_name);
+	if (strbuf_read_file(&out->index, path.buf, 0) < 0) {
+		ret = error_errno(_("unable to read %s"), path.buf);
+		goto out;
+	}
+
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%.*s.rev", (int)len, pack->pack_name);
+	if (file_exists(path.buf) &&
+	    strbuf_read_file(&out->rev_index, path.buf, 0) < 0) {
+		ret = error_errno(_("unable to read %s"), path.buf);
+		goto out;
+	}
+
+	out->pack_size = pack->pack_size;
+
+out:
+	strbuf_release(&path);
+	return ret;
+}
+
+/*
+ * Have the helper store the reachability bitmap of its objects, or remove
+ * the one it stores when there is none to store.
+ */
+static int store_pack_bitmap(struct odb_source_helper *helper,
+			     const struct odb_pack_bitmap *bitmap)
+{
+	struct helper_process *hp = started(helper);
+	struct strbuf line = STRBUF_INIT;
+	int ret = 0;
+
+	if (bitmap->bitmap.len) {
+		helper_process_send(hp, "put-bitmap %"PRIuMAX" %"PRIuMAX" %"PRIuMAX" %"PRIuMAX"\n",
+				    (uintmax_t)bitmap->pack_size,
+				    (uintmax_t)bitmap->index.len,
+				    (uintmax_t)bitmap->rev_index.len,
+				    (uintmax_t)bitmap->bitmap.len);
+		helper_process_write(hp, bitmap->index.buf, bitmap->index.len);
+		helper_process_write(hp, bitmap->rev_index.buf, bitmap->rev_index.len);
+		helper_process_write(hp, bitmap->bitmap.buf, bitmap->bitmap.len);
+	} else {
+		helper_process_send(hp, "remove-bitmap\n");
+	}
+
+	if (helper_process_readline(hp, &line) == EOF)
+		drop_connection(helper);
+	if (strcmp(line.buf, "ok"))
+		ret = error(_("helper '%s' failed to store the bitmap: %s"),
+			    hp->name, line.len ? line.buf : _("no reply"));
+	strbuf_release(&line);
+	return ret;
+}
+
+/*
  * Have the helper store its objects as deltas where git finds good ones, as
  * a repack does for packfiles: pack-objects packs every reachable object
  * into the files store, reading those of the helper through the object
  * database to search for deltas among them, and the packfile then moves
  * into the helper, replacing how it stores each object. The objects of kept
- * packfiles stay out of it, as they stay out of the helper.
+ * packfiles stay out of it, as they stay out of the helper, unless a
+ * reachability bitmap is written, which needs every object in the pack.
+ * The helper then stores the bitmap of that pack for its objects.
  */
 static int deltify(struct odb_source_helper *helper,
 		   const struct odb_optimize_options *opts)
@@ -1343,14 +1449,16 @@ static int deltify(struct odb_source_helper *helper,
 	struct repository *repo = helper->base.odb->repo;
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	struct pack_objects_args args = PACK_OBJECTS_ARGS_INIT;
+	struct odb_pack_bitmap bitmap = ODB_PACK_BITMAP_INIT;
 	struct strbuf base = STRBUF_INIT, line = STRBUF_INIT;
 	struct packed_git **packs = NULL;
 	size_t nr = 0, alloc = 0;
+	int write_bitmaps = want_bitmap(helper);
 	int ret = 0;
 	FILE *out;
 
 	args.local = 1;
-	args.pack_kept_objects = 0;
+	args.pack_kept_objects = write_bitmaps > 0;
 	args.delta_base_offset = 1;
 	args.quiet = !(opts->flags & ODB_OPTIMIZE_VERBOSE);
 	args.no_reuse_delta = !!(opts->flags & ODB_OPTIMIZE_NO_REUSE_DELTAS);
@@ -1365,6 +1473,10 @@ static int deltify(struct odb_source_helper *helper,
 		     "--all", "--reflog", "--indexed-objects", NULL);
 	if (repo_has_promisor_remote(repo))
 		strvec_push(&cmd.args, "--exclude-promisor-objects");
+	if (write_bitmaps > 0)
+		strvec_push(&cmd.args, "--write-bitmap-index");
+	else if (write_bitmaps < 0)
+		strvec_push(&cmd.args, "--write-bitmap-index-quiet");
 	cmd.no_stdin = 1;
 
 	if (start_command(&cmd)) {
@@ -1393,14 +1505,79 @@ static int deltify(struct odb_source_helper *helper,
 		ret = error(_("pack-objects failed for helper '%s'"),
 			    helper->hp.name);
 
+	/* The files of the pack go away as its objects move. */
+	if (!ret && write_bitmaps && nr == 1)
+		ret = read_pack_bitmap_files(packs[0], &bitmap);
 	if (!ret && nr)
 		ret = drain(helper, packs, nr, 0, 1);
+	if (!ret && capable(helper, OBJECT_HELPER_BITMAP))
+		ret = store_pack_bitmap(helper, &bitmap);
 
 out:
 	pack_objects_args_release(&args);
+	odb_pack_bitmap_release(&bitmap);
 	strbuf_release(&base);
 	strbuf_release(&line);
 	free(packs);
+	return ret;
+}
+
+static int odb_source_helper_read_pack_bitmap(struct odb_source *source,
+					      struct odb_pack_bitmap *out)
+{
+	struct odb_source_helper *helper = odb_source_helper_downcast(source);
+	struct helper_process *hp;
+	struct strbuf line = STRBUF_INIT;
+	uintmax_t sizes[4];
+	struct strbuf *parts[] = { &out->index, &out->rev_index, &out->bitmap };
+	const char *p;
+	int ret = -1;
+
+	if (!capable(helper, OBJECT_HELPER_BITMAP))
+		return 1;
+
+	hp = started(helper);
+	helper_process_send(hp, "get-bitmap\n");
+	if (helper_process_readline(hp, &line) == EOF) {
+		drop_connection(helper);
+		goto out;
+	}
+	if (!strcmp(line.buf, "missing")) {
+		ret = 1;
+		goto out;
+	}
+
+	/* "<pack-size> <index-size> <reverse-index-size> <bitmap-size>" */
+	p = line.buf;
+	for (size_t i = 0; i < ARRAY_SIZE(sizes); i++) {
+		char *end;
+
+		errno = 0;
+		sizes[i] = strtoumax(p, &end, 10);
+		if (!isdigit(*p) || errno ||
+		    (i + 1 < ARRAY_SIZE(sizes) ? *end != ' ' : *end != '\0') ||
+		    sizes[i] > (i ? SIZE_MAX : maximum_signed_value_of_type(off_t))) {
+			error(_("helper '%s' sent a malformed reply: %s"),
+			      hp->name, line.buf);
+			drop_connection(helper);
+			goto out;
+		}
+		p = end + 1;
+	}
+
+	out->pack_size = sizes[0];
+	for (size_t i = 0; i < ARRAY_SIZE(parts); i++) {
+		size_t len = sizes[i + 1];
+		char *buf = read_payload(helper, len);
+
+		if (!buf)
+			goto out;
+		strbuf_attach(parts[i], buf, len, len + 1);
+	}
+	ret = 0;
+
+out:
+	strbuf_release(&line);
 	return ret;
 }
 
@@ -1883,6 +2060,7 @@ struct odb_source_helper *odb_source_helper_new(struct object_database *odb,
 	helper->base.prepare = odb_source_helper_prepare;
 	helper->base.fsck = odb_source_helper_fsck;
 	helper->base.prune = odb_source_helper_prune;
+	helper->base.read_pack_bitmap = odb_source_helper_read_pack_bitmap;
 	helper->base.read_object_info = odb_source_helper_read_object_info;
 	helper->base.read_object_stream = odb_source_helper_read_object_stream;
 	helper->base.read_object_raw = odb_source_helper_read_object_raw;

@@ -34,7 +34,8 @@ struct packed_git {
 		 do_not_close:1,
 		 pack_promisor:1,
 		 multi_pack_index:1,
-		 is_cruft:1;
+		 is_cruft:1,
+		 in_memory:1;
 	unsigned char hash[GIT_MAX_RAWSZ];
 	struct revindex_entry *revindex;
 	const uint32_t *revindex_data;
@@ -193,6 +194,23 @@ const char *pack_basename(struct packed_git *p);
  */
 struct packed_git *parse_pack_index(struct repository *r, unsigned char *sha1,
 				    const char *idx_path);
+
+/*
+ * Set up a pack of which only the index is at hand, in the `index_size`
+ * bytes at `index` laid out as an '.idx' file is, as a source keeping its
+ * objects elsewhere may store the index of the pack it once kept them in,
+ * for the reachability bitmap of that pack. `pack_size` is the size the
+ * pack had. The objects cannot be read from the pack, which is not added
+ * to the internal list of packs either.
+ *
+ * The pack takes the memory over when it is set up, which close_pack()
+ * frees, and the caller frees the pack after closing it. Returns NULL when
+ * the data is not a pack index.
+ */
+struct packed_git *packed_git_from_index(struct repository *r,
+					 const char *pack_name,
+					 void *index, size_t index_size,
+					 off_t pack_size);
 
 typedef void each_file_in_pack_dir_fn(const char *full_path, size_t full_path_len,
 				      const char *file_name, void *data);

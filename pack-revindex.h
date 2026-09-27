@@ -60,6 +60,16 @@ int load_pack_revindex(struct repository *r, struct packed_git *p);
 int load_pack_revindex_from_disk(struct packed_git *p);
 
 /*
+ * Load the reverse index of a pack whose index is in memory (see
+ * packed_git_from_index()) from the `len` bytes at `data`, laid out as a
+ * '.rev' file is. The pack takes the memory over when the load succeeds.
+ *
+ * Returns 0 on success, and -1 when the data is not a reverse index of the
+ * pack.
+ */
+int load_pack_revindex_from_memory(struct packed_git *p, void *data, size_t len);
+
+/*
  * verify_pack_revindex verifies that the on-disk rev-index for the given
  * pack-file is the same that would be created if written from scratch.
  *

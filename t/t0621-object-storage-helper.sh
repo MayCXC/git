@@ -748,6 +748,121 @@ test_expect_success 'pack-objects --no-reuse-delta computes the deltas of the he
 	git -C received fsck --strict
 '
 
+test_expect_success 'setup a bare helper repository' '
+	git init bitmapsrc &&
+	for i in 1 2 3 4 5
+	do
+		test_seq 1 $((100 * $i)) >bitmapsrc/f$i &&
+		git -C bitmapsrc add f$i &&
+		git -C bitmapsrc commit -m c$i || return 1
+	done &&
+	create_helper_repo --bare bitmapped.git &&
+	git -C bitmapped.git fetch "$(pwd)/bitmapsrc" "+refs/heads/*:refs/heads/*"
+'
+
+test_expect_success 'gc stores a reachability bitmap in the helper of a bare repository' '
+	test_when_finished "rm -f bitmaplog" &&
+	test_must_fail git -C bitmapped.git rev-list --test-bitmap main &&
+	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/bitmaplog" \
+		git -C bitmapped.git gc &&
+	test_grep "^put-bitmap " bitmaplog &&
+	assert_files_store_empty bitmapped.git &&
+	git -C bitmapped.git rev-list --test-bitmap main
+'
+
+test_expect_success 'the stored bitmap answers what a traversal answers' '
+	test_when_finished "rm -f trace" &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/trace" \
+		git -C bitmapped.git rev-list --count --all --use-bitmap-index &&
+	test_grep "\"key\":\"opened stored bitmap\"" trace &&
+	for filter in "" --filter=blob:none --filter=blob:limit=300
+	do
+		git -C bitmapped.git rev-list --objects --all $filter >out &&
+		cut -d" " -f1 out | sort >expect &&
+		git -C bitmapped.git rev-list --objects --all \
+			--use-bitmap-index $filter >out &&
+		cut -d" " -f1 out | sort >actual &&
+		test_cmp expect actual || return 1
+	done &&
+	git -C bitmapped.git rev-list --count --objects --all >expect &&
+	git -C bitmapped.git rev-list --count --objects --all \
+		--use-bitmap-index >actual &&
+	test_cmp expect actual &&
+	git -C bitmapped.git rev-list --disk-usage --objects --all >expect &&
+	git -C bitmapped.git rev-list --disk-usage --objects --all \
+		--use-bitmap-index >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'pack-objects counts the objects of the helper with the stored bitmap' '
+	test_when_finished "rm -rf received trace" &&
+	echo main |
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/trace" \
+		git -C bitmapped.git pack-objects --revs --stdout \
+			--use-bitmap-index >sent.pack &&
+	test_grep "\"key\":\"opened stored bitmap\"" trace &&
+	git init received &&
+	git -C received index-pack --stdin <sent.pack &&
+	git -C bitmapped.git rev-list --objects main >out &&
+	cut -d" " -f1 out | sort >expect &&
+	git -C received cat-file --batch-all-objects --batch-check="%(objectname)" >actual &&
+	test_cmp expect actual &&
+	git -C received fsck --strict
+'
+
+test_expect_success 'gc writes the stored bitmap anew from the one stored' '
+	test_when_finished "rm -f trace" &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/trace" git -C bitmapped.git gc &&
+	test_grep "\"key\":\"opened stored bitmap\"" trace &&
+	git -C bitmapped.git rev-list --test-bitmap main
+'
+
+test_expect_success 'gc without bitmaps has the helper remove the stored one' '
+	test_when_finished "rm -f bitmaplog" &&
+	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/bitmaplog" \
+		git -C bitmapped.git -c repack.writeBitmaps=false gc &&
+	test_grep "^remove-bitmap\$" bitmaplog &&
+	test_must_fail git -C bitmapped.git rev-list --test-bitmap main &&
+	git -C bitmapped.git gc &&
+	git -C bitmapped.git rev-list --test-bitmap main
+'
+
+test_expect_success 'repack.writeBitmaps has gc store a bitmap for a repository with a work tree' '
+	test_when_finished "rm -rf worked" &&
+	create_helper_repo worked &&
+	git -C worked fetch "$(pwd)/bitmapsrc" main:src &&
+	git -C worked gc &&
+	test_must_fail git -C worked rev-list --test-bitmap src &&
+	git -C worked -c repack.writeBitmaps=true gc &&
+	git -C worked rev-list --test-bitmap src
+'
+
+test_expect_success 'a bitmap stored for a repository with a kept pack covers its objects' '
+	test_when_finished "rm -rf keptbitmap.git" &&
+	create_helper_repo --bare keptbitmap.git &&
+	git -C keptbitmap.git -c fetch.unpackLimit=1 fetch --no-auto-maintenance \
+		"$(pwd)/bitmapsrc" main:main &&
+	pack=$(ls keptbitmap.git/objects/pack/*.pack) &&
+	touch "${pack%.pack}.keep" &&
+	git -C keptbitmap.git -c repack.writeBitmaps=true gc &&
+	test_path_is_file "$pack" &&
+	git -C keptbitmap.git rev-list --test-bitmap main
+'
+
+test_expect_success 'a helper without the bitmap capability has none stored' '
+	test_when_finished "rm -rf unbitmapped.git bitmaplog" &&
+	create_helper_repo --bare unbitmapped.git &&
+	git -C unbitmapped.git fetch "$(pwd)/bitmapsrc" main:main &&
+	caps="get info put put-raw replace have list-objects optimize" &&
+	GIT_LOCAL_TESTGIT_CAPABILITIES="$caps" \
+	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/bitmaplog" \
+		git -C unbitmapped.git gc &&
+	test_grep ! "bitmap" bitmaplog &&
+	test_must_fail env GIT_LOCAL_TESTGIT_CAPABILITIES="$caps" \
+		git -C unbitmapped.git rev-list --test-bitmap main &&
+	test_must_fail git -C unbitmapped.git rev-list --test-bitmap main
+'
+
 test_expect_success 'a local clone of the helper repository fetches its objects' '
 	test_when_finished "rm -rf localclone" &&
 	git clone store localclone &&

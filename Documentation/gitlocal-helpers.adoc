@@ -299,8 +299,10 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	`optimize`, after moving the objects of the objects directory into the
 	helper, having a helper advertising `put-raw` and `replace` store its
 	objects the way linkgit:git-pack-objects[1] finds best, as deltas
-	where it finds good ones, and having a helper advertising `prune`
-	remove the unreachable objects past `gc.pruneExpire`.
+	where it finds good ones, along with a reachability bitmap for them
+	(see `put-bitmap`) when `repack.writeBitmaps` asks for one, and having
+	a helper advertising `prune` remove the unreachable objects past
+	`gc.pruneExpire`.
 
 `optimize-required`::
 	Reply with the number of objects stored since the storage was last
@@ -324,6 +326,33 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	linkgit:git-fsck[1], which reads and checks every object besides.
 	Reply `ok`, or `error <message>` if it is damaged. Git sends it only
 	to a helper advertising `verify`.
+
+`put-bitmap <pack-size> <index-size> <reverse-index-size> <bitmap-size>`::
+	Store the reachability bitmap of the objects of the helper, replacing
+	any stored before, and reply `ok` or `error <message>`. Git writes the
+	bitmap for a packfile holding the objects, as it does for a packfile
+	it keeps (see linkgit:gitformat-pack[5]), and keeps the objects in the
+	helper, so the bitmap comes with what relates its bits to the objects:
+	the _<index-size>_ bytes of the index of the packfile, the
+	_<reverse-index-size>_ bytes of its reverse index, which there may be
+	none of, and then the _<bitmap-size>_ bytes of the bitmap follow the
+	command. _<pack-size>_ is the size the packfile had. Git sends it only
+	to a helper advertising `bitmap`, as linkgit:git-gc[1] optimizes the
+	storage of the objects.
+
+`get-bitmap`::
+	Reply with the reachability bitmap stored, as `put-bitmap` gave it:
+	`<pack-size> <index-size> <reverse-index-size> <bitmap-size>` followed
+	by the index, the reverse index and the bitmap, or `missing` if there
+	is none. Git sends it, only to a helper advertising `bitmap`, to count
+	the objects reachable from some others with the bitmap, as it does
+	with the bitmap of a packfile.
+
+`remove-bitmap`::
+	Remove the reachability bitmap stored, if any, and reply `ok` or
+	`error <message>`. Git sends it only to a helper advertising `bitmap`,
+	as linkgit:git-gc[1] optimizes the storage of the objects without
+	writing a bitmap for them.
 
 SEE ALSO
 --------

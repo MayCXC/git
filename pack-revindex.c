@@ -203,6 +203,35 @@ struct revindex_header {
 	uint32_t hash_id;
 };
 
+static int check_revindex_size(const struct git_hash_algo *algo,
+			       const char *revindex_name, size_t revindex_size,
+			       uint32_t num_objects)
+{
+	if (revindex_size < ridx_min_size(algo))
+		return error(_("reverse-index file %s is too small"), revindex_name);
+
+	if (revindex_size - ridx_min_size(algo) != st_mult(sizeof(uint32_t), num_objects))
+		return error(_("reverse-index file %s is corrupt"), revindex_name);
+
+	return 0;
+}
+
+static int check_revindex_header(const char *revindex_name, const void *data)
+{
+	const struct revindex_header *hdr = data;
+
+	if (ntohl(hdr->signature) != RIDX_SIGNATURE)
+		return error(_("reverse-index file %s has unknown signature"), revindex_name);
+	if (ntohl(hdr->version) != 1)
+		return error(_("reverse-index file %s has unsupported version %"PRIu32),
+			     revindex_name, ntohl(hdr->version));
+	if (!(ntohl(hdr->hash_id) == 1 || ntohl(hdr->hash_id) == 2))
+		return error(_("reverse-index file %s has unsupported hash id %"PRIu32),
+			     revindex_name, ntohl(hdr->hash_id));
+
+	return 0;
+}
+
 static int load_revindex_from_disk(const struct git_hash_algo *algo,
 				   char *revindex_name,
 				   uint32_t num_objects,
@@ -212,7 +241,6 @@ static int load_revindex_from_disk(const struct git_hash_algo *algo,
 	struct stat st;
 	void *data = NULL;
 	size_t revindex_size;
-	struct revindex_header *hdr;
 
 	if (git_env_bool(GIT_TEST_REV_INDEX_DIE_ON_DISK, 0))
 		die("dying as requested by '%s'", GIT_TEST_REV_INDEX_DIE_ON_DISK);
@@ -231,33 +259,12 @@ static int load_revindex_from_disk(const struct git_hash_algo *algo,
 
 	revindex_size = xsize_t(st.st_size);
 
-	if (revindex_size < ridx_min_size(algo)) {
-		ret = error(_("reverse-index file %s is too small"), revindex_name);
+	ret = check_revindex_size(algo, revindex_name, revindex_size, num_objects);
+	if (ret)
 		goto cleanup;
-	}
-
-	if (revindex_size - ridx_min_size(algo) != st_mult(sizeof(uint32_t), num_objects)) {
-		ret = error(_("reverse-index file %s is corrupt"), revindex_name);
-		goto cleanup;
-	}
 
 	data = xmmap(NULL, revindex_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	hdr = data;
-
-	if (ntohl(hdr->signature) != RIDX_SIGNATURE) {
-		ret = error(_("reverse-index file %s has unknown signature"), revindex_name);
-		goto cleanup;
-	}
-	if (ntohl(hdr->version) != 1) {
-		ret = error(_("reverse-index file %s has unsupported version %"PRIu32),
-			    revindex_name, ntohl(hdr->version));
-		goto cleanup;
-	}
-	if (!(ntohl(hdr->hash_id) == 1 || ntohl(hdr->hash_id) == 2)) {
-		ret = error(_("reverse-index file %s has unsupported hash id %"PRIu32),
-			    revindex_name, ntohl(hdr->hash_id));
-		goto cleanup;
-	}
+	ret = check_revindex_header(revindex_name, data);
 
 cleanup:
 	if (ret) {
@@ -297,6 +304,28 @@ int load_pack_revindex_from_disk(struct packed_git *p)
 	p->revindex_data = (const uint32_t *)((const char *)p->revindex_map + RIDX_HEADER_SIZE);
 
 cleanup:
+	free(revindex_name);
+	return ret;
+}
+
+int load_pack_revindex_from_memory(struct packed_git *p, void *data, size_t len)
+{
+	char *revindex_name = pack_revindex_filename(p);
+	int ret;
+
+	if (!p->in_memory)
+		BUG("the index of %s is not in memory", p->pack_name);
+
+	ret = check_revindex_size(p->repo->hash_algo, revindex_name, len,
+				  p->num_objects);
+	if (!ret)
+		ret = check_revindex_header(revindex_name, data);
+	if (!ret) {
+		p->revindex_map = data;
+		p->revindex_size = len;
+		p->revindex_data = (const uint32_t *)((const char *)data + RIDX_HEADER_SIZE);
+	}
+
 	free(revindex_name);
 	return ret;
 }

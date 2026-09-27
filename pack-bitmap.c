@@ -18,6 +18,7 @@
 #include "repository.h"
 #include "trace2.h"
 #include "odb.h"
+#include "odb/source.h"
 #include "list-objects-filter-options.h"
 #include "midx.h"
 #include "config.h"
@@ -53,6 +54,14 @@ struct bitmap_index {
 	 */
 	struct packed_git *pack;
 	struct multi_pack_index *midx;
+
+	/*
+	 * The source that stored this bitmap, when it keeps its objects
+	 * elsewhere than in 'pack', of which it stored only the index. The
+	 * objects are then read through the object database, and the bitmap,
+	 * like the pack, is in memory this bitmap index owns.
+	 */
+	struct odb_source *stored_in;
 
 	/*
 	 * If using a multi-pack index chain, 'base' points to the
@@ -709,6 +718,89 @@ static int open_bitmap_for_source(struct odb_source_packed *source,
 	return found ? 0 : -1;
 }
 
+/*
+ * Open the bitmap a source stores for its objects, which it keeps elsewhere
+ * than in the pack the bitmap was written for. Of that pack, the source
+ * stored the index and the reverse index, which relate the bits to the
+ * objects.
+ */
+static int open_stored_bitmap(struct repository *r,
+			      struct bitmap_index *bitmap_git,
+			      struct odb_source *source)
+{
+	const struct git_hash_algo *algo = r->hash_algo;
+	struct odb_pack_bitmap stored = ODB_PACK_BITMAP_INIT;
+	struct strbuf pack_name = STRBUF_INIT;
+	struct packed_git *pack = NULL;
+	size_t len;
+	void *data;
+	int ret = -1;
+
+	if (odb_source_read_pack_bitmap(source, &stored))
+		goto out;
+
+	if (bitmap_git->pack || bitmap_git->midx) {
+		trace2_data_string("bitmap", r, "ignoring extra stored bitmap",
+				   source->path);
+		goto out;
+	}
+
+	if (stored.index.len < 2 * algo->rawsz) {
+		error(_("the pack index stored for the bitmap of %s is too small"),
+		      source->path);
+		goto out;
+	}
+	/* The index ends with the checksum of the pack and its own. */
+	strbuf_addf(&pack_name, "%s/pack/pack-%s.pack", source->path,
+		    hash_to_hex_algop((unsigned char *)stored.index.buf +
+				      stored.index.len - 2 * algo->rawsz, algo));
+
+	data = strbuf_detach(&stored.index, &len);
+	pack = packed_git_from_index(r, pack_name.buf, data, len,
+				     stored.pack_size);
+	if (!pack) {
+		free(data);
+		goto out;
+	}
+	if (stored.rev_index.len) {
+		data = strbuf_detach(&stored.rev_index, &len);
+		if (load_pack_revindex_from_memory(pack, data, len)) {
+			free(data);
+			goto out;
+		}
+	}
+
+	bitmap_git->pack = pack;
+	bitmap_git->stored_in = source;
+	bitmap_git->map = (unsigned char *)strbuf_detach(&stored.bitmap,
+							 &bitmap_git->map_size);
+	bitmap_git->map_pos = 0;
+	bitmap_git->base_nr = 0;
+	pack = NULL;
+
+	if (load_bitmap_header(bitmap_git) < 0) {
+		pack = bitmap_git->pack;
+		FREE_AND_NULL(bitmap_git->map);
+		bitmap_git->map_size = 0;
+		bitmap_git->map_pos = 0;
+		bitmap_git->pack = NULL;
+		bitmap_git->stored_in = NULL;
+		goto out;
+	}
+
+	trace2_data_string("bitmap", r, "opened stored bitmap", pack_name.buf);
+	ret = 0;
+
+out:
+	if (pack) {
+		close_pack(pack);
+		free(pack);
+	}
+	odb_pack_bitmap_release(&stored);
+	strbuf_release(&pack_name);
+	return ret;
+}
+
 static int open_bitmap(struct repository *r,
 		       struct bitmap_index *bitmap_git)
 {
@@ -720,9 +812,9 @@ static int open_bitmap(struct repository *r,
 	for (source = r->objects->sources; source; source = source->next) {
 		struct odb_source_files *files = odb_source_files_store_gently(source);
 
-		if (!files)
-			continue;
-		if (!open_bitmap_for_source(files->packed, bitmap_git))
+		if (files && !open_bitmap_for_source(files->packed, bitmap_git))
+			found = true;
+		else if (!open_stored_bitmap(r, bitmap_git, source))
 			found = true;
 
 		/*
@@ -1750,6 +1842,13 @@ static int show_objects_for_type(
 
 				pack_id = nth_midxed_pack_int_id(m, index_pos);
 				pack = nth_midxed_pack(bitmap_git->midx, pack_id);
+			} else if (bitmap_git->stored_in) {
+				/* The objects are not in the pack. */
+				index_pos = pack_pos_to_index(bitmap_git->pack, pos + offset);
+				nth_bitmap_object_oid(bitmap_git, &oid, index_pos);
+
+				pack = NULL;
+				ofs = 0;
 			} else {
 				index_pos = pack_pos_to_index(bitmap_git->pack, pos + offset);
 				ofs = pack_pos_to_offset(bitmap_git->pack, pos + offset);
@@ -1879,7 +1978,16 @@ static unsigned long get_size_by_pos(struct bitmap_index *bitmap_git,
 
 	oi.sizep = &size;
 
-	if (pos < bitmap_num_objects_total(bitmap_git)) {
+	if (pos < bitmap_num_objects_total(bitmap_git) && bitmap_git->stored_in) {
+		struct object_id oid;
+
+		/* The objects are not in the pack. */
+		nth_bitmap_object_oid(bitmap_git, &oid,
+				      pack_pos_to_index(bitmap_git->pack, pos));
+		if (odb_read_object_info_extended(bitmap_repo(bitmap_git)->objects,
+						  &oid, &oi, 0) < 0)
+			die(_("unable to get size of %s"), oid_to_hex(&oid));
+	} else if (pos < bitmap_num_objects_total(bitmap_git)) {
 		struct packed_git *pack;
 		off_t ofs;
 
@@ -2496,6 +2604,10 @@ void reuse_partial_packfile_from_bitmap(struct bitmap_index *bitmap_git,
 	uint32_t objects_nr = 0;
 
 	assert(result);
+
+	/* There is no pack to reuse when the objects are elsewhere. */
+	if (bitmap_git->stored_in)
+		return;
 
 	load_reverse_index(r, bitmap_git);
 
@@ -3177,8 +3289,13 @@ void free_bitmap_index(struct bitmap_index *b)
 	if (!b)
 		return;
 
-	if (b->map)
+	if (b->stored_in) {
+		free(b->map);
+		close_pack(b->pack);
+		free(b->pack);
+	} else if (b->map) {
 		munmap(b->map, b->map_size);
+	}
 	ewah_pool_free(b->commits);
 	ewah_pool_free(b->trees);
 	ewah_pool_free(b->blobs);
@@ -3269,6 +3386,21 @@ static off_t get_disk_usage_for_type(struct bitmap_index *bitmap_git,
 				}
 
 				total += pack_pos_to_offset(pack, pack_pos + 1) - offset;
+			} else if (bitmap_git->stored_in) {
+				/* The objects are not in the pack. */
+				struct object_info oi = OBJECT_INFO_INIT;
+				struct object_id oid;
+				off_t object_size;
+
+				nth_bitmap_object_oid(bitmap_git, &oid,
+						      pack_pos_to_index(bitmap_git->pack,
+									base + offset));
+				oi.disk_sizep = &object_size;
+				if (odb_read_object_info_extended(bitmap_repo(bitmap_git)->objects,
+								  &oid, &oi, 0) < 0)
+					die(_("unable to get disk usage of '%s'"),
+					    oid_to_hex(&oid));
+				total += object_size;
 			} else {
 				size_t pos = base + offset;
 				total += pack_pos_to_offset(bitmap_git->pack, pos + 1) -
