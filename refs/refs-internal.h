@@ -566,6 +566,15 @@ typedef int fsck_fn(struct ref_store *ref_store,
 
 struct ref_storage_be {
 	const char *name;
+
+	/*
+	 * Whether this backend stores references as files in a directory:
+	 * the repository's common directory, unless the payload of a reference
+	 * storage URI names another. Any other backend gives its payload a
+	 * meaning of its own.
+	 */
+	bool uses_refdir;
+
 	ref_store_init_fn *init;
 	ref_store_release_fn *release;
 	ref_store_create_on_disk_fn *create_on_disk;

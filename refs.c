@@ -85,6 +85,15 @@ const char *ref_storage_format_to_name(enum ref_storage_format ref_storage_forma
 	return be->name;
 }
 
+const char *repo_alternate_refdir(struct repository *repo)
+{
+	const struct ref_storage_be *be = find_ref_storage_backend(repo->ref_storage_format);
+
+	if (!be || !be->uses_refdir)
+		return NULL;
+	return repo->ref_storage_payload;
+}
+
 static const char *abort_by_ref_transaction_hook =
 	N_("in '%s' phase, update aborted by the reference-transaction hook");
 
@@ -2252,7 +2261,7 @@ int ref_store_create_on_disk(struct ref_store *refs, int flags, struct strbuf *e
 
 	if (!ret) {
 		/* Creation of stubs for linked worktrees are handled in the worktree code. */
-		if (!(flags & REF_STORE_CREATE_ON_DISK_IS_WORKTREE) && refs->repo->ref_storage_payload) {
+		if (!(flags & REF_STORE_CREATE_ON_DISK_IS_WORKTREE) && repo_alternate_refdir(refs->repo)) {
 			refs_create_refdir_stubs(refs->repo, refs->repo->gitdir,
 						 "repository uses alternate refs storage");
 		} else if (ref_storage_format_by_name(refs->be->name) != REF_STORAGE_FORMAT_FILES) {
@@ -2279,7 +2288,7 @@ int ref_store_remove_on_disk(struct ref_store *refs, struct strbuf *err)
 			return ret;
 
 		/* Alternate refs backend require stubs in the gitdir. */
-		if (refs->repo->ref_storage_payload)
+		if (repo_alternate_refdir(refs->repo))
 			return ret;
 
 		strbuf_addf(&sb, "%s/HEAD", refs->gitdir);
