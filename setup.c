@@ -867,6 +867,23 @@ int read_repository_format(struct repository_format *format, const char *path)
 	return format->version;
 }
 
+char *read_object_storage(const char *gitdir)
+{
+	struct repository_format format = REPOSITORY_FORMAT_INIT;
+	struct strbuf config = STRBUF_INIT;
+	char *storage;
+
+	get_common_dir(&config, gitdir);
+	strbuf_addstr(&config, "/config");
+	read_repository_format(&format, config.buf);
+	storage = format.object_storage;
+	format.object_storage = NULL;
+
+	clear_repository_format(&format);
+	strbuf_release(&config);
+	return storage;
+}
+
 void clear_repository_format(struct repository_format *format)
 {
 	string_list_clear(&format->unknown_extensions, 0);

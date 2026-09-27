@@ -690,6 +690,34 @@ test_expect_success 'clone --no-local serves a pack generated from the helper' '
 	git -C served fsck
 '
 
+test_expect_success 'a local clone of the helper repository fetches its objects' '
+	test_when_finished "rm -rf localclone" &&
+	git clone store localclone &&
+	git -C store rev-parse HEAD >expect &&
+	git -C localclone rev-parse HEAD >actual &&
+	test_cmp expect actual &&
+	git -C localclone fsck
+'
+
+test_expect_success 'clone --local of the helper repository fetches with a warning' '
+	test_when_finished "rm -rf localclone" &&
+	git clone --local store localclone 2>err &&
+	test_grep "stores its objects in a helper, ignoring --local" err &&
+	git -C localclone fsck
+'
+
+test_expect_success 'clone --shared of the helper repository is refused' '
+	test_when_finished "rm -rf sharedclone" &&
+	test_must_fail git clone --shared store sharedclone 2>err &&
+	test_grep "cannot share the objects" err
+'
+
+test_expect_success 'the helper repository is refused as a reference' '
+	test_when_finished "rm -rf referenced" &&
+	test_must_fail git clone --reference store --no-local store referenced 2>err &&
+	test_grep "stores its objects in a helper" err
+'
+
 test_expect_success 'bundle create generates a pack from the helper' '
 	git -C store bundle create "$TRASH_DIRECTORY/all.bundle" --all &&
 	git -C store bundle verify "$TRASH_DIRECTORY/all.bundle" >verify &&

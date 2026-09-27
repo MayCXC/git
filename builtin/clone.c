@@ -901,6 +901,7 @@ int cmd_clone(int argc,
 	const char *repo_name, *repo, *work_tree, *git_dir;
 	char *repo_to_free = NULL;
 	char *path = NULL, *dir, *display_repo = NULL;
+	char *source_storage = NULL;
 	int dest_exists, real_dest_exists = 0;
 	const struct ref *refs, *remote_head;
 	struct ref *remote_head_points_at = NULL;
@@ -1365,6 +1366,15 @@ int cmd_clone(int argc,
 				warning(_("source repository is shallow, ignoring --local"));
 			is_local = 0;
 		}
+		/* Its objects directory lacks the objects its helper keeps. */
+		source_storage = read_object_storage(path);
+		if (source_storage) {
+			if (option_shared)
+				die(_("cannot share the objects of a source repository that stores them in a helper"));
+			if (option_local > 0)
+				warning(_("source repository stores its objects in a helper, ignoring --local"));
+			is_local = 0;
+		}
 	}
 	if (option_local > 0 && !is_local)
 		warning(_("--local is ignored"));
@@ -1680,6 +1690,7 @@ int cmd_clone(int argc,
 	free(unborn_head);
 	free(dir);
 	free(path);
+	free(source_storage);
 	free(repo_to_free);
 	junk_mode = JUNK_LEAVE_ALL;
 

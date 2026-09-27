@@ -286,7 +286,7 @@ void odb_restore_primary_source(struct object_database *odb,
 
 char *compute_alternate_path(const char *path, struct strbuf *err)
 {
-	char *ref_git = NULL;
+	char *ref_git = NULL, *storage;
 	const char *repo;
 	int seen_error = 0;
 
@@ -336,6 +336,17 @@ char *compute_alternate_path(const char *path, struct strbuf *err)
 		strbuf_addf(err,
 			    _("reference repository '%s' is grafted"),
 			    path);
+		seen_error = 1;
+		goto out;
+	}
+
+	/* Its objects directory lacks the objects its helper keeps. */
+	storage = read_object_storage(ref_git);
+	if (storage) {
+		strbuf_addf(err,
+			    _("reference repository '%s' stores its objects in a helper"),
+			    path);
+		free(storage);
 		seen_error = 1;
 		goto out;
 	}

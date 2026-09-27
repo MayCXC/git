@@ -223,6 +223,13 @@ struct repository_format {
 int read_repository_format(struct repository_format *format, const char *path);
 
 /*
+ * Return the object storage the repository at `gitdir` uses, as its
+ * extensions.objectStorage names it, or a NULL pointer for the files
+ * backend. The caller frees the result.
+ */
+char *read_object_storage(const char *gitdir);
+
+/*
  * Free the memory held onto by `format`, but not the struct itself.
  * (No need to use this after `read_repository_format()` fails.)
  */
