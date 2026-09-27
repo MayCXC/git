@@ -13,6 +13,7 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source-helper.h"
 #include "odb/source-inmemory.h"
 #include "path.h"
 #include "promisor-remote.h"
@@ -1035,6 +1036,71 @@ int odb_prune(struct object_database *odb,
 	      const struct odb_prune_options *opts)
 {
 	return odb_source_prune(odb->sources, opts);
+}
+
+/*
+ * Every step leaves the objects readable, should the migration stop there:
+ * the objects of a helper are copied into its objects directory before the
+ * repository stops using it, and a new helper takes them from the objects
+ * directory only once the repository uses it, reading any it has not taken
+ * from there.
+ */
+int repo_migrate_object_storage(struct repository *repo, const char *uri,
+				struct strbuf *err)
+{
+	struct odb_source *primary = repo->objects->sources;
+	struct oid_array copied = OID_ARRAY_INIT;
+	char *storage = NULL;
+	int ret = -1;
+
+	if (odb_object_storage_parse(uri, &storage) < 0) {
+		strbuf_addf(err, _("unknown object storage '%s'"), uri);
+		goto out;
+	}
+	if (!strcmp(storage ? storage : "files",
+		    repo->object_storage ? repo->object_storage : "files")) {
+		strbuf_addf(err, _("repository already uses '%s' object storage"),
+			    uri);
+		goto out;
+	}
+	if (getenv(DB_ENVIRONMENT)) {
+		strbuf_addf(err, _("cannot migrate the object storage with %s set"),
+			    DB_ENVIRONMENT);
+		goto out;
+	}
+
+	if (primary->type == ODB_SOURCE_HELPER &&
+	    odb_source_helper_copy_to_files_store(odb_source_helper_downcast(primary),
+						  &copied)) {
+		strbuf_addstr(err, _("unable to copy the objects out of the helper"));
+		goto out;
+	}
+
+	repo_set_object_storage(repo, storage);
+	initialize_repository_version(repo, hash_algo_by_ptr(repo->hash_algo),
+				      repo->ref_storage_format, 1);
+
+	if (primary->type == ODB_SOURCE_HELPER &&
+	    odb_source_helper_remove_objects(odb_source_helper_downcast(primary),
+					     &copied))
+		warning(_("the objects stay in the helper the repository used"));
+
+	odb_free(repo->objects);
+	repo->objects = odb_new(repo, ODB_NEW_HONOR_ENV);
+	primary = repo->objects->sources;
+
+	if (primary->type == ODB_SOURCE_HELPER &&
+	    odb_source_helper_take_files_store(odb_source_helper_downcast(primary))) {
+		strbuf_addstr(err, _("unable to move the objects into the helper"));
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	oid_array_clear(&copied);
+	free(storage);
+	return ret;
 }
 
 void odb_generate_pack_options_release(struct odb_generate_pack_options *opts)

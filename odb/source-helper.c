@@ -1613,6 +1613,139 @@ out:
 	return ret;
 }
 
+int odb_source_helper_take_files_store(struct odb_source_helper *helper)
+{
+	return drain_files_store(helper);
+}
+
+/*
+ * Pack `oids`, objects of the helper, into the files store with
+ * pack-objects, which reads them through the object database, and mark the
+ * packfile as a promisor packfile with `promisor`.
+ */
+static int pack_into_files_store(struct odb_source_helper *helper,
+				 const struct oid_array *oids, int promisor)
+{
+	struct child_process cmd = CHILD_PROCESS_INIT;
+	struct pack_objects_args args = PACK_OBJECTS_ARGS_INIT;
+	struct strbuf base = STRBUF_INIT, line = STRBUF_INIT;
+	FILE *in, *out;
+	int ret = 0;
+
+	if (!oids->nr)
+		return 0;
+
+	args.local = 1;
+	args.quiet = 1;
+	args.delta_base_offset = 1;
+	strbuf_addf(&base, "%s/pack/pack", helper->files->base.path);
+	prepare_pack_objects(&cmd, &args, base.buf);
+	cmd.in = -1;
+	if (start_command(&cmd)) {
+		ret = error(_("unable to start pack-objects for helper '%s'"),
+			    helper->hp.name);
+		goto out;
+	}
+
+	/* pack-objects reads its input in full before it writes a line. */
+	in = xfdopen(cmd.in, "w");
+	for (size_t i = 0; i < oids->nr; i++)
+		fprintf(in, "%s\n", oid_to_hex(&oids->oid[i]));
+	fclose(in);
+
+	out = xfdopen(cmd.out, "r");
+	while (strbuf_getline_lf(&line, out) != EOF) {
+		if (promisor) {
+			struct strbuf path = STRBUF_INIT;
+
+			strbuf_addf(&path, "%s-%s.promisor", base.buf, line.buf);
+			write_file_buf(path.buf, "", 0);
+			strbuf_release(&path);
+		}
+	}
+	fclose(out);
+	if (finish_command(&cmd))
+		ret = error(_("pack-objects failed for helper '%s'"),
+			    helper->hp.name);
+
+out:
+	pack_objects_args_release(&args);
+	strbuf_release(&base);
+	strbuf_release(&line);
+	return ret;
+}
+
+int odb_source_helper_copy_to_files_store(struct odb_source_helper *helper,
+					  struct oid_array *copied)
+{
+	struct oid_array regular = OID_ARRAY_INIT, promisor = OID_ARRAY_INIT;
+	struct listed_object *objects = NULL, *promisors = NULL;
+	size_t nr, promisors_nr = 0;
+	int ret = 0;
+
+	if (list_objects(helper, "", &objects, &nr) < 0 ||
+	    (capable(helper, OBJECT_HELPER_PROMISOR) &&
+	     list_objects(helper, " --promisor-only", &promisors,
+			  &promisors_nr) < 0)) {
+		ret = error(_("unable to list the objects of helper '%s'"),
+			    helper->hp.name);
+		goto out;
+	}
+
+	QSORT(promisors, promisors_nr, listed_object_cmp);
+	for (size_t i = 0; i < nr; i++) {
+		if (oid_pos(&objects[i].oid, promisors, promisors_nr,
+			    listed_object_oid) >= 0)
+			oid_array_append(&promisor, &objects[i].oid);
+		else
+			oid_array_append(&regular, &objects[i].oid);
+	}
+
+	if (pack_into_files_store(helper, &regular, 0) ||
+	    pack_into_files_store(helper, &promisor, 1)) {
+		ret = -1;
+		goto out;
+	}
+	for (size_t i = 0; i < nr; i++)
+		oid_array_append(copied, &objects[i].oid);
+
+out:
+	oid_array_clear(&regular);
+	oid_array_clear(&promisor);
+	free(objects);
+	free(promisors);
+	return ret;
+}
+
+/* Of the objects of the helper, those in the oid_array `data` go. */
+static bool not_removed(const struct object_id *oid, void *data)
+{
+	return oid_array_lookup(data, oid) < 0;
+}
+
+static void removed(const struct object_id *oid UNUSED,
+		    enum object_type type UNUSED, void *data UNUSED)
+{
+}
+
+int odb_source_helper_remove_objects(struct odb_source_helper *helper,
+				     struct oid_array *oids)
+{
+	struct odb_prune_options opts = {
+		.expire = TIME_MAX,
+		.is_reachable = not_removed,
+		.pruned = removed,
+		.data = oids,
+	};
+
+	if (!capable(helper, OBJECT_HELPER_PRUNE)) {
+		warning(_("helper '%s' cannot remove the objects it stores"),
+			helper->hp.name);
+		return 0;
+	}
+	return odb_source_helper_prune(&helper->base, &opts);
+}
+
 static int odb_source_helper_create_on_disk(struct odb_source *source,
 					    const struct odb_create_on_disk_options *opts)
 {

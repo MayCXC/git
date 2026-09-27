@@ -193,6 +193,15 @@ int odb_prune(struct object_database *odb,
 	      const struct odb_prune_options *opts);
 
 /*
+ * Move the objects of the repository into the object storage `uri` names,
+ * as extensions.objectStorage takes it, and have the repository use it,
+ * with an object database made anew. Returns 0 on success and -1 with a
+ * message in `err` otherwise.
+ */
+int repo_migrate_object_storage(struct repository *repo, const char *uri,
+				struct strbuf *err);
+
+/*
  * Close the object database and all of its sources so that any held resources
  * will be released. The database can still be used after closing it, in which
  * case these resources may be reallocated.

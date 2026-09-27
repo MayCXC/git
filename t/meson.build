@@ -156,6 +156,7 @@ integration_tests = [
   't0614-reftable-fsck.sh',
   't0620-ref-storage-helper.sh',
   't0621-object-storage-helper.sh',
+  't0622-object-storage-migrate.sh',
   't1000-read-tree-m-3way.sh',
   't1001-read-tree-m-2way.sh',
   't1002-read-tree-m-u-2way.sh',

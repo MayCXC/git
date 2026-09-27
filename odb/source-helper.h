@@ -34,6 +34,27 @@ struct odb_source_helper *odb_source_helper_new(struct object_database *odb,
 						bool local);
 
 /*
+ * Move every object of the files store of the source into the helper, as
+ * optimizing the source does first. Returns 0 on success and -1 on error.
+ */
+int odb_source_helper_take_files_store(struct odb_source_helper *helper);
+
+/*
+ * Copy every object of the helper into packfiles of the files store of the
+ * source, the promisor objects into a promisor packfile, and append their
+ * IDs to `copied`. Returns 0 on success and -1 on error.
+ */
+int odb_source_helper_copy_to_files_store(struct odb_source_helper *helper,
+					  struct oid_array *copied);
+
+/*
+ * Have the helper remove the objects of `oids`. Returns 0 on success and -1
+ * on error.
+ */
+int odb_source_helper_remove_objects(struct odb_source_helper *helper,
+				     struct oid_array *oids);
+
+/*
  * Cast the given object database source to the helper backend. This will
  * cause a BUG in case the source doesn't use this backend.
  */
