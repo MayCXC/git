@@ -1149,6 +1149,74 @@ unwind:
 	goto out;
 }
 
+int packed_object_raw_entry(struct packed_git *p, off_t offset,
+			    struct packed_raw_entry *entry)
+{
+	struct pack_window *w_curs = NULL;
+	off_t curpos = offset, next;
+	enum object_type type;
+	unsigned char *dst;
+	uint32_t pos;
+	size_t left;
+	int ret = -1;
+
+	memset(entry, 0, sizeof(*entry));
+
+	/* The entry runs up to the next one, as write_reuse_object() finds. */
+	if (offset_to_pack_pos(p, offset, &pos) < 0)
+		goto out;
+	next = pack_pos_to_offset(p, pos + 1);
+	if (p->index_version > 1 &&
+	    check_pack_crc(p, &w_curs, offset, next - offset,
+			   pack_pos_to_index(p, pos))) {
+		error(_("bad packed object CRC at offset %"PRIuMAX" in %s"),
+		      (uintmax_t)offset, p->pack_name);
+		goto out;
+	}
+
+	type = unpack_object_header(p, &w_curs, &curpos, &entry->size);
+	entry->type = packed_to_object_type(p->repo, p, offset, type,
+					    &w_curs, curpos);
+	if (entry->type <= OBJ_NONE)
+		goto out;
+
+	switch (type) {
+	case OBJ_OFS_DELTA:
+	case OBJ_REF_DELTA:
+		if (get_delta_base_oid(p, &w_curs, curpos, &entry->delta_base,
+				       type, offset) < 0 ||
+		    !get_delta_base(p, &w_curs, &curpos, type, offset))
+			goto out;
+		break;
+	default:
+		oidclr(&entry->delta_base, p->repo->hash_algo);
+		break;
+	}
+	if (next <= curpos)
+		goto out;
+
+	entry->data_len = next - curpos;
+	entry->data = xmalloc(entry->data_len);
+	for (dst = entry->data, left = entry->data_len; left; ) {
+		size_t avail;
+		unsigned char *src = use_pack(p, &w_curs, curpos, &avail);
+
+		if (avail > left)
+			avail = left;
+		memcpy(dst, src, avail);
+		dst += avail;
+		curpos += avail;
+		left -= avail;
+	}
+	ret = 0;
+
+out:
+	unuse_pack(&w_curs);
+	if (ret)
+		FREE_AND_NULL(entry->data);
+	return ret;
+}
+
 static struct hashmap delta_base_cache;
 static size_t delta_base_cached;
 

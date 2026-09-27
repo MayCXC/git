@@ -315,6 +315,30 @@ off_t get_delta_base(struct packed_git *p, struct pack_window **w_curs,
 		     off_t *curpos, enum object_type type,
 		     off_t delta_obj_offset);
 
+/*
+ * The entry of an object in a packfile, as the packfile stores it: the
+ * compressed contents of the object, or a compressed delta against another.
+ */
+struct packed_raw_entry {
+	unsigned char *data;
+	size_t data_len;
+	/* The size of what the compressed bytes inflate to. */
+	size_t size;
+	/* The type of the object, resolved through a delta. */
+	enum object_type type;
+	/* The base of a delta, or the null object ID for a whole object. */
+	struct object_id delta_base;
+};
+
+/*
+ * Read the entry of the object at `offset` in `p` without inflating it, as
+ * pack-objects copies an entry it reuses, and check its CRC if the index of
+ * the packfile records one. Returns 0 on success, in which case the caller
+ * frees `entry->data`, and -1 on error.
+ */
+int packed_object_raw_entry(struct packed_git *p, off_t offset,
+			    struct packed_raw_entry *entry);
+
 int packfile_read_object_stream(struct odb_stream **out,
 				const struct object_id *oid,
 				struct packed_git *pack,
