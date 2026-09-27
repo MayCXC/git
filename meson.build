@@ -390,6 +390,7 @@ libgit_sources = [
   'hash.c',
   'hashmap.c',
   'help.c',
+  'helper.c',
   'hex.c',
   'hex-ll.c',
   'hook.c',
