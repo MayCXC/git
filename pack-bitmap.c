@@ -718,8 +718,10 @@ static int open_bitmap(struct repository *r,
 	assert(!bitmap_git->map);
 
 	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
+		if (!files)
+			continue;
 		if (!open_bitmap_for_source(files->packed, bitmap_git))
 			found = true;
 

@@ -1562,6 +1562,20 @@ static int have_duplicate_entry(const struct object_id *oid,
 	return 1;
 }
 
+/*
+ * Whether the source holds the object other than in one of its packfiles: as a
+ * loose object of its files store, or in a store of any other kind.
+ */
+static int has_object_outside_packs(struct odb_source *source,
+				    const struct object_id *oid)
+{
+	struct odb_source *outside_packs = source;
+
+	if (source->type == ODB_SOURCE_FILES)
+		outside_packs = &odb_source_files_downcast(source)->loose->base;
+	return !odb_source_read_object_info(outside_packs, oid, NULL, 0, NULL);
+}
+
 static int want_cruft_object_mtime(struct repository *r,
 				   const struct object_id *oid,
 				   unsigned flags, uint32_t mtime)
@@ -1569,8 +1583,12 @@ static int want_cruft_object_mtime(struct repository *r,
 	struct odb_source *source;
 
 	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packed_git **cache = packfile_store_get_kept_pack_cache(files->packed, flags);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		struct packed_git **cache;
+
+		if (!files)
+			continue;
+		cache = packfile_store_get_kept_pack_cache(files->packed, flags);
 
 		for (; *cache; cache++) {
 			struct packed_git *p = *cache;
@@ -1763,11 +1781,9 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 		 * skip the local object source.
 		 */
 		struct odb_source *source = the_repository->objects->sources->next;
-		for (; source; source = source->next) {
-			struct odb_source_files *files = odb_source_files_downcast(source);
-			if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0, NULL))
+		for (; source; source = source->next)
+			if (has_object_outside_packs(source, oid))
 				return 0;
-		}
 	}
 
 	/*
@@ -1786,10 +1802,13 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct multi_pack_index *m = get_multi_pack_index(files->packed);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		struct multi_pack_index *m;
 		struct pack_entry e;
 
+		if (!files)
+			continue;
+		m = get_multi_pack_index(files->packed);
 		if (m && midx_fill_entry(m, oid, &e, NULL) == MIDX_FILL_HIT) {
 			want = want_object_in_pack_one(e.p, oid, exclude, found_pack, found_offset, found_mtime);
 			if (want != -1)
@@ -1798,8 +1817,10 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
+		if (!files)
+			continue;
 		for (e = files->packed->packs.head; e; e = e->next) {
 			struct packed_git *p = e->pack;
 			want = want_object_in_pack_one(p, oid, exclude, found_pack, found_offset, found_mtime);
@@ -4173,11 +4194,9 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 			struct odb_source *source = the_repository->objects->sources;
 			int found = 0;
 
-			for (; !found && source; source = source->next) {
-				struct odb_source_files *files = odb_source_files_downcast(source);
-				if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0, NULL))
+			for (; !found && source; source = source->next)
+				if (has_object_outside_packs(source, oid))
 					found = 1;
-			}
 
 			/*
 			 * If a traversed tree has a missing blob then we want
@@ -4527,9 +4546,9 @@ static void add_objects_in_unpacked_packs(void)
 	};
 
 	for (source = to_pack.repo->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
-		if (!source->local)
+		if (!files || !source->local)
 			continue;
 
 		if (odb_source_for_each_object(&files->packed->base, &oi,
@@ -4631,7 +4650,7 @@ static int force_object_loose(struct odb_source *source,
 			      const struct object_id *oid,
 			      const time_t *mtime)
 {
-	struct odb_source_files *files = odb_source_files_downcast(source);
+	struct odb_source_files *files = odb_source_files_store(source);
 	const struct git_hash_algo *compat = source->odb->repo->compat_hash_algo;
 	struct object_info oi = OBJECT_INFO_INIT;
 	struct object_id compat_oid, *compat_oid_p = NULL;
@@ -4640,11 +4659,9 @@ static int force_object_loose(struct odb_source *source,
 	size_t len;
 	int ret;
 
-	for (struct odb_source *s = source->odb->sources; s; s = s->next) {
-		struct odb_source_files *files = odb_source_files_downcast(s);
-		if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0, NULL))
+	for (struct odb_source *s = source->odb->sources; s; s = s->next)
+		if (has_object_outside_packs(s, oid))
 			return 0;
-	}
 
 	oi.typep = &type;
 	oi.sizep = &len;

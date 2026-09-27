@@ -983,3 +983,20 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 
 	return files;
 }
+
+struct odb_source_files *odb_source_files_store_gently(struct odb_source *source)
+{
+	if (source->type != ODB_SOURCE_FILES)
+		return NULL;
+	return odb_source_files_downcast(source);
+}
+
+struct odb_source_files *odb_source_files_store(struct odb_source *source)
+{
+	struct odb_source_files *files = odb_source_files_store_gently(source);
+
+	if (!files)
+		BUG("object source of type '%s' has no files store",
+		    odb_source_type_to_name(source->type));
+	return files;
+}
