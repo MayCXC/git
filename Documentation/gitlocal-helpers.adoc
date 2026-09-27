@@ -195,7 +195,7 @@ A helper storing objects advertises the capabilities `get`, `put` and
 The objects directory of a repository whose objects are stored in a helper
 remains, and objects arriving there as packfiles or loose objects, such as
 those received by a fetch or push, are read from there until
-linkgit:git-gc[1] moves them into the helper with `put`. The helper stores
+linkgit:git-gc[1] moves them into the helper. The helper stores
 objects by the object ID Git gives it, in the object format of the
 repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 
@@ -228,6 +228,17 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	once the object is stored, or `error <message>`. Git sends it only to
 	a helper advertising `put-stream`, and otherwise reads the object into
 	memory to send `put`.
+
+`put-raw <oid> <type> <size> <delta-base> <compressed-size>`::
+	Store the object as a packfile keeps it: the _<compressed-size>_ bytes
+	that follow the command are the zlib-compressed contents of the object
+	when _<delta-base>_ is `0`, and otherwise a zlib-compressed delta (see
+	linkgit:gitformat-pack[5]) against _<delta-base>_, an object the
+	helper stores already. _<size>_ is the size of what the bytes inflate
+	to. Reply with _<oid>_ once the object is stored, or
+	`error <message>`. Git sends it only to a helper advertising
+	`put-raw`, as it moves the objects of a packfile into the helper, and
+	otherwise sends `put`.
 
 `list-objects [--promisor-only] [<prefix>]`::
 	List the objects stored whose IDs start with the hexadecimal

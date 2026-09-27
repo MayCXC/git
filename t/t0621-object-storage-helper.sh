@@ -240,6 +240,78 @@ test_expect_success 'fetch resolves a thin pack against bases in the helper' '
 	test_cmp expect actual
 '
 
+test_expect_success 'setup a server whose pack holds deltas' '
+	git init deltasrv &&
+	test_seq 1 300 >deltasrv/f &&
+	git -C deltasrv add f &&
+	git -C deltasrv commit -m one &&
+	test_seq 1 301 >deltasrv/f &&
+	git -C deltasrv commit -am two &&
+	git -C deltasrv repack -ad &&
+	git -C deltasrv cat-file --batch-all-objects \
+		--batch-check="%(deltabase)" >deltabases &&
+	test_grep -v $ZERO_OID deltabases
+'
+
+test_expect_success 'the deltas of a pack stay deltas in the helper' '
+	test_when_finished "rm -rf deltacl" &&
+	create_helper_repo deltacl &&
+	git -C deltacl -c fetch.unpackLimit=1 fetch --no-auto-maintenance \
+		"$(pwd)/deltasrv" main:src &&
+	git -C deltacl gc &&
+	assert_files_store_empty deltacl &&
+	git -C deltacl cat-file --batch-all-objects \
+		--batch-check="%(deltabase)" >deltabases &&
+	test_grep -v $ZERO_OID deltabases &&
+	git -C deltacl fsck
+'
+
+test_expect_success 'a helper without put-raw takes the objects of a pack whole' '
+	test_when_finished "rm -rf wholecl" &&
+	create_helper_repo wholecl &&
+	git -C wholecl -c fetch.unpackLimit=1 fetch --no-auto-maintenance \
+		"$(pwd)/deltasrv" main:src &&
+	GIT_LOCAL_TESTGIT_CAPABILITIES="get info put have list-objects optimize" \
+		git -C wholecl gc &&
+	assert_files_store_empty wholecl &&
+	git -C wholecl cat-file --batch-all-objects \
+		--batch-check="%(deltabase)" >deltabases &&
+	test_grep ! -v $ZERO_OID deltabases &&
+	git -C wholecl fsck
+'
+
+# index-pack completes a thin pack by appending the bases it lacks, after the
+# deltas against them. With the first pack kept, the base of the new delta
+# moves into the helper only from the end of the second pack, so the delta
+# waits for it.
+test_expect_success 'a delta of a thin pack waits for the base appended to it' '
+	test_when_finished "rm -rf thinsrv thincl" &&
+	git init thinsrv &&
+	test_seq 1 300 >thinsrv/f &&
+	git -C thinsrv add f &&
+	git -C thinsrv commit -m one &&
+	create_helper_repo thincl &&
+	git -C thincl -c fetch.unpackLimit=1 fetch --no-auto-maintenance \
+		"$(pwd)/thinsrv" main:src &&
+	for pack in thincl/.git/objects/pack/*.pack
+	do
+		>"${pack%.pack}.keep" || return 1
+	done &&
+	test_seq 1 301 >thinsrv/f &&
+	git -C thinsrv commit -am two &&
+	git -C thincl -c fetch.unpackLimit=1 fetch --no-auto-maintenance \
+		"$(pwd)/thinsrv" main:src &&
+	git -C thincl gc &&
+	git -C thincl rev-parse src~1:f >expect &&
+	git -C thincl rev-parse src:f >blob &&
+	git -C thincl cat-file --batch-check="%(deltabase)" <blob >actual &&
+	test_cmp expect actual &&
+	git -C thinsrv cat-file -p main:f >expect &&
+	git -C thincl cat-file -p src:f >actual &&
+	test_cmp expect actual &&
+	git -C thincl fsck
+'
+
 test_expect_success 'fetch with fsckObjects checks objects into the helper repository' '
 	echo "line 202" >>server/big &&
 	git -C server commit -am v3 &&

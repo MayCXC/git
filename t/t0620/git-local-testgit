@@ -5,7 +5,8 @@
 # gitlocal-helpers(7)), for objects and refs alike, like a real helper does.
 # State is kept as plain files under the directory the helper is spawned
 # with: objects in helper-objects/ (each with a .meta file holding
-# "<type> <size>", and a .promisor marker for promisor objects), refs in
+# "<type> <size>", followed by " <delta-base>" for an object that arrived
+# as a delta, and a .promisor marker for promisor objects), refs in
 # helper-refs/, reflogs in helper-reflogs/ (refnames encode '/' as '_').
 
 OBJDIR="$1/helper-objects"
@@ -23,16 +24,19 @@ LOG="${GIT_LOCAL_TESTGIT_LOG:-}"
 # command is handled, so a test can act at a point of an exchange.
 ON_COMMAND="${GIT_LOCAL_TESTGIT_ON_COMMAND:-}"
 
+# When set, the capabilities to advertise instead of all of them, so a test
+# can exercise what git does without one.
+CAPABILITIES="${GIT_LOCAL_TESTGIT_CAPABILITIES:-get info put put-raw \
+put-stream have list-objects promisor refresh optimize verify \
+read list transaction create remove reflog reflog-read-reverse}"
+
 while IFS= read -r line
 do
 	test -n "$LOG" && printf '%s\n' "$line" >>"$LOG"
 	test -n "$ON_COMMAND" && eval "$ON_COMMAND"
 	case "$line" in
 	capabilities)
-		printf '%s\n' get info put put-stream have list-objects \
-			promisor refresh optimize verify \
-			read list transaction create remove \
-			reflog reflog-read-reverse ""
+		printf '%s\n' $CAPABILITIES ""
 		;;
 	info\ *)
 		oid="${line#info }"
@@ -74,6 +78,27 @@ do
 		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
 		echo "$oid"
 		;;
+	put-raw\ *)
+		# put-raw <oid> <type> <size> <delta-base> <compressed-size>, then
+		# the compressed content, or a compressed delta against a stored
+		# <delta-base>. Keep the object resolved, and the base to report.
+		set -- $line
+		oid="$2" type="$3" base="$5" clen="$6"
+		tmp=$(mktemp "$OBJDIR/tmp.XXXXXX")
+		head -c "$clen" | test-tool zlib inflate >"$tmp"
+		if test "$base" = 0
+		then
+			mv "$tmp" "$OBJDIR/$oid"
+			size=$(wc -c <"$OBJDIR/$oid")
+			printf '%s %d\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		else
+			test-tool delta -p "$OBJDIR/$base" "$tmp" "$OBJDIR/$oid"
+			rm -f "$tmp"
+			size=$(wc -c <"$OBJDIR/$oid")
+			printf '%s %d %s\n' "$type" "$size" "$base" >"$OBJDIR/$oid.meta"
+		fi
+		echo "$oid"
+		;;
 	have\ *)
 		oid="${line#have }"
 		if test -f "$OBJDIR/$oid.meta"
@@ -108,7 +133,7 @@ do
 			then
 				continue
 			fi
-			read -r type size <"$meta"
+			read -r type size base <"$meta"
 			printf '%s %s %s\n' "$oid" "$type" "$size"
 		done
 		echo ""
@@ -139,7 +164,7 @@ do
 		do
 			test -f "$meta" || continue
 			oid=$(basename "$meta" .meta)
-			read -r type size <"$meta"
+			read -r type size base <"$meta"
 			got=$(git hash-object -t "$type" --stdin <"$OBJDIR/$oid")
 			if test "$got" != "$oid"
 			then

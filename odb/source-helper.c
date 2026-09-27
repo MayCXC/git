@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "config.h"
+#include "dir.h"
 #include "gettext.h"
 #include "hex.h"
 #include "helper.h"
@@ -13,6 +14,7 @@
 #include "odb/streaming.h"
 #include "odb/transaction.h"
 #include "oid-array.h"
+#include "oidset.h"
 #include "packfile.h"
 #include "repository.h"
 #include "strbuf.h"
@@ -33,6 +35,7 @@ enum object_helper_capability {
 	OBJECT_HELPER_OPTIMIZE = (1 << 9),
 	OBJECT_HELPER_OPTIMIZE_REQUIRED = (1 << 10),
 	OBJECT_HELPER_VERIFY = (1 << 11),
+	OBJECT_HELPER_PUT_RAW = (1 << 12),
 };
 
 static const struct helper_capability object_helper_capabilities[] = {
@@ -48,6 +51,7 @@ static const struct helper_capability object_helper_capabilities[] = {
 	{ "optimize", OBJECT_HELPER_OPTIMIZE },
 	{ "optimize-required", OBJECT_HELPER_OPTIMIZE_REQUIRED },
 	{ "verify", OBJECT_HELPER_VERIFY },
+	{ "put-raw", OBJECT_HELPER_PUT_RAW },
 	{ NULL },
 };
 
@@ -867,52 +871,190 @@ static int odb_source_helper_read_alternates(struct odb_source *source,
 
 struct drain {
 	struct odb_source_helper *helper;
+	/* Whether the loose objects of the files store move, too. */
+	unsigned loose : 1;
+	/* The packfiles whose objects move into the helper. */
+	struct packed_git **packs;
+	size_t packs_nr;
+	/* The objects this drain stored in the helper. */
+	struct oidset stored;
+	/* Packed deltas waiting for their base to be stored first. */
+	struct drain_waiting {
+		struct packed_git *pack;
+		uint32_t pos;
+	} *waiting;
+	size_t waiting_nr, waiting_alloc;
 	struct oid_array promisor;
-	int ret;
 };
 
-/* Copy one object of the files store into the helper, unless it is there. */
-static int drain_object(struct drain *drain, const struct object_id *oid,
-			int promisor)
+/* Whether the helper stores `oid`, from before or from this drain. */
+static int drain_stored(struct drain *drain, const struct object_id *oid)
+{
+	return oidset_contains(&drain->stored, oid) ||
+	       helper_read_object(drain->helper, oid, NULL, 0, NULL) == ODB_READ_OK;
+}
+
+/* Whether `oid` is among the objects this drain moves into the helper. */
+static int drain_moves(struct drain *drain, const struct object_id *oid)
+{
+	for (size_t i = 0; i < drain->packs_nr; i++)
+		if (find_pack_entry_one(oid, drain->packs[i]))
+			return 1;
+	return drain->loose &&
+	       odb_source_read_object_info(&drain->helper->files->loose->base,
+					   oid, NULL, 0, NULL) == ODB_READ_OK;
+}
+
+/* Copy one object of the files store into the helper whole. */
+static int drain_whole(struct drain *drain, const struct object_id *oid)
 {
 	struct odb_source_helper *helper = drain->helper;
 	struct object_info oi = OBJECT_INFO_INIT;
 	enum object_type type;
 	size_t size;
 	void *buf = NULL;
-
-	if (promisor)
-		oid_array_append(&drain->promisor, oid);
-
-	if (helper_read_object(helper, oid, NULL, 0, NULL) == ODB_READ_OK)
-		return 0;
+	int ret;
 
 	oi.typep = &type;
 	oi.sizep = &size;
 	oi.contentp = &buf;
-	if (odb_source_read_object_info(&helper->files->base, oid, &oi, 0, NULL)) {
-		drain->ret = error(_("unable to read %s to move it into helper '%s'"),
-				   oid_to_hex(oid), helper->hp.name);
-		return drain->ret;
-	}
-	if (odb_source_helper_write_object(&helper->base, buf, size, type,
-					   oid, NULL, NULL, 0))
-		drain->ret = -1;
+	if (odb_source_read_object_info(&helper->files->base, oid, &oi, 0, NULL))
+		return error(_("unable to read %s to move it into helper '%s'"),
+			     oid_to_hex(oid), helper->hp.name);
+	ret = odb_source_helper_write_object(&helper->base, buf, size, type,
+					     oid, NULL, NULL, 0);
+	if (!ret)
+		oidset_insert(&drain->stored, oid);
 	free(buf);
-	return drain->ret;
+	return ret;
+}
+
+/* Store an object with "put-raw" as its packfile keeps it. */
+static int put_raw(struct drain *drain, const struct object_id *oid,
+		   const struct packed_raw_entry *entry)
+{
+	struct odb_source_helper *helper = drain->helper;
+	struct helper_process *hp = started(helper);
+	struct strbuf line = STRBUF_INIT;
+	char hex[GIT_MAX_HEXSZ + 1], base[GIT_MAX_HEXSZ + 1];
+	int ret = 0;
+
+	oid_to_hex_r(hex, oid);
+	if (is_null_oid(&entry->delta_base))
+		xsnprintf(base, sizeof(base), "0");
+	else
+		oid_to_hex_r(base, &entry->delta_base);
+
+	helper_process_send(hp, "put-raw %s %s %"PRIuMAX" %s %"PRIuMAX"\n",
+			    hex, type_name(entry->type), (uintmax_t)entry->size,
+			    base, (uintmax_t)entry->data_len);
+	helper_process_write(hp, entry->data, entry->data_len);
+	if (helper_process_readline(hp, &line) == EOF)
+		drop_connection(helper);
+	if (strcmp(line.buf, hex))
+		ret = error(_("helper '%s' failed to write %s: %s"), hp->name,
+			    hex, line.len ? line.buf : _("no reply"));
+	else
+		oidset_insert(&drain->stored, oid);
+	strbuf_release(&line);
+	return ret;
+}
+
+/*
+ * Move the object at index position `pos` of `pack` into the helper as the
+ * packfile keeps it, as a delta if it is one, provided the helper takes
+ * objects so. The base of a delta is stored first: a delta whose base the
+ * helper lacks waits for it if `may_wait` and the base moves along, like
+ * the bases index-pack appends to a thin pack, and is stored whole
+ * otherwise. Returns 0 once the object is stored or waiting, and -1 on
+ * error.
+ */
+static int drain_packed(struct drain *drain, const struct object_id *oid,
+			struct packed_git *pack, uint32_t pos, int may_wait)
+{
+	struct packed_raw_entry entry;
+	int ret;
+
+	if (!capable(drain->helper, OBJECT_HELPER_PUT_RAW) ||
+	    packed_object_raw_entry(pack, nth_packed_object_offset(pack, pos),
+				    &entry))
+		return drain_whole(drain, oid);
+
+	if (!is_null_oid(&entry.delta_base) &&
+	    !drain_stored(drain, &entry.delta_base)) {
+		free(entry.data);
+		if (may_wait && drain_moves(drain, &entry.delta_base)) {
+			ALLOC_GROW(drain->waiting, drain->waiting_nr + 1,
+				   drain->waiting_alloc);
+			drain->waiting[drain->waiting_nr].pack = pack;
+			drain->waiting[drain->waiting_nr].pos = pos;
+			drain->waiting_nr++;
+			return 0;
+		}
+		return drain_whole(drain, oid);
+	}
+
+	ret = put_raw(drain, oid, &entry);
+	free(entry.data);
+	return ret;
+}
+
+/*
+ * Store the deltas left waiting for their base, in rounds, as a base may
+ * itself have been waiting. A round that stores none of them leaves no base
+ * to wait for, so the rest are stored whole.
+ */
+static int drain_waiting(struct drain *drain)
+{
+	int may_wait = 1;
+
+	while (drain->waiting_nr) {
+		struct drain_waiting *waiting = drain->waiting;
+		size_t nr = drain->waiting_nr;
+		int ret = 0;
+
+		drain->waiting = NULL;
+		drain->waiting_nr = drain->waiting_alloc = 0;
+		for (size_t i = 0; !ret && i < nr; i++) {
+			struct object_id oid;
+
+			if (nth_packed_object_id(&oid, waiting[i].pack,
+						 waiting[i].pos) < 0)
+				ret = -1;
+			else if (!drain_stored(drain, &oid))
+				ret = drain_packed(drain, &oid, waiting[i].pack,
+						   waiting[i].pos, may_wait);
+		}
+		free(waiting);
+		if (ret)
+			return ret;
+		if (drain->waiting_nr == nr)
+			may_wait = 0;
+	}
+	return 0;
 }
 
 static int drain_packed_object(const struct object_id *oid,
 			       struct packed_git *pack,
-			       uint32_t pos UNUSED, void *data)
+			       uint32_t pos, void *data)
 {
-	return drain_object(data, oid, pack->pack_promisor);
+	struct drain *drain = data;
+
+	if (pack->pack_promisor)
+		oid_array_append(&drain->promisor, oid);
+	if (drain_stored(drain, oid))
+		return 0;
+	return drain_packed(drain, oid, pack, pos, 1);
 }
 
 static int drain_loose_object(const struct object_id *oid,
 			      struct object_info *oi UNUSED, void *data)
 {
-	return drain_object(data, oid, 0);
+	struct drain *drain = data;
+
+	if (drain_stored(drain, oid))
+		return 0;
+	return drain_whole(drain, oid);
 }
 
 /*
@@ -922,8 +1064,7 @@ static int drain_loose_object(const struct object_id *oid,
 static int remove_loose_object(const struct object_id *oid, const char *path,
 			       void *data)
 {
-	if (helper_read_object(data, oid, NULL, 0, NULL) == ODB_READ_OK &&
-	    unlink(path) && errno != ENOENT)
+	if (drain_stored(data, oid) && unlink(path) && errno != ENOENT)
 		warning_errno(_("unable to remove %s"), path);
 	return 0;
 }
@@ -963,51 +1104,53 @@ static int mark_promisor_objects(struct drain *drain)
 }
 
 /*
- * Move the objects of the files store into the helper: copy them, then
- * remove the loose objects and the packfiles they came from. A packfile with
- * a .keep file is left for later, as the .keep of a fetch or push still
- * receiving it looks the same as one keeping it for good.
+ * Move the objects of `packs`, and with `loose` the loose objects of the
+ * files store, into the helper: copy them, then remove the packfiles and
+ * loose objects they came from.
  */
-static int drain_files_store(struct odb_source_helper *helper)
+static int drain(struct odb_source_helper *helper, struct packed_git **packs,
+		 size_t packs_nr, int loose)
 {
 	struct odb_source_files *files = helper->files;
 	struct odb_for_each_object_options opts = { 0 };
 	struct drain drain = {
 		.helper = helper,
+		.loose = !!loose,
+		.packs = packs,
+		.packs_nr = packs_nr,
+		.stored = OIDSET_INIT,
 		.promisor = OID_ARRAY_INIT,
 	};
 	struct odb_transaction *transaction = NULL;
-	struct packfile_list_entry *e;
-	struct packed_git **drained = NULL;
-	size_t drained_nr = 0, drained_alloc = 0;
 	int ret = 0;
 
-	odb_source_prepare(&files->base, ODB_PREPARE_FLUSH_CACHES);
+	for (size_t i = 0; i < packs_nr; i++)
+		/* The objects of a pack are counted once its index is open. */
+		if (open_pack_index(packs[i]))
+			return error(_("unable to open the index of %s"),
+				     packs[i]->pack_name);
 
 	if (!helper->base.odb->transaction &&
-	    odb_source_helper_begin_transaction(&helper->base, &transaction, 0))
-		return -1;
+	    odb_source_helper_begin_transaction(&helper->base, &transaction, 0)) {
+		ret = -1;
+		goto out;
+	}
 
-	for (e = packfile_store_get_packs(files->packed); e; e = e->next) {
-		struct packed_git *p = e->pack;
+	/* In pack order, the base of an offset delta comes before it. */
+	for (size_t i = 0; i < drain.packs_nr; i++) {
+		struct packed_git *p = drain.packs[i];
 
-		if (p->pack_keep)
-			continue;
-		/* The objects of a pack are counted once its index is open. */
-		if (open_pack_index(p)) {
-			ret = error(_("unable to open the index of %s"), p->pack_name);
-			goto out;
-		}
-		if (for_each_object_in_pack(p, drain_packed_object, &drain, 0)) {
+		if (for_each_object_in_pack(p, drain_packed_object, &drain,
+					    ODB_FOR_EACH_OBJECT_PACK_ORDER)) {
 			ret = error(_("unable to move %s into helper '%s'"),
 				    p->pack_name, helper->hp.name);
 			goto out;
 		}
-		ALLOC_GROW(drained, drained_nr + 1, drained_alloc);
-		drained[drained_nr++] = p;
 	}
-	if (odb_source_for_each_object(&files->loose->base, NULL,
-				       drain_loose_object, &drain, &opts)) {
+	if ((loose && odb_source_for_each_object(&files->loose->base, NULL,
+						 drain_loose_object, &drain,
+						 &opts)) ||
+	    drain_waiting(&drain)) {
 		ret = -1;
 		goto out;
 	}
@@ -1024,14 +1167,15 @@ static int drain_files_store(struct odb_source_helper *helper)
 			goto out;
 	}
 
-	for_each_loose_file_in_source(&files->loose->base,
-				      remove_loose_object, NULL,
-				      remove_loose_subdir, helper);
-	if (drained_nr && get_multi_pack_index(files->packed))
+	if (loose)
+		for_each_loose_file_in_source(&files->loose->base,
+					      remove_loose_object, NULL,
+					      remove_loose_subdir, &drain);
+	if (packs_nr && get_multi_pack_index(files->packed))
 		clear_midx_file(helper->base.odb->repo);
-	for (size_t i = 0; i < drained_nr; i++) {
-		close_pack(drained[i]);
-		unlink_pack_path(drained[i]->pack_name, 0);
+	for (size_t i = 0; i < packs_nr; i++) {
+		close_pack(packs[i]);
+		unlink_pack_path(packs[i]->pack_name, 0);
 	}
 	odb_source_prepare(&files->base, ODB_PREPARE_FLUSH_CACHES);
 
@@ -1041,8 +1185,37 @@ out:
 		drop_connection(helper);
 		free(transaction);
 	}
-	free(drained);
+	free(drain.waiting);
+	oidset_clear(&drain.stored);
 	oid_array_clear(&drain.promisor);
+	return ret;
+}
+
+/*
+ * Move the objects of the files store into the helper. A packfile with a
+ * .keep file is left for later, as the .keep of a fetch or push still
+ * receiving it looks the same as one keeping it for good, and so is one
+ * that another process removed since the store was last prepared, which
+ * stays listed.
+ */
+static int drain_files_store(struct odb_source_helper *helper)
+{
+	struct odb_source_files *files = helper->files;
+	struct packfile_list_entry *e;
+	struct packed_git **packs = NULL;
+	size_t nr = 0, alloc = 0;
+	int ret;
+
+	odb_source_prepare(&files->base, ODB_PREPARE_FLUSH_CACHES);
+	for (e = packfile_store_get_packs(files->packed); e; e = e->next) {
+		if (e->pack->pack_keep || !file_exists(e->pack->pack_name))
+			continue;
+		ALLOC_GROW(packs, nr + 1, alloc);
+		packs[nr++] = e->pack;
+	}
+
+	ret = drain(helper, packs, nr, 1);
+	free(packs);
 	return ret;
 }
 
