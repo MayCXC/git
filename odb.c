@@ -1031,6 +1031,12 @@ bool odb_optimize_required(struct object_database *odb,
 	return odb_source_optimize_required(odb->sources, opts);
 }
 
+int odb_prune(struct object_database *odb,
+	      const struct odb_prune_options *opts)
+{
+	return odb_source_prune(odb->sources, opts);
+}
+
 void odb_generate_pack_options_release(struct odb_generate_pack_options *opts)
 {
 	oid_array_clear(&opts->wants);

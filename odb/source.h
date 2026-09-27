@@ -336,6 +336,21 @@ struct odb_source {
 	 */
 	int (*fsck)(struct odb_source *source,
 		    struct odb_fsck_options *options);
+
+	/*
+	 * This callback is expected to remove the objects of the source that
+	 * are unreachable and were last written before the expiry of the
+	 * options, as git-prune(1) removes loose objects.
+	 *
+	 * This callback is optional. Sources that keep their objects as loose
+	 * objects and packfiles, which git-prune(1) and git-repack(1) remove,
+	 * shall leave it unset.
+	 *
+	 * The callback is expected to return 0 on success, a negative error
+	 * code otherwise.
+	 */
+	int (*prune)(struct odb_source *source,
+		     const struct odb_prune_options *opts);
 };
 
 /*
@@ -620,6 +635,18 @@ static inline int odb_source_fsck(struct odb_source *source,
 				  struct odb_fsck_options *opts)
 {
 	return source->fsck(source, opts);
+}
+
+/*
+ * Prune the unreachable objects of the source that git-prune(1) does not
+ * remove itself. Returns 0 on success, a negative error code otherwise.
+ */
+static inline int odb_source_prune(struct odb_source *source,
+				   const struct odb_prune_options *opts)
+{
+	if (!source->prune)
+		return 0;
+	return source->prune(source, opts);
 }
 
 #endif

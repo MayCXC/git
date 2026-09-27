@@ -167,6 +167,31 @@ int odb_optimize(struct object_database *odb,
 bool odb_optimize_required(struct object_database *odb,
 			   const struct odb_optimize_options *opts);
 
+enum odb_prune_flags {
+	/* Report the objects to prune without removing them. */
+	ODB_PRUNE_DRY_RUN = (1 << 0),
+};
+
+struct odb_prune_options {
+	enum odb_prune_flags flags;
+	/* Objects last written after this time stay. */
+	timestamp_t expire;
+	/* Tell whether an object is reachable, which then stays. */
+	bool (*is_reachable)(const struct object_id *oid, void *data);
+	/* Called with each object pruned. */
+	void (*pruned)(const struct object_id *oid, enum object_type type,
+		       void *data);
+	void *data;
+};
+
+/*
+ * Prune the unreachable objects that the object database keeps other than as
+ * loose objects and packfiles, which git-prune(1) and git-repack(1) remove.
+ * Returns 0 on success, a negative error code otherwise.
+ */
+int odb_prune(struct object_database *odb,
+	      const struct odb_prune_options *opts);
+
 /*
  * Close the object database and all of its sources so that any held resources
  * will be released. The database can still be used after closing it, in which

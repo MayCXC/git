@@ -108,6 +108,19 @@ static int prune_object(const struct object_id *oid, const char *fullpath,
 	return 0;
 }
 
+static bool is_reachable_to_prune(const struct object_id *oid, void *data)
+{
+	return is_object_reachable(oid, data);
+}
+
+static void show_pruned(const struct object_id *oid, enum object_type type,
+			void *data UNUSED)
+{
+	if (show_only || verbose)
+		printf("%s %s\n", oid_to_hex(oid),
+		       (type > 0) ? type_name(type) : "unknown");
+}
+
 static int prune_cruft(const char *basename, const char *path,
 		       void *data UNUSED)
 {
@@ -156,7 +169,12 @@ int cmd_prune(int argc,
 	      struct repository *repo)
 {
 	struct rev_info revs;
-	int exclude_promisor_objects = 0;
+	struct odb_prune_options prune_opts = {
+		.is_reachable = is_reachable_to_prune,
+		.pruned = show_pruned,
+		.data = &revs,
+	};
+	int exclude_promisor_objects = 0, ret = 0;
 	const struct option options[] = {
 		OPT__DRY_RUN(&show_only, N_("do not remove, show only")),
 		OPT__VERBOSE(&verbose, N_("report pruned objects")),
@@ -201,6 +219,12 @@ int cmd_prune(int argc,
 	for_each_loose_file_in_source(repo->objects->sources,
 				      prune_object, prune_cruft, prune_subdir, &revs);
 
+	if (show_only)
+		prune_opts.flags |= ODB_PRUNE_DRY_RUN;
+	prune_opts.expire = expire;
+	if (odb_prune(repo->objects, &prune_opts))
+		ret = error(_("unable to prune the object database"));
+
 	prune_packed_objects(show_only ? PRUNE_PACKED_DRY_RUN : 0);
 	remove_temporary_files(repo_get_object_directory(repo));
 	s = mkpathdup("%s/pack", repo_get_object_directory(repo));
@@ -213,5 +237,5 @@ int cmd_prune(int argc,
 	}
 
 	release_revisions(&revs);
-	return 0;
+	return ret;
 }
