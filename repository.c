@@ -218,6 +218,12 @@ void repo_set_ref_storage_format(struct repository *repo,
 	repo->ref_storage_payload = xstrdup_or_null(payload);
 }
 
+void repo_set_object_storage(struct repository *repo, const char *uri)
+{
+	free(repo->object_storage);
+	repo->object_storage = xstrdup_or_null(uri);
+}
+
 /*
  * Attempt to resolve and set the provided 'gitdir' for repository 'repo'.
  * Return 0 upon success and a non-zero value upon failure.
@@ -385,6 +391,7 @@ void repo_clear(struct repository *repo)
 	free(repo->ref_storage_payload);
 
 	odb_free(repo->objects);
+	free(repo->object_storage);
 
 	if (repo->parsed_objects)
 		parsed_object_pool_clear(repo->parsed_objects);

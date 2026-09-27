@@ -11,7 +11,7 @@ SYNOPSIS
 [synopsis]
 git init [-q | --quiet] [--bare] [--template=<template-directory>]
 	 [--separate-git-dir <git-dir>] [--object-format=<format>]
-	 [--ref-storage-format=<format>]
+	 [--ref-storage-format=<format>] [--object-storage=<storage>]
 	 [-b <branch-name> | --initial-branch=<branch-name>]
 	 [--shared[=<permissions>]] [<directory>]
 
@@ -67,6 +67,12 @@ include::ref-storage-format.adoc[]
 
 `--ref-format=<format>`::
 Deprecated alias of `--ref-storage-format=<format>`.
+
+`--object-storage=<storage>`::
+Specify the given object _<storage>_ for the repository. The valid values
+are:
++
+include::object-storage.adoc[]
 
 `--template=<template-directory>`::
 Specify the directory from which templates will be used.  (See the "TEMPLATE

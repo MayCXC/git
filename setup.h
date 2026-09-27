@@ -190,6 +190,7 @@ struct repository_format {
 	int compat_hash_algo;
 	enum ref_storage_format ref_storage_format;
 	char *ref_storage_payload;
+	char *object_storage; /* canonical extensions.objectstorage, or NULL */
 	int sparse_index;
 	char *work_tree;
 	struct string_list unknown_extensions;
@@ -274,6 +275,7 @@ void create_repository(struct repository *repo,
 		       const char *template_dir,
 		       int hash_algo,
 		       const char *ref_storage_format_uri,
+		       const char *object_storage_uri,
 		       int init_shared_repository,
 		       int *reinit_ok);
 

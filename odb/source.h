@@ -342,10 +342,25 @@ struct odb_source {
  * Allocate and initialize a new source for the given object database located
  * at `path`. `local` indicates whether or not the source is the local and thus
  * primary object source of the object database.
+ *
+ * The objects directory of the repository is opened with the object storage
+ * the repository is configured with, be it the primary source or not, as when
+ * a child process writes into a quarantine. Any other directory, like that of
+ * an alternate, is opened with the files backend.
  */
 struct odb_source *odb_source_new(struct object_database *odb,
 				  const char *path,
 				  bool local);
+
+/*
+ * Parse the URI of an object storage, "<format>[://<payload>]": "files" for the
+ * files backend, which is the default, or "helper://<name>" for the objects
+ * that the git-local-<name> helper keeps, which a bare name spelled like a URL
+ * scheme also stands for. On success, set `canonical` to the URI in its
+ * canonical form, or to a NULL pointer for the files backend, and return 0.
+ * Return -1 in case the URI names no object storage.
+ */
+int odb_object_storage_parse(const char *uri, char **canonical);
 
 /*
  * Initialize the source for the given object database located at `path`.

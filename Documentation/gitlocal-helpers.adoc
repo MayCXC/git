@@ -16,12 +16,12 @@ DESCRIPTION
 Local helper programs store the references or the objects of a repository
 in a way Git does not support natively, for example in a database. A
 repository keeps its references in a helper when `extensions.refStorage` is
-`helper://<name>` (see linkgit:git-config[1]). Git then runs
-`git-local-<name>`, sends it commands on its standard input and reads the
-replies from its standard output, the way it drives a remote helper (see
-linkgit:gitremote-helpers[7]). Because a local helper runs as a separate
-process, there is no need to rebuild Git to add one, nor for the helper to
-link with Git.
+`helper://<name>`, and its objects when `extensions.objectStorage` is (see
+linkgit:git-config[1]). Git then runs `git-local-<name>`, sends it commands
+on its standard input and reads the replies from its standard output, the
+way it drives a remote helper (see linkgit:gitremote-helpers[7]). Because a
+local helper runs as a separate process, there is no need to rebuild Git to
+add one, nor for the helper to link with Git.
 
 A local helper stores data at the fine granularity of Git's own storage:
 Git reads, writes and lists single references and objects, and updates

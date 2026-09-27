@@ -623,4 +623,52 @@ test_expect_success 'refs migrate: migration to the same helper fails' '
 	test_grep "already uses .helper://testgit. format" err
 '
 
+# A repository keeping both its refs and its objects in the helper runs two
+# helper processes, one for each; both root at the common directory, which a
+# linked worktree exposes.
+test_expect_success 'a repository with refs and objects in the helper supports worktrees' '
+	test_when_finished "rm -rf combined wt2" &&
+	git init --ref-storage-format=testgit --object-storage=testgit combined &&
+	test_commit -C combined first &&
+	git -C combined worktree add ../wt2 &&
+	cat >expect <<-\EOF &&
+	* main
+	+ wt2
+	EOF
+	git -C combined branch >actual &&
+	test_cmp expect actual &&
+	git -C wt2 log --oneline >log &&
+	test_line_count = 1 log
+'
+
+# gc walks the reflogs to mark reachable objects, and reads each commit from
+# the object helper while the ref helper serves the reflog.
+test_expect_success 'gc and prune walk the reflog of a helper repository' '
+	test_when_finished "rm -rf reflogwalk" &&
+	git init --ref-storage-format=testgit --object-storage=testgit reflogwalk &&
+	test_commit -C reflogwalk one &&
+	test_commit -C reflogwalk two &&
+	test_commit -C reflogwalk three &&
+	git -C reflogwalk gc &&
+	git -C reflogwalk prune --expire=now &&
+	git -C reflogwalk fsck &&
+	git -C reflogwalk rev-list --all >walked &&
+	test_line_count = 3 walked
+'
+
+# The helper keeps its objects under the gitdir where its refs go too, so
+# migrating the refs into it must add them to its store rather than put a
+# store of its own in place.
+test_expect_success 'refs migrate into the helper keeps the objects it stores' '
+	test_when_finished "rm -rf objectsfirst" &&
+	git init --object-storage=testgit objectsfirst &&
+	test_commit -C objectsfirst one &&
+	test_commit -C objectsfirst two &&
+	git -C objectsfirst rev-list --objects --all >expect &&
+	git -C objectsfirst refs migrate --ref-storage-format=testgit &&
+	git -C objectsfirst rev-list --objects --all >actual &&
+	test_cmp expect actual &&
+	git -C objectsfirst fsck
+'
+
 test_done

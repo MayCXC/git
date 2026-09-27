@@ -1,14 +1,17 @@
 #!/bin/sh
 #
 # Minimal "git-local-testgit" storage helper for exercising the local helper
-# ref backend end to end. Speaks the line protocol on stdin/stdout (see
-# gitlocal-helpers(7)). State is kept as plain files under the directory the
-# helper is spawned with: refs in helper-refs/, reflogs in helper-reflogs/
-# (refnames encode '/' as '_').
+# backends end to end. Speaks the line protocol on stdin/stdout (see
+# gitlocal-helpers(7)), for objects and refs alike, like a real helper does.
+# State is kept as plain files under the directory the helper is spawned
+# with: objects in helper-objects/ (each with a .meta file holding
+# "<type> <size>", and a .promisor marker for promisor objects), refs in
+# helper-refs/, reflogs in helper-reflogs/ (refnames encode '/' as '_').
 
+OBJDIR="$1/helper-objects"
 REFDIR="$1/helper-refs"
 REFLOGDIR="$1/helper-reflogs"
-mkdir -p "$REFDIR" "$REFLOGDIR"
+mkdir -p "$OBJDIR" "$REFDIR" "$REFLOGDIR"
 
 TXUPDATES=
 
@@ -16,13 +19,135 @@ TXUPDATES=
 # wire behavior.
 LOG="${GIT_LOCAL_TESTGIT_LOG:-}"
 
+# When set, evaluated for every received command line, as $line, before the
+# command is handled, so a test can act at a point of an exchange.
+ON_COMMAND="${GIT_LOCAL_TESTGIT_ON_COMMAND:-}"
+
 while IFS= read -r line
 do
 	test -n "$LOG" && printf '%s\n' "$line" >>"$LOG"
+	test -n "$ON_COMMAND" && eval "$ON_COMMAND"
 	case "$line" in
 	capabilities)
-		printf '%s\n' read list transaction create remove \
+		printf '%s\n' get info put put-stream have list-objects \
+			promisor refresh optimize verify \
+			read list transaction create remove \
 			reflog reflog-read-reverse ""
+		;;
+	info\ *)
+		oid="${line#info }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			cat "$OBJDIR/$oid.meta"
+		else
+			echo missing
+		fi
+		;;
+	get\ *)
+		oid="${line#get }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			cat "$OBJDIR/$oid.meta" "$OBJDIR/$oid"
+		else
+			echo missing
+		fi
+		;;
+	put\ *)
+		# put <oid> <type> <size>, then <size> bytes of content. git
+		# waits for the reply, so nothing follows the content yet.
+		set -- $line
+		oid="$2" type="$3" size="$4"
+		head -c "$size" >"$OBJDIR/$oid"
+		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		echo "$oid"
+		;;
+	put-stream\ *)
+		# put-stream <type> <size>, then the content and a line with the
+		# object ID git computed. git sends the ID without waiting, so
+		# read the content a byte at a time to leave the ID in the pipe.
+		set -- $line
+		type="$2" size="$3"
+		tmp=$(mktemp "$OBJDIR/tmp.XXXXXX")
+		dd bs=1 count="$size" of="$tmp" 2>/dev/null
+		IFS= read -r oid
+		mv "$tmp" "$OBJDIR/$oid"
+		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		echo "$oid"
+		;;
+	have\ *)
+		oid="${line#have }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			echo true
+		else
+			echo false
+		fi
+		;;
+	list-objects | list-objects\ *)
+		# An optional "--promisor-only" restricts the listing to the
+		# objects marked by "promisor"; an optional hex prefix scopes it
+		# to the objects whose IDs start with it.
+		promisor_only=
+		prefix=
+		for arg in ${line#list-objects}
+		do
+			case "$arg" in
+			--promisor-only) promisor_only=t ;;
+			*) prefix=$arg ;;
+			esac
+		done
+		for meta in "$OBJDIR"/*.meta
+		do
+			test -f "$meta" || continue
+			oid=$(basename "$meta" .meta)
+			case "$oid" in
+			"$prefix"*) ;;
+			*) continue ;;
+			esac
+			if test -n "$promisor_only" && ! test -f "$OBJDIR/$oid.promisor"
+			then
+				continue
+			fi
+			read -r type size <"$meta"
+			printf '%s %s %s\n' "$oid" "$type" "$size"
+		done
+		echo ""
+		;;
+	promisor)
+		# Mark each listed object, one ID per line up to a blank line,
+		# as a promisor object.
+		while IFS= read -r oid
+		do
+			test -n "$oid" || break
+			: >"$OBJDIR/$oid.promisor"
+		done
+		echo ok
+		;;
+	refresh)
+		# Every read goes to the files, so there is no view to reload;
+		# per the protocol there is no reply.
+		;;
+	optimize)
+		# Nothing to compact in plain files; a test asserts the command
+		# arrives through the log.
+		echo ok
+		;;
+	verify)
+		# Every stored object must still hash to its name.
+		rc=ok
+		for meta in "$OBJDIR"/*.meta
+		do
+			test -f "$meta" || continue
+			oid=$(basename "$meta" .meta)
+			read -r type size <"$meta"
+			got=$(git hash-object -t "$type" --stdin <"$OBJDIR/$oid")
+			if test "$got" != "$oid"
+			then
+				rc="error object $oid is corrupt"
+				break
+			fi
+		done
+		echo "$rc"
 		;;
 	read\ *)
 		refname="${line#read }"

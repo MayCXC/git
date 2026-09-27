@@ -360,6 +360,12 @@ include::ref-storage-format.adoc[]
 `--ref-format=<format>`::
 Deprecated alias of `--ref-storage-format=<format>`.
 
+`--object-storage=<storage>`::
+Specify the given object _<storage>_ for the new repository. The valid
+values are:
++
+include::object-storage.adoc[]
+
 `-j<n>`::
 `--jobs=<n>`::
 	The number of submodules fetched at the same time.

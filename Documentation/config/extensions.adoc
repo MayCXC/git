@@ -37,6 +37,26 @@ Note that this setting should only be set by linkgit:git-init[1] or
 linkgit:git-clone[1].  Trying to change it after initialization will not
 work and will produce hard-to-diagnose issues.
 
+objectStorage:::
+	Specify where the repository stores its objects. The value is one
+	of:
++
+--
+include::../object-storage.adoc[]
+--
++
+A repository whose objects are stored by a helper keeps its objects
+directory. Objects arriving as packfiles or loose objects, such as those
+received by linkgit:git-fetch[1] or linkgit:git-receive-pack[1], land
+there and are read from there until linkgit:git-gc[1] moves them into the
+helper. Packfiles kept by a `.keep` file stay where they are, and so do all
+of them in a repository with `extensions.preciousObjects` set, whose
+objects other repositories may borrow.
++
+Note that this setting should only be set by linkgit:git-init[1] or
+linkgit:git-clone[1]. Trying to change it after initialization will not
+work and will produce hard-to-diagnose issues.
+
 partialClone:::
 	When enabled, indicates that the repo was created with a partial clone
 	(or later performed a partial fetch) and that the remote may have
