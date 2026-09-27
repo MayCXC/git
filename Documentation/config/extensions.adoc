@@ -66,6 +66,10 @@ refStorage:::
 * A URI format `<format>://<payload>` explicitly specifies both the
   format and payload (e.g., `reftable:///foo/bar`).
 
+* Any other name, spelled like a URL scheme, stands for `helper://<name>`:
+  it selects the `git-local-<name>` helper program, the way an unknown URL
+  scheme selects a `git-remote-<name>` remote helper.
+
 Supported format names are:
 
 include::../ref-storage-format.adoc[]

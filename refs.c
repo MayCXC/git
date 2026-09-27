@@ -29,6 +29,7 @@
 #include "wildmatch.h"
 #include "ident.h"
 #include "fsck.h"
+#include "helper.h"
 
 /*
  * List of all available backends
@@ -74,6 +75,19 @@ enum ref_storage_format ref_storage_format_by_uri(const char *uri,
 	}
 
 	format = ref_storage_format_by_name(name);
+
+	/*
+	 * Any other bare name is the git-local-<name> ref helper, the way an
+	 * unknown URL scheme names a remote helper: "<name>" reads as
+	 * "helper://<name>".
+	 */
+	if (format == REF_STORAGE_FORMAT_UNKNOWN && !schema_end &&
+	    is_helper_name(name)) {
+		format = REF_STORAGE_FORMAT_HELPER;
+		if (payload)
+			*payload = xstrdup(name);
+	}
+
 	free(name);
 	return format;
 }

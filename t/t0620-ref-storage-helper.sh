@@ -55,6 +55,32 @@ test_expect_success 'a helper that cannot store references is refused' '
 	test_grep "helper .noref. does not support the .read. capability" err
 '
 
+test_expect_success 'a bare helper name selects the helper' '
+	test_when_finished "rm -rf repo" &&
+	git init --ref-storage-format=testgit repo &&
+	echo helper://testgit >expect &&
+	git -C repo config extensions.refStorage >actual &&
+	test_cmp expect actual &&
+	test_commit -C repo first &&
+	test_path_is_file repo/.git/helper-refs/refs_heads_main
+'
+
+test_expect_success 'a bare helper name in extensions.refStorage selects the helper' '
+	test_when_finished "rm -rf repo" &&
+	create_ref_helper_repo repo &&
+	test_commit -C repo first &&
+	git -C repo config extensions.refStorage testgit &&
+	git -C repo rev-parse --verify refs/heads/main
+'
+
+test_expect_success 'GIT_REF_STORAGE_FORMAT with a bare helper name selects the helper' '
+	test_when_finished "rm -rf repo" &&
+	GIT_REF_STORAGE_FORMAT=testgit git init repo &&
+	echo helper://testgit >expect &&
+	git -C repo config extensions.refStorage >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success 'the gitdir carries the stubs of a non-files format' '
 	test_when_finished "rm -rf repo" &&
 	create_ref_helper_repo repo &&

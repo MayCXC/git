@@ -85,4 +85,10 @@ void helper_process_disconnect(struct helper_process *hp);
 /* Stop the running helper, if any, and release `hp`. */
 void helper_process_release(struct helper_process *hp);
 
+/*
+ * Whether `name` is spelled like a URL scheme, which is how helpers are
+ * named, the way a remote helper is named by the scheme it serves.
+ */
+bool is_helper_name(const char *name);
+
 #endif

@@ -631,13 +631,16 @@ test_expect_success DEFAULT_REPO_FORMAT 'extensions.refStorage with files backen
 	git -C refstorage rev-parse --verify HEAD
 '
 
-test_expect_success DEFAULT_REPO_FORMAT 'extensions.refStorage with unknown backend' '
+test_expect_success DEFAULT_REPO_FORMAT 'extensions.refStorage with an unknown name selects a ref helper' '
 	test_when_finished "rm -rf refstorage" &&
 	git init refstorage &&
 	git -C refstorage config core.repositoryformatversion 1 &&
 	git -C refstorage config extensions.refStorage garbage &&
-	test_must_fail git -C refstorage rev-parse 2>err &&
-	test_grep "invalid value for ${SQ}extensions.refstorage${SQ}: ${SQ}garbage${SQ}" err
+	# An unknown name selects the git-local-<name> ref helper, the way an
+	# unknown URL scheme selects a remote helper, so it fails once the
+	# refs are read and the helper cannot be started.
+	test_must_fail git -C refstorage for-each-ref 2>err &&
+	test_grep "unable to start helper ${SQ}garbage${SQ}" err
 '
 
 test_expect_success 'init with GIT_DEFAULT_REF_STORAGE_FORMAT=garbage' '
@@ -830,10 +833,10 @@ do
 	done
 done
 
-test_expect_success 'init with --ref-storage-format=garbage' '
+test_expect_success 'init with --ref-storage-format=garbage selects a ref helper' '
 	test_when_finished "rm -rf refformat" &&
 	cat >expect <<-EOF &&
-	fatal: unknown ref storage format specified via command line: ${SQ}garbage${SQ}
+	fatal: unable to start helper ${SQ}garbage${SQ}
 	EOF
 	test_must_fail git init --ref-storage-format=garbage refformat 2>err &&
 	test_cmp expect err

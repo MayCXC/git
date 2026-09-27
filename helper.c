@@ -4,7 +4,18 @@
 #include "run-command.h"
 #include "sigchain.h"
 #include "strvec.h"
+#include "url.h"
 #include "wrapper.h"
+
+bool is_helper_name(const char *name)
+{
+	if (!is_urlschemechar(1, *name))
+		return false;
+	while (*++name)
+		if (!is_urlschemechar(0, *name))
+			return false;
+	return true;
+}
 
 void helper_process_init(struct helper_process *hp, const char *name,
 			 const char *gitdir,
