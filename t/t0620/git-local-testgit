@@ -1,0 +1,217 @@
+#!/bin/sh
+#
+# Minimal "git-local-testgit" storage helper for exercising the local helper
+# ref backend end to end. Speaks the line protocol on stdin/stdout (see
+# gitlocal-helpers(7)). State is kept as plain files under the directory the
+# helper is spawned with: refs in helper-refs/, reflogs in helper-reflogs/
+# (refnames encode '/' as '_').
+
+REFDIR="$1/helper-refs"
+REFLOGDIR="$1/helper-reflogs"
+mkdir -p "$REFDIR" "$REFLOGDIR"
+
+TXUPDATES=
+
+# When set, append every received command line here so a test can assert the
+# wire behavior.
+LOG="${GIT_LOCAL_TESTGIT_LOG:-}"
+
+while IFS= read -r line
+do
+	test -n "$LOG" && printf '%s\n' "$line" >>"$LOG"
+	case "$line" in
+	capabilities)
+		printf '%s\n' read list transaction create remove \
+			reflog reflog-read-reverse ""
+		;;
+	read\ *)
+		refname="${line#read }"
+		file="$REFDIR/$(echo "$refname" | tr / _)"
+		if test -f "$file"
+		then
+			cat "$file"
+		else
+			echo missing
+		fi
+		;;
+	list|list\ *)
+		prefix="${line#list}"
+		prefix="${prefix# }"
+		for f in "$REFDIR"/*
+		do
+			test -f "$f" || continue
+			refname=$(basename "$f" | tr _ /)
+			case "$refname" in
+			"$prefix"*)
+				val=$(cat "$f")
+				case "$val" in
+				symref\ *)
+					echo "$refname symref ${val#symref }" ;;
+				*)
+					echo "$refname $val" ;;
+				esac
+				;;
+			esac
+		done | LC_ALL=C sort
+		echo ""
+		;;
+	create)
+		echo ok
+		;;
+	remove)
+		# Delete this helper's ref and reflog store on disk, the step
+		# where a ref storage migration removes the old store.
+		rm -rf "$REFDIR" "$REFLOGDIR"
+		echo ok
+		;;
+	transaction-begin)
+		TXUPDATES=
+		echo ok
+		;;
+	transaction-update\ *|transaction-create\ *|\
+	transaction-delete\ *|transaction-create-symref\ *)
+		TXUPDATES="$TXUPDATES
+$line"
+		echo ok
+		;;
+	transaction-prepare)
+		# Enforce the old-value preconditions the backend forwards (see
+		# gitlocal-helpers(7)): an update or a non-zero-old delete must
+		# match the ref's current value; create force-sets.
+		# This is the race-free point to check, standing in for a real
+		# helper's lock. A here-doc keeps the loop in this shell so the
+		# error flag survives.
+		tx_err=
+		while IFS= read -r upd
+		do
+			test -z "$upd" && continue
+			set -- $upd
+			pcmd="$1" pref="$2"
+			pfile="$REFDIR/$(echo "$pref" | tr / _)"
+			pcur=
+			test -f "$pfile" && pcur=$(cat "$pfile")
+			case "$pcmd" in
+			transaction-update)
+				# An all-zero old value means "must not exist"
+				# (create); otherwise the ref must equal it.
+				case "$4" in
+				*[!0]*) test "$pcur" = "$4" ||
+					tx_err="ref '$pref' is at '$pcur', expected '$4'" ;;
+				*) test -z "$pcur" ||
+					tx_err="ref '$pref' already exists at '$pcur'" ;;
+				esac ;;
+			transaction-delete)
+				# A non-zero old value must match; all-zero is a force
+				# delete (no precondition).
+				case "$3" in
+				*[!0]*) test "$pcur" = "$3" ||
+					tx_err="ref '$pref' is at '$pcur', expected '$3'" ;;
+				esac ;;
+			esac
+		done <<EOF
+$TXUPDATES
+EOF
+		if test -n "$tx_err"
+		then
+			TXUPDATES=
+			printf 'error %s\n' "$tx_err"
+		else
+			echo ok
+		fi
+		;;
+	transaction-finish)
+		echo "$TXUPDATES" | while IFS= read -r upd
+		do
+			test -z "$upd" && continue
+			set -- $upd
+			cmd="$1" refname="$2"
+			file="$REFDIR/$(echo "$refname" | tr / _)"
+			case "$cmd" in
+			transaction-update|transaction-create)
+				echo "$3" >"$file" ;;
+			transaction-delete)
+				rm -f "$file" ;;
+			transaction-create-symref)
+				echo "symref $3" >"$file" ;;
+			esac
+		done
+		echo ok
+		;;
+	transaction-abort)
+		TXUPDATES=
+		echo ok
+		;;
+	reflog-read\ *)
+		refname="${line#reflog-read }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		test -f "$file" && cat "$file"
+		echo ""
+		;;
+	reflog-read-reverse\ *)
+		refname="${line#reflog-read-reverse }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		test -f "$file" && sed -n '1!G;h;$p' "$file"
+		echo ""
+		;;
+	reflog-append\ *)
+		rest="${line#reflog-append }"
+		refname="${rest%% *}"
+		entry="${rest#* }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		echo "$entry" >>"$file"
+		echo ok
+		;;
+	reflog-exists\ *)
+		refname="${line#reflog-exists }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		if test -f "$file"
+		then
+			echo true
+		else
+			echo false
+		fi
+		;;
+	reflog-create\ *)
+		refname="${line#reflog-create }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		: >>"$file"
+		echo ok
+		;;
+	reflog-delete\ *)
+		refname="${line#reflog-delete }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		rm -f "$file"
+		echo ok
+		;;
+	reflog-list)
+		for f in "$REFLOGDIR"/*
+		do
+			test -f "$f" || continue
+			basename "$f" | tr _ /
+		done
+		echo ""
+		;;
+	reflog-copy\ *)
+		# Carry a ref's reflog across on rename/copy. delete_old=1 moves it
+		# (rename), 0 duplicates it (copy). The new name has no reflog yet
+		# here, so appending old's entries keeps them ahead of the rename
+		# entry the backend appends next.
+		rest="${line#reflog-copy }"
+		set -- $rest
+		old="$1" new="$2" delete_old="$3"
+		oldfile="$REFLOGDIR/$(echo "$old" | tr / _)"
+		newfile="$REFLOGDIR/$(echo "$new" | tr / _)"
+		if test -f "$oldfile"
+		then
+			cat "$oldfile" >>"$newfile"
+			if test "$delete_old" = 1
+			then
+				rm -f "$oldfile"
+			fi
+		fi
+		echo ok
+		;;
+	"")
+		;;
+	esac
+done

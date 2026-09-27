@@ -73,8 +73,10 @@ include::../ref-storage-format.adoc[]
 The payload is passed directly to the reference backend. For the files and
 reftable backends, this must be a filesystem path where the references will
 be stored. Defaulting to the commondir when no payload is provided. Relative
-paths are resolved relative to the `$GIT_DIR`. Future backends may support
-other payload schemes, e.g., postgres://127.0.0.1:5432?database=myrepo.
+paths are resolved relative to the `$GIT_DIR`. For the helper backend, it is
+the `<name>` of the `git-local-<name>` program serving the references, which
+it requires. Future backends may support other payload schemes, e.g.,
+postgres://127.0.0.1:5432?database=myrepo.
 --
 +
 Note that this setting should only be set by linkgit:git-init[1] or

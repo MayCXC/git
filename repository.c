@@ -4,6 +4,7 @@
 #include "hook.h"
 #include "odb.h"
 #include "odb/source.h"
+#include "helper.h"
 #include "config.h"
 #include "gettext.h"
 #include "object.h"
@@ -434,6 +435,15 @@ void repo_clear(struct repository *repo)
 	strmap_for_each_entry(&repo->worktree_ref_stores, &iter, e)
 		ref_store_release(e->value);
 	strmap_clear(&repo->worktree_ref_stores, 1);
+
+	/*
+	 * The ref stores borrow repo->ref_local_helper, so release it only
+	 * once they have been torn down above.
+	 */
+	if (repo->ref_local_helper) {
+		helper_process_release(repo->ref_local_helper);
+		free(repo->ref_local_helper);
+	}
 
 	repo_clear_path_cache(&repo->cached_paths);
 

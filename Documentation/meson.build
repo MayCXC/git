@@ -201,6 +201,7 @@ manpages = {
   'giteveryday.adoc' : 7,
   'gitfaq.adoc' : 7,
   'gitglossary.adoc' : 7,
+  'gitlocal-helpers.adoc' : 7,
   'gitpacking.adoc' : 7,
   'gitnamespaces.adoc' : 7,
   'gitremote-helpers.adoc' : 7,

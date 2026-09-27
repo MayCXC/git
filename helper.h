@@ -10,7 +10,7 @@ struct child_process;
  * references or objects for Git, the way a "git-remote-<name>" program
  * reaches a remote repository for it. Git runs the helper as a separate
  * process and speaks a line-based protocol to it on its standard input and
- * output.
+ * output, described in gitlocal-helpers(7).
  *
  * The process is started lazily, when a command is first sent to it, and
  * negotiates the capabilities of the helper then.

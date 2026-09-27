@@ -1,0 +1,194 @@
+gitlocal-helpers(7)
+===================
+
+NAME
+----
+gitlocal-helpers - Helper programs to store the references of a repository
+
+SYNOPSIS
+--------
+[verse]
+'git-local-<name>' <directory>
+
+DESCRIPTION
+-----------
+
+Local helper programs store the references of a repository in a way Git
+does not support natively, for example in a database. A repository keeps
+its references in a helper when `extensions.refStorage` is
+`helper://<name>` (see linkgit:git-config[1]). Git then runs
+`git-local-<name>`, sends it commands on its standard input and reads the
+replies from its standard output, the way it drives a remote helper (see
+linkgit:gitremote-helpers[7]). Because a local helper runs as a separate
+process, there is no need to rebuild Git to add one, nor for the helper to
+link with Git.
+
+A local helper stores data at the fine granularity of Git's own storage:
+Git reads, writes and lists single references, and updates them in
+transactions. Because the helper is a separate process, Git cannot make
+assertions about the stored data without racing the helper and other Git
+processes, and leaves to the helper what only it can check without a race,
+such as whether a reference still points where an update expects.
+
+INVOCATION
+----------
+
+Git runs `git-local-<name>`, found on the `PATH`, with one argument: the
+directory whose data the helper stores. That is the common directory of the
+repository (see linkgit:gitrepository-layout[5]) for the references its
+worktrees share, and the git directory of a linked worktree for the
+references private to that worktree. Errors the helper writes to its
+standard error reach the user.
+
+Git starts a helper when it first needs it and closes the standard input of
+the helper when it is done with it, upon which the helper exits. It starts
+one process of the helper for the references of a repository and another
+for each linked worktree whose references it touches, and every Git process
+working with the repository at the same time starts its own. A helper
+therefore keeps its data consistent under concurrent use.
+
+PROTOCOL
+--------
+
+Git sends commands one per line, and the helper answers each with a reply
+of one or more lines, unless the command says otherwise. A reply listing
+items ends with a blank line.
+
+Commands that change the data reply `ok` on success, and on failure
+`error <message>`, which Git reports.
+
+Capabilities
+~~~~~~~~~~~~
+
+The first command Git sends is `capabilities`. The helper replies with the
+capabilities it supports, one per line, followed by a blank line. Each
+capability names a command or a group of commands the helper supports,
+which Git uses from then on. Git refuses a helper that lacks a capability
+it requires, and ignores capabilities it does not know.
+
+REFERENCE COMMANDS
+------------------
+
+A helper storing references advertises the capabilities `read`, `list` and
+`transaction`, which Git requires, and optionally `create`, `remove`,
+`reflog` and `reflog-read-reverse`.
+
+The helper of a repository stores the references its worktrees share and
+those private to its main worktree, and the helper of a linked worktree the
+references private to that worktree. Git names a reference to the helper
+storing it without the `main-worktree/` or `worktrees/<id>/` prefix that
+names it in another worktree. Object IDs are in hexadecimal.
+
+`read <refname>`::
+	Reply with the object ID the reference points to, `symref <target>` if
+	it is a symbolic reference, or `missing` if there is no such reference.
+
+`list [<prefix>]`::
+	List the references whose names start with _<prefix>_, or all of them,
+	one per line as `<refname> <object-id>` or `<refname> symref <target>`,
+	sorted by name byte by byte, followed by a blank line.
+
+`transaction-begin`::
+	Start a transaction, which gathers the updates of the following
+	commands up to `transaction-finish` or `transaction-abort`. Reply `ok`.
+
+`transaction-update <refname> <new-oid> <old-oid>`::
+	Point _<refname>_ at _<new-oid>_, provided that it points at
+	_<old-oid>_ or, if that is all zeros, that it does not exist.
+
+`transaction-create <refname> <new-oid>`::
+	Point _<refname>_ at _<new-oid>_, whether or not it exists.
+
+`transaction-delete <refname> [<old-oid>]`::
+	Delete _<refname>_, provided that it points at _<old-oid>_ unless that
+	is absent or all zeros.
+
+`transaction-create-symref <refname> <target>`::
+	Make _<refname>_ a symbolic reference to _<target>_.
+
+`transaction-prepare`::
+	Check the updates of the transaction, and lock what they change so
+	that `transaction-finish` cannot fail for a reason this check could
+	have found. Reply `ok`, or `error <message>` to refuse the
+	transaction.
+
+`transaction-finish`::
+	Apply the updates of the transaction, all of them or none. Reply `ok`
+	or `error <message>`.
+
+`transaction-abort`::
+	Drop the updates of the transaction. Reply `ok`.
+
+Each of the commands updating a reference replies `ok`, or
+`error <message>` to refuse the update. The helper checks the object ID an
+update expects when the transaction is prepared or finished, under the lock
+that keeps other processes from changing the reference, as that is the only
+place the check cannot race them; Git does not check it.
+
+`create`::
+	Create the storage for the references, for a new repository, a new
+	linked worktree or a migration from another reference storage, and
+	leave storage that exists already as it is. Reply `ok` or
+	`error <message>`. Git sends it only to a helper advertising `create`;
+	others create their storage when they first need it.
+
+`remove`::
+	Remove the storage for the references and their reflogs, as a
+	migration to another reference storage does once it has copied them.
+	Reply `ok` or `error <message>`. Git can only migrate away from a
+	helper advertising `remove`.
+
+The reflog commands are those of the capability `reflog`, which Git
+requires to keep reflogs in the helper at all. A reflog entry is written as
+in a reflog file, `<old-oid> <new-oid> <name> <<email>> <timestamp> <tz>`,
+followed by a tab and the message if there is one.
+
+A command changing a reflog that Git sends within a transaction is part of
+it, applied when the transaction is finished and dropped when it is
+aborted. Git records the reflog entries of the updates of a transaction
+within it, and expires the entries of a reflog by deleting the reflog and
+appending the entries it keeps within a transaction.
+
+`reflog-append <refname> <entry>`::
+	Append _<entry>_ to the reflog of _<refname>_, creating the reflog if
+	need be. Reply `ok` or `error <message>`.
+
+`reflog-create <refname>`::
+	Create an empty reflog for _<refname>_, unless it has one. Reply `ok`
+	or `error <message>`.
+
+`reflog-delete <refname>`::
+	Delete the reflog of _<refname>_. Reply `ok` or `error <message>`.
+
+`reflog-copy <old-refname> <new-refname> <move>`::
+	Within a transaction renaming or copying a reference, give
+	_<new-refname>_ the entries of the reflog of _<old-refname>_, and
+	delete that reflog if _<move>_ is `1` rather than `0`. Reply `ok` or
+	`error <message>`.
+
+`reflog-read <refname>`::
+	List the entries of the reflog of _<refname>_, oldest first, followed
+	by a blank line.
+
+`reflog-read-reverse <refname>`::
+	List the entries of the reflog of _<refname>_, newest first, followed
+	by a blank line. Git sends it only to a helper advertising
+	`reflog-read-reverse`, and otherwise reverses the reply to
+	`reflog-read` itself.
+
+`reflog-exists <refname>`::
+	Reply `true` if _<refname>_ has a reflog, and `false` otherwise.
+
+`reflog-list`::
+	List the references that have a reflog, one name per line, sorted by
+	name byte by byte, followed by a blank line.
+
+SEE ALSO
+--------
+linkgit:gitremote-helpers[7]
+
+linkgit:gitrepository-layout[5]
+
+GIT
+---
+Part of the linkgit:git[1] suite
