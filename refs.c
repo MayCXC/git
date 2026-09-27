@@ -3584,7 +3584,8 @@ const char *ref_transaction_error_msg(enum ref_transaction_error err)
 	}
 }
 
-void refs_compute_filesystem_location(const char *gitdir, const char *payload,
+void refs_compute_filesystem_location(struct repository *repo,
+				      const char *gitdir, const char *payload,
 				      bool *is_worktree, struct strbuf *refdir,
 				      struct strbuf *ref_common_dir)
 {
@@ -3602,8 +3603,13 @@ void refs_compute_filesystem_location(const char *gitdir, const char *payload,
 		return;
 	}
 
+	/*
+	 * The gitdir of a store that is not the repository's own, like the
+	 * destination of a migration, has a common directory of its own, so
+	 * resolve against the repository's.
+	 */
 	if (!is_absolute_path(payload)) {
-		strbuf_addf(&sb, "%s/%s", ref_common_dir->buf, payload);
+		strbuf_addf(&sb, "%s/%s", repo->commondir, payload);
 		strbuf_realpath(ref_common_dir, sb.buf, 1);
 	} else {
 		strbuf_realpath(ref_common_dir, payload, 1);

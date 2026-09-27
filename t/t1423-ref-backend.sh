@@ -226,6 +226,28 @@ do
 		)
 	'
 
+	test_expect_success "migrating repository to $to_format with relative alternate refs directory" '
+		test_when_finished "rm -rf repo" &&
+		mkdir -p repo/refdir &&
+		GIT_REF_STORAGE_FORMAT="${from_format}://../refdir" git init repo &&
+		(
+			cd repo &&
+
+			test_commit 1 &&
+			test_commit 2 &&
+			test_commit 3 &&
+			git refs list >expect &&
+
+			git refs migrate --ref-storage-format=$to_format &&
+			echo "$to_format://../refdir" >expect-uri &&
+			git config extensions.refStorage >actual-uri &&
+			test_cmp expect-uri actual-uri &&
+			git refs list >actual &&
+			test_cmp expect actual &&
+			test_path_is_missing refdir/refdir
+		)
+	'
+
 done # closes to_format
 done # closes from_format
 
