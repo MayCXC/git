@@ -10,6 +10,7 @@
 #include "odb.h"
 #include "odb/source.h"
 #include "odb/source-files.h"
+#include "odb/source-helper.h"
 #include "odb/source-loose.h"
 #include "pack-objects.h"
 #include "packfile.h"
@@ -986,9 +987,14 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
 
 struct odb_source_files *odb_source_files_store_gently(struct odb_source *source)
 {
-	if (source->type != ODB_SOURCE_FILES)
+	switch (source->type) {
+	case ODB_SOURCE_FILES:
+		return odb_source_files_downcast(source);
+	case ODB_SOURCE_HELPER:
+		return odb_source_helper_downcast(source)->files;
+	default:
 		return NULL;
-	return odb_source_files_downcast(source);
+	}
 }
 
 struct odb_source_files *odb_source_files_store(struct odb_source *source)

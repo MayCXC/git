@@ -497,10 +497,20 @@ struct odb_transaction_files {
 	size_t pack_lockfiles_alloc;
 };
 
+/*
+ * The files transaction `base` is, or a NULL pointer in case there is no
+ * transaction or it belongs to a source of another backend.
+ */
+static struct odb_transaction_files *files_transaction(struct odb_transaction *base)
+{
+	if (!base || base->source->type != ODB_SOURCE_FILES)
+		return NULL;
+	return container_of(base, struct odb_transaction_files, base);
+}
+
 int odb_transaction_files_prepare(struct odb_transaction *base)
 {
-	struct odb_transaction_files *transaction =
-		container_of_or_null(base, struct odb_transaction_files, base);
+	struct odb_transaction_files *transaction = files_transaction(base);
 
 	/*
 	 * We lazily create the temporary object directory
@@ -523,8 +533,7 @@ int odb_transaction_files_prepare(struct odb_transaction *base)
 void odb_transaction_files_fsync(struct odb_transaction *base,
 				 int fd, const char *filename)
 {
-	struct odb_transaction_files *transaction =
-		container_of_or_null(base, struct odb_transaction_files, base);
+	struct odb_transaction_files *transaction = files_transaction(base);
 
 	if (!transaction || !transaction->objdir) {
 		fsync_or_die(fd, filename);

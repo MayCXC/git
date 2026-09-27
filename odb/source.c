@@ -10,6 +10,7 @@ static const char * const odb_source_names_by_type[] = {
 	[ODB_SOURCE_LOOSE] = "loose",
 	[ODB_SOURCE_PACKED] = "packed",
 	[ODB_SOURCE_INMEMORY] = "in-memory",
+	[ODB_SOURCE_HELPER] = "helper",
 };
 
 const char *odb_source_type_to_name(enum odb_source_type type)

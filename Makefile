@@ -1229,6 +1229,7 @@ LIB_OBJS += object.o
 LIB_OBJS += odb.o
 LIB_OBJS += odb/source.o
 LIB_OBJS += odb/source-files.o
+LIB_OBJS += odb/source-helper.o
 LIB_OBJS += odb/source-inmemory.o
 LIB_OBJS += odb/source-loose.o
 LIB_OBJS += odb/source-packed.o

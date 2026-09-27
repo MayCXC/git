@@ -24,6 +24,9 @@ enum odb_source_type {
 
 	/* The "in-memory" backend that stores objects in memory. */
 	ODB_SOURCE_INMEMORY,
+
+	/* The "helper" backend that stores objects in a helper program. */
+	ODB_SOURCE_HELPER,
 };
 
 /*
