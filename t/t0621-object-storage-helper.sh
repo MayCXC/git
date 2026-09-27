@@ -283,7 +283,8 @@ test_expect_success 'a helper without put-raw takes the objects of a pack whole'
 # index-pack completes a thin pack by appending the bases it lacks, after the
 # deltas against them. With the first pack kept, the base of the new delta
 # moves into the helper only from the end of the second pack, so the delta
-# waits for it.
+# waits for it. The helper lacks "replace", so that gc does not go on to
+# store the objects the way it finds best.
 test_expect_success 'a delta of a thin pack waits for the base appended to it' '
 	test_when_finished "rm -rf thinsrv thincl" &&
 	git init thinsrv &&
@@ -301,7 +302,8 @@ test_expect_success 'a delta of a thin pack waits for the base appended to it' '
 	git -C thinsrv commit -am two &&
 	git -C thincl -c fetch.unpackLimit=1 fetch --no-auto-maintenance \
 		"$(pwd)/thinsrv" main:src &&
-	git -C thincl gc &&
+	GIT_LOCAL_TESTGIT_CAPABILITIES="get info put put-raw have list-objects" \
+		git -C thincl gc &&
 	git -C thincl rev-parse src~1:f >expect &&
 	git -C thincl rev-parse src:f >blob &&
 	git -C thincl cat-file --batch-check="%(deltabase)" <blob >actual &&
@@ -330,6 +332,8 @@ test_expect_success 'a pack kept with a .keep file stays in the files store' '
 	touch "${pack%.pack}.keep" &&
 	git -C keeper gc &&
 	test_path_is_file "$pack" &&
+	find keeper/.git/helper-objects -name "*.meta" >stored &&
+	test_must_be_empty stored &&
 	rm "${pack%.pack}.keep" &&
 	git -C keeper gc &&
 	assert_files_store_empty keeper &&
@@ -522,6 +526,43 @@ test_expect_success 'a rejected push leaves the helper repository untouched' '
 	test_must_fail git -C rejecting cat-file -e "$(git -C pushsrc rev-parse main:f.txt)" &&
 	git -C rejecting cat-file -e "$(git -C pushsrc rev-parse main~1:f.txt)" &&
 	git -C rejecting fsck
+'
+
+test_expect_success 'gc has the helper store the objects written whole as deltas' '
+	test_when_finished "rm -rf deltified" &&
+	create_helper_repo deltified &&
+	test_seq 1 300 >deltified/f &&
+	git -C deltified add f &&
+	git -C deltified commit -m one &&
+	test_seq 1 301 >deltified/f &&
+	git -C deltified commit -am two &&
+	git -C deltified cat-file --batch-all-objects \
+		--batch-check="%(deltabase)" >before &&
+	test_grep ! -v $ZERO_OID before &&
+	git -C deltified gc &&
+	assert_files_store_empty deltified &&
+	git -C deltified cat-file --batch-all-objects \
+		--batch-check="%(deltabase)" >after &&
+	test_grep -v $ZERO_OID after &&
+	test_seq 1 301 >expect &&
+	git -C deltified cat-file -p HEAD:f >actual &&
+	test_cmp expect actual &&
+	git -C deltified fsck
+'
+
+test_expect_success 'gc leaves how a helper without replace stores its objects' '
+	test_when_finished "rm -rf asis" &&
+	create_helper_repo asis &&
+	test_seq 1 300 >asis/f &&
+	git -C asis add f &&
+	git -C asis commit -m one &&
+	test_seq 1 301 >asis/f &&
+	git -C asis commit -am two &&
+	GIT_LOCAL_TESTGIT_CAPABILITIES="get info put put-raw have list-objects optimize" \
+		git -C asis gc &&
+	git -C asis cat-file --batch-all-objects \
+		--batch-check="%(deltabase)" >after &&
+	test_grep ! -v $ZERO_OID after
 '
 
 test_expect_success 'gc sends the helper the optimize command' '

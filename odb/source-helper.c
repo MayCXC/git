@@ -16,7 +16,10 @@
 #include "oid-array.h"
 #include "oidset.h"
 #include "packfile.h"
+#include "promisor-remote.h"
+#include "repack.h"
 #include "repository.h"
+#include "run-command.h"
 #include "strbuf.h"
 #include "strvec.h"
 #include "tempfile.h"
@@ -36,6 +39,7 @@ enum object_helper_capability {
 	OBJECT_HELPER_OPTIMIZE_REQUIRED = (1 << 10),
 	OBJECT_HELPER_VERIFY = (1 << 11),
 	OBJECT_HELPER_PUT_RAW = (1 << 12),
+	OBJECT_HELPER_REPLACE = (1 << 13),
 };
 
 static const struct helper_capability object_helper_capabilities[] = {
@@ -52,6 +56,7 @@ static const struct helper_capability object_helper_capabilities[] = {
 	{ "optimize-required", OBJECT_HELPER_OPTIMIZE_REQUIRED },
 	{ "verify", OBJECT_HELPER_VERIFY },
 	{ "put-raw", OBJECT_HELPER_PUT_RAW },
+	{ "replace", OBJECT_HELPER_REPLACE },
 	{ NULL },
 };
 
@@ -871,6 +876,11 @@ static int odb_source_helper_read_alternates(struct odb_source *source,
 
 struct drain {
 	struct odb_source_helper *helper;
+	/*
+	 * Whether the objects replace how the helper stores those it has,
+	 * rather than skipping them.
+	 */
+	unsigned replace : 1;
 	/* Whether the loose objects of the files store move, too. */
 	unsigned loose : 1;
 	/* The packfiles whose objects move into the helper. */
@@ -945,9 +955,10 @@ static int put_raw(struct drain *drain, const struct object_id *oid,
 	else
 		oid_to_hex_r(base, &entry->delta_base);
 
-	helper_process_send(hp, "put-raw %s %s %"PRIuMAX" %s %"PRIuMAX"\n",
+	helper_process_send(hp, "put-raw %s %s %"PRIuMAX" %s %"PRIuMAX"%s\n",
 			    hex, type_name(entry->type), (uintmax_t)entry->size,
-			    base, (uintmax_t)entry->data_len);
+			    base, (uintmax_t)entry->data_len,
+			    drain->replace ? " 1" : "");
 	helper_process_write(hp, entry->data, entry->data_len);
 	if (helper_process_readline(hp, &line) == EOF)
 		drop_connection(helper);
@@ -1042,7 +1053,7 @@ static int drain_packed_object(const struct object_id *oid,
 
 	if (pack->pack_promisor)
 		oid_array_append(&drain->promisor, oid);
-	if (drain_stored(drain, oid))
+	if (!drain->replace && drain_stored(drain, oid))
 		return 0;
 	return drain_packed(drain, oid, pack, pos, 1);
 }
@@ -1106,15 +1117,17 @@ static int mark_promisor_objects(struct drain *drain)
 /*
  * Move the objects of `packs`, and with `loose` the loose objects of the
  * files store, into the helper: copy them, then remove the packfiles and
- * loose objects they came from.
+ * loose objects they came from. With `replace`, the objects replace how the
+ * helper stores those it has already.
  */
 static int drain(struct odb_source_helper *helper, struct packed_git **packs,
-		 size_t packs_nr, int loose)
+		 size_t packs_nr, int loose, int replace)
 {
 	struct odb_source_files *files = helper->files;
 	struct odb_for_each_object_options opts = { 0 };
 	struct drain drain = {
 		.helper = helper,
+		.replace = !!replace,
 		.loose = !!loose,
 		.packs = packs,
 		.packs_nr = packs_nr,
@@ -1214,13 +1227,88 @@ static int drain_files_store(struct odb_source_helper *helper)
 		packs[nr++] = e->pack;
 	}
 
-	ret = drain(helper, packs, nr, 1);
+	ret = drain(helper, packs, nr, 1, 0);
+	free(packs);
+	return ret;
+}
+
+/*
+ * Have the helper store its objects as deltas where git finds good ones, as
+ * a repack does for packfiles: pack-objects packs every reachable object
+ * into the files store, reading those of the helper through the object
+ * database to search for deltas among them, and the packfile then moves
+ * into the helper, replacing how it stores each object. The objects of kept
+ * packfiles stay out of it, as they stay out of the helper.
+ */
+static int deltify(struct odb_source_helper *helper,
+		   const struct odb_optimize_options *opts)
+{
+	struct repository *repo = helper->base.odb->repo;
+	struct child_process cmd = CHILD_PROCESS_INIT;
+	struct pack_objects_args args = PACK_OBJECTS_ARGS_INIT;
+	struct strbuf base = STRBUF_INIT, line = STRBUF_INIT;
+	struct packed_git **packs = NULL;
+	size_t nr = 0, alloc = 0;
+	int ret = 0;
+	FILE *out;
+
+	args.local = 1;
+	args.pack_kept_objects = 0;
+	args.delta_base_offset = 1;
+	args.quiet = !(opts->flags & ODB_OPTIMIZE_VERBOSE);
+	args.no_reuse_delta = !!(opts->flags & ODB_OPTIMIZE_NO_REUSE_DELTAS);
+	if (opts->window > 0)
+		args.window = xstrfmt("%d", opts->window);
+	if (opts->depth > 0)
+		args.depth = xstrfmt("%d", opts->depth);
+
+	strbuf_addf(&base, "%s/pack/pack", helper->files->base.path);
+	prepare_pack_objects(&cmd, &args, base.buf);
+	strvec_pushl(&cmd.args, "--keep-true-parents", "--non-empty",
+		     "--all", "--reflog", "--indexed-objects", NULL);
+	if (repo_has_promisor_remote(repo))
+		strvec_push(&cmd.args, "--exclude-promisor-objects");
+	cmd.no_stdin = 1;
+
+	if (start_command(&cmd)) {
+		ret = error(_("unable to start pack-objects for helper '%s'"),
+			    helper->hp.name);
+		goto out;
+	}
+	/* pack-objects names each packfile it writes by its hash. */
+	out = xfdopen(cmd.out, "r");
+	while (strbuf_getline_lf(&line, out) != EOF) {
+		struct strbuf idx = STRBUF_INIT;
+		struct packed_git *p;
+
+		strbuf_addf(&idx, "%s-%s.idx", base.buf, line.buf);
+		p = packfile_store_load_pack(helper->files->packed, idx.buf, 1);
+		if (!p)
+			ret = error(_("unable to open the packfile %s"), idx.buf);
+		else {
+			ALLOC_GROW(packs, nr + 1, alloc);
+			packs[nr++] = p;
+		}
+		strbuf_release(&idx);
+	}
+	fclose(out);
+	if (finish_command(&cmd))
+		ret = error(_("pack-objects failed for helper '%s'"),
+			    helper->hp.name);
+
+	if (!ret && nr)
+		ret = drain(helper, packs, nr, 0, 1);
+
+out:
+	pack_objects_args_release(&args);
+	strbuf_release(&base);
+	strbuf_release(&line);
 	free(packs);
 	return ret;
 }
 
 static int odb_source_helper_optimize(struct odb_source *source,
-				      const struct odb_optimize_options *opts UNUSED)
+				      const struct odb_optimize_options *opts)
 {
 	struct odb_source_helper *helper = odb_source_helper_downcast(source);
 	struct helper_process *hp;
@@ -1231,9 +1319,14 @@ static int odb_source_helper_optimize(struct odb_source *source,
 	 * Objects of a repository that others borrow through their alternates
 	 * stay in its files store, where those see them.
 	 */
-	if (!source->odb->repo->repository_format_precious_objects &&
-	    drain_files_store(helper))
-		return -1;
+	if (!source->odb->repo->repository_format_precious_objects) {
+		if (drain_files_store(helper))
+			return -1;
+		if (capable(helper, OBJECT_HELPER_PUT_RAW) &&
+		    capable(helper, OBJECT_HELPER_REPLACE) &&
+		    deltify(helper, opts))
+			return -1;
+	}
 
 	hp = started(helper);
 	if (!capable(helper, OBJECT_HELPER_OPTIMIZE))

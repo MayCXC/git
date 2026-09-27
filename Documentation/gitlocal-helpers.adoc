@@ -229,16 +229,18 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	a helper advertising `put-stream`, and otherwise reads the object into
 	memory to send `put`.
 
-`put-raw <oid> <type> <size> <delta-base> <compressed-size>`::
+`put-raw <oid> <type> <size> <delta-base> <compressed-size> [<replace>]`::
 	Store the object as a packfile keeps it: the _<compressed-size>_ bytes
 	that follow the command are the zlib-compressed contents of the object
 	when _<delta-base>_ is `0`, and otherwise a zlib-compressed delta (see
 	linkgit:gitformat-pack[5]) against _<delta-base>_, an object the
 	helper stores already. _<size>_ is the size of what the bytes inflate
-	to. Reply with _<oid>_ once the object is stored, or
-	`error <message>`. Git sends it only to a helper advertising
-	`put-raw`, as it moves the objects of a packfile into the helper, and
-	otherwise sends `put`.
+	to. An object stored already is kept as it is, unless _<replace>_ is
+	`1`, in which case the helper stores it this way instead. Reply with
+	_<oid>_ once the object is stored, or `error <message>`. Git sends it
+	only to a helper advertising `put-raw`, as it moves the objects of a
+	packfile into the helper, and otherwise sends `put`; it sends
+	_<replace>_ only to a helper advertising `replace`.
 
 `list-objects [--promisor-only] [<prefix>]`::
 	List the objects stored whose IDs start with the hexadecimal
@@ -275,7 +277,10 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 `optimize`::
 	Optimize the storage of the objects, for linkgit:git-gc[1]. Reply `ok`
 	or `error <message>`. Git sends it only to a helper advertising
-	`optimize`.
+	`optimize`, after moving the objects of the objects directory into the
+	helper and, for a helper advertising `put-raw` and `replace`, having
+	it store its objects the way linkgit:git-pack-objects[1] finds best,
+	as deltas where it finds good ones.
 
 `optimize-required`::
 	Reply with the number of objects stored since the storage was last

@@ -27,7 +27,7 @@ ON_COMMAND="${GIT_LOCAL_TESTGIT_ON_COMMAND:-}"
 # When set, the capabilities to advertise instead of all of them, so a test
 # can exercise what git does without one.
 CAPABILITIES="${GIT_LOCAL_TESTGIT_CAPABILITIES:-get info put put-raw \
-put-stream have list-objects promisor refresh optimize verify \
+replace put-stream have list-objects promisor refresh optimize verify \
 read list transaction create remove reflog reflog-read-reverse}"
 
 while IFS= read -r line
@@ -79,14 +79,19 @@ do
 		echo "$oid"
 		;;
 	put-raw\ *)
-		# put-raw <oid> <type> <size> <delta-base> <compressed-size>, then
-		# the compressed content, or a compressed delta against a stored
-		# <delta-base>. Keep the object resolved, and the base to report.
+		# put-raw <oid> <type> <size> <delta-base> <compressed-size>
+		# [<replace>], then the compressed content, or a compressed delta
+		# against a stored <delta-base>. Keep the object resolved, and the
+		# base to report; an object stored already stays as it is unless
+		# <replace> is 1.
 		set -- $line
-		oid="$2" type="$3" base="$5" clen="$6"
+		oid="$2" type="$3" base="$5" clen="$6" replace="$7"
 		tmp=$(mktemp "$OBJDIR/tmp.XXXXXX")
 		head -c "$clen" | test-tool zlib inflate >"$tmp"
-		if test "$base" = 0
+		if test -f "$OBJDIR/$oid.meta" && test "$replace" != 1
+		then
+			rm -f "$tmp"
+		elif test "$base" = 0
 		then
 			mv "$tmp" "$OBJDIR/$oid"
 			size=$(wc -c <"$OBJDIR/$oid")
