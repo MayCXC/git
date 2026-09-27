@@ -34,6 +34,12 @@ assert_object_in_helper () {
 	test_path_is_file "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)/helper-objects/$2"
 }
 
+# The helper keeps the time an object was last written as the modification
+# time of its .meta file; move it back by the given number of seconds.
+age_object_in_helper () {
+	test-tool chmtime "-$3" "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)/helper-objects/$2.meta"
+}
+
 test_expect_success 'setup files server repo' '
 	git init server &&
 	test_seq 1 200 >server/big &&
@@ -581,6 +587,55 @@ test_expect_success 'fsck checks the objects of the helper and has it verify its
 	GIT_LOCAL_TESTGIT_LOG="$TRASH_DIRECTORY/fscklog" git -C checked fsck 2>err &&
 	test_must_be_empty err &&
 	test_grep "^verify$" fscklog
+'
+
+test_expect_success 'prune removes the unreachable objects of the helper' '
+	test_when_finished "rm -rf pruned" &&
+	create_helper_repo pruned &&
+	test_commit -C pruned one &&
+	old=$(echo old | git -C pruned hash-object -w --stdin) &&
+	new=$(echo new | git -C pruned hash-object -w --stdin) &&
+	age_object_in_helper pruned $old 86400 &&
+	git -C pruned prune --expire=1.hour.ago &&
+	test_must_fail git -C pruned cat-file -e $old &&
+	git -C pruned cat-file -e $new &&
+	git -C pruned fsck &&
+	git -C pruned prune &&
+	test_must_fail git -C pruned cat-file -e $new &&
+	git -C pruned cat-file -e HEAD:one.t
+'
+
+test_expect_success 'prune --dry-run names the objects of the helper it would remove' '
+	test_when_finished "rm -rf dryrun" &&
+	create_helper_repo dryrun &&
+	test_commit -C dryrun one &&
+	blob=$(echo stray | git -C dryrun hash-object -w --stdin) &&
+	git -C dryrun prune --dry-run >actual &&
+	echo "$blob blob" >expect &&
+	test_cmp expect actual &&
+	git -C dryrun cat-file -e $blob
+'
+
+test_expect_success 'an object written again is freshened and outlives the prune' '
+	test_when_finished "rm -rf fresh" &&
+	create_helper_repo fresh &&
+	test_commit -C fresh one &&
+	blob=$(echo again | git -C fresh hash-object -w --stdin) &&
+	age_object_in_helper fresh $blob 86400 &&
+	echo again | git -C fresh hash-object -w --stdin &&
+	git -C fresh prune --expire=1.hour.ago &&
+	git -C fresh cat-file -e $blob
+'
+
+test_expect_success 'gc prunes an unreachable object of the helper past gc.pruneExpire' '
+	test_when_finished "rm -rf gcpruned" &&
+	create_helper_repo gcpruned &&
+	test_commit -C gcpruned one &&
+	blob=$(echo stale | git -C gcpruned hash-object -w --stdin) &&
+	age_object_in_helper gcpruned $blob 2592000 &&
+	git -C gcpruned gc &&
+	test_must_fail git -C gcpruned cat-file -e $blob &&
+	git -C gcpruned fsck
 '
 
 test_expect_success 'fsck finds a damaged object in the helper' '

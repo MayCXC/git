@@ -216,6 +216,13 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	sends it only to a helper advertising `have`, and otherwise sends
 	`info` or `get`.
 
+`freshen <oid>`::
+	Take the object as written just now, as `prune` goes by when an
+	object was last written, and reply `true`, or reply `false` if there
+	is no such object. Git sends it, only to a helper advertising
+	`freshen`, when it writes an object the helper stores already, and
+	otherwise sends `have`.
+
 `put <oid> <type> <size>`::
 	Store the object, whose _<size>_ bytes of contents follow the command.
 	Reply with _<oid>_ once the object is stored, or `error <message>`. An
@@ -278,15 +285,27 @@ repository, and a _<type>_ is `blob`, `tree`, `commit` or `tag`.
 	Optimize the storage of the objects, for linkgit:git-gc[1]. Reply `ok`
 	or `error <message>`. Git sends it only to a helper advertising
 	`optimize`, after moving the objects of the objects directory into the
-	helper and, for a helper advertising `put-raw` and `replace`, having
-	it store its objects the way linkgit:git-pack-objects[1] finds best,
-	as deltas where it finds good ones.
+	helper, having a helper advertising `put-raw` and `replace` store its
+	objects the way linkgit:git-pack-objects[1] finds best, as deltas
+	where it finds good ones, and having a helper advertising `prune`
+	remove the unreachable objects past `gc.pruneExpire`.
 
 `optimize-required`::
 	Reply with the number of objects stored since the storage was last
 	optimized, which Git compares with `gc.auto` to decide whether to run
 	linkgit:git-gc[1] automatically. Git sends it only to a helper
 	advertising `optimize-required`.
+
+`prune [--dry-run] [<expire>]`::
+	Remove the objects whose IDs follow, one per line up to a blank line,
+	which Git found unreachable, provided they were last written at or
+	before _<expire>_, a Unix time, if one is given. Reply with the ID of
+	each object removed, one per line, followed by `ok`, or with
+	`error <message>`. With `--dry-run`, name the objects without
+	removing them. A helper storing another object as a delta against one
+	of them may keep it for as long as it does. Git sends it only to a
+	helper advertising `prune`, for linkgit:git-prune[1] and
+	linkgit:git-gc[1].
 
 `verify`::
 	Check the integrity of the storage of the objects, for

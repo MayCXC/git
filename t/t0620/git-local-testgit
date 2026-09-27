@@ -27,8 +27,8 @@ ON_COMMAND="${GIT_LOCAL_TESTGIT_ON_COMMAND:-}"
 # When set, the capabilities to advertise instead of all of them, so a test
 # can exercise what git does without one.
 CAPABILITIES="${GIT_LOCAL_TESTGIT_CAPABILITIES:-get info put put-raw \
-replace put-stream have list-objects promisor refresh optimize verify \
-read list transaction create remove reflog reflog-read-reverse}"
+replace put-stream have freshen list-objects promisor refresh optimize \
+prune verify read list transaction create remove reflog reflog-read-reverse}"
 
 while IFS= read -r line
 do
@@ -112,6 +112,45 @@ do
 		else
 			echo false
 		fi
+		;;
+	freshen\ *)
+		# The time an object was last written, which pruning goes by, is
+		# the modification time of its .meta file.
+		oid="${line#freshen }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			touch "$OBJDIR/$oid.meta"
+			echo true
+		else
+			echo false
+		fi
+		;;
+	prune | prune\ *)
+		# prune [--dry-run] [<expire>], then the unreachable objects, one
+		# per line up to a blank line. Remove those last written at or
+		# before <expire>, or all of them without one, naming each.
+		set -- ${line#prune}
+		dry_run=
+		if test "$1" = --dry-run
+		then
+			dry_run=t
+			shift
+		fi
+		expire="$1"
+		while IFS= read -r oid
+		do
+			test -n "$oid" || break
+			test -f "$OBJDIR/$oid.meta" || continue
+			if test -n "$expire" &&
+			   test "$(test-tool chmtime --get "$OBJDIR/$oid.meta")" -gt "$expire"
+			then
+				continue
+			fi
+			test -n "$dry_run" ||
+				rm -f "$OBJDIR/$oid" "$OBJDIR/$oid.meta" "$OBJDIR/$oid.promisor"
+			echo "$oid"
+		done
+		echo ok
 		;;
 	list-objects | list-objects\ *)
 		# An optional "--promisor-only" restricts the listing to the

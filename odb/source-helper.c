@@ -2,6 +2,7 @@
 #include "config.h"
 #include "dir.h"
 #include "gettext.h"
+#include "hash-lookup.h"
 #include "hex.h"
 #include "helper.h"
 #include "loose.h"
@@ -40,6 +41,8 @@ enum object_helper_capability {
 	OBJECT_HELPER_VERIFY = (1 << 11),
 	OBJECT_HELPER_PUT_RAW = (1 << 12),
 	OBJECT_HELPER_REPLACE = (1 << 13),
+	OBJECT_HELPER_FRESHEN = (1 << 14),
+	OBJECT_HELPER_PRUNE = (1 << 15),
 };
 
 static const struct helper_capability object_helper_capabilities[] = {
@@ -57,6 +60,8 @@ static const struct helper_capability object_helper_capabilities[] = {
 	{ "verify", OBJECT_HELPER_VERIFY },
 	{ "put-raw", OBJECT_HELPER_PUT_RAW },
 	{ "replace", OBJECT_HELPER_REPLACE },
+	{ "freshen", OBJECT_HELPER_FRESHEN },
+	{ "prune", OBJECT_HELPER_PRUNE },
 	{ NULL },
 };
 
@@ -628,12 +633,26 @@ static int odb_source_helper_freshen_object(struct odb_source *source,
 					    const time_t *mtime)
 {
 	struct odb_source_helper *helper = odb_source_helper_downcast(source);
+	struct helper_process *hp = started(helper);
+	struct strbuf line = STRBUF_INIT;
+	int exists = 0;
 
 	/*
-	 * Nothing prunes the objects of the helper, so one that it has needs
-	 * no freshening.
+	 * "freshen" moves the time the helper keeps for when an object was
+	 * last written, which its pruning goes by. A helper keeping no such
+	 * time only tells whether it has the object.
 	 */
-	if (helper_read_object(helper, oid, NULL, 0, NULL) == ODB_READ_OK)
+	if (capable(helper, OBJECT_HELPER_FRESHEN)) {
+		helper_process_send(hp, "freshen %s\n", oid_to_hex(oid));
+		if (helper_process_readline(hp, &line) == EOF)
+			drop_connection(helper);
+		else
+			exists = !strcmp(line.buf, "true");
+		strbuf_release(&line);
+	} else {
+		exists = helper_read_object(helper, oid, NULL, 0, NULL) == ODB_READ_OK;
+	}
+	if (exists)
 		return 1;
 	return odb_source_freshen_object(&helper->files->base, oid, mtime);
 }
@@ -1307,6 +1326,26 @@ out:
 	return ret;
 }
 
+/*
+ * Remove the unreachable objects of the helper past the expiry, as the
+ * repack optimizing the files backend expires the unreachable objects of
+ * its packfiles. git-prune(1) finds out which objects are reachable.
+ */
+static int prune_unreachable(struct odb_source_helper *helper,
+			     const char *expire)
+{
+	struct child_process cmd = CHILD_PROCESS_INIT;
+
+	cmd.git_cmd = 1;
+	strvec_pushl(&cmd.args, "prune", "--expire", expire, NULL);
+	if (repo_has_promisor_remote(helper->base.odb->repo))
+		strvec_push(&cmd.args, "--exclude-promisor-objects");
+	if (run_command(&cmd))
+		return error(_("unable to prune the objects of helper '%s'"),
+			     helper->hp.name);
+	return 0;
+}
+
 static int odb_source_helper_optimize(struct odb_source *source,
 				      const struct odb_optimize_options *opts)
 {
@@ -1317,7 +1356,8 @@ static int odb_source_helper_optimize(struct odb_source *source,
 
 	/*
 	 * Objects of a repository that others borrow through their alternates
-	 * stay in its files store, where those see them.
+	 * stay in its files store, where those see them, and are never
+	 * pruned.
 	 */
 	if (!source->odb->repo->repository_format_precious_objects) {
 		if (drain_files_store(helper))
@@ -1325,6 +1365,10 @@ static int odb_source_helper_optimize(struct odb_source *source,
 		if (capable(helper, OBJECT_HELPER_PUT_RAW) &&
 		    capable(helper, OBJECT_HELPER_REPLACE) &&
 		    deltify(helper, opts))
+			return -1;
+		/* Deltas off an unreachable base were moved off it just now. */
+		if (opts->prune_expire && capable(helper, OBJECT_HELPER_PRUNE) &&
+		    prune_unreachable(helper, opts->prune_expire))
 			return -1;
 	}
 
@@ -1483,6 +1527,92 @@ static int odb_source_helper_fsck(struct odb_source *source,
 	return ret;
 }
 
+static int listed_object_cmp(const void *a, const void *b)
+{
+	const struct listed_object *x = a, *y = b;
+	return oidcmp(&x->oid, &y->oid);
+}
+
+static const struct object_id *listed_object_oid(size_t i, const void *table)
+{
+	const struct listed_object *objects = table;
+	return &objects[i].oid;
+}
+
+/*
+ * Git knows which objects are reachable and the helper when it wrote each,
+ * so git sends the unreachable ones for the helper to remove those it wrote
+ * before the expiry. The objects of the files store are loose objects and
+ * packfiles, which git-prune(1) and git-repack(1) remove themselves.
+ */
+static int odb_source_helper_prune(struct odb_source *source,
+				   const struct odb_prune_options *opts)
+{
+	struct odb_source_helper *helper = odb_source_helper_downcast(source);
+	const struct git_hash_algo *algo = source->odb->repo->hash_algo;
+	struct helper_process *hp = started(helper);
+	struct strbuf line = STRBUF_INIT;
+	struct listed_object *objects;
+	size_t nr, unreachable = 0;
+	int ret = 0;
+
+	if (!capable(helper, OBJECT_HELPER_PRUNE))
+		return 0;
+	if (list_objects(helper, "", &objects, &nr) < 0)
+		return error(_("unable to list the objects of helper '%s'"),
+			     hp->name);
+
+	for (size_t i = 0; i < nr; i++)
+		if (!opts->is_reachable(&objects[i].oid, opts->data))
+			objects[unreachable++] = objects[i];
+	if (!unreachable)
+		goto out;
+	QSORT(objects, unreachable, listed_object_cmp);
+
+	/* An object written at any time may go, unless an expiry says. */
+	helper_process_send(hp, "prune%s", (opts->flags & ODB_PRUNE_DRY_RUN) ?
+			    " --dry-run" : "");
+	if (opts->expire != TIME_MAX)
+		helper_process_send(hp, " %"PRItime, opts->expire);
+	helper_process_send(hp, "\n");
+	for (size_t i = 0; i < unreachable; i++)
+		helper_process_send(hp, "%s\n", oid_to_hex(&objects[i].oid));
+	helper_process_send(hp, "\n");
+
+	/* The helper names each object it prunes, then says "ok". */
+	while (1) {
+		struct object_id oid;
+		const char *end;
+		int pos;
+
+		if (helper_process_readline(hp, &line) == EOF) {
+			drop_connection(helper);
+			ret = error(_("helper '%s' hung up while pruning"), hp->name);
+			break;
+		}
+		if (!strcmp(line.buf, "ok"))
+			break;
+		if (parse_oid_hex_algop(line.buf, &oid, &end, algo) || *end ||
+		    (pos = oid_pos(&oid, objects, unreachable,
+				   listed_object_oid)) < 0) {
+			const char *reason = line.buf;
+
+			skip_prefix(reason, "error ", &reason);
+			ret = error(_("helper '%s' failed to prune: %s"),
+				    hp->name, reason);
+			/* The reply may go on; start over on the next command. */
+			drop_connection(helper);
+			break;
+		}
+		opts->pruned(&oid, objects[pos].type, opts->data);
+	}
+
+out:
+	strbuf_release(&line);
+	free(objects);
+	return ret;
+}
+
 static int odb_source_helper_create_on_disk(struct odb_source *source,
 					    const struct odb_create_on_disk_options *opts)
 {
@@ -1541,6 +1671,7 @@ struct odb_source_helper *odb_source_helper_new(struct object_database *odb,
 	helper->base.create_on_disk = odb_source_helper_create_on_disk;
 	helper->base.prepare = odb_source_helper_prepare;
 	helper->base.fsck = odb_source_helper_fsck;
+	helper->base.prune = odb_source_helper_prune;
 	helper->base.read_object_info = odb_source_helper_read_object_info;
 	helper->base.read_object_stream = odb_source_helper_read_object_stream;
 	helper->base.for_each_object = odb_source_helper_for_each_object;
