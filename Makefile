@@ -135,6 +135,9 @@ include shared.mak
 #
 # Define MMAP_PREVENTS_DELETE if a file that is currently mmapped cannot be
 # deleted or cannot be replaced using rename().
+# It only chooses the default for core.mmapPreventsDelete, which says the same
+# thing for one repository, and is slated for removal; see Documentation/
+# BreakingChanges.adoc.
 #
 # Define NO_POLL_H if you don't have poll.h.
 #
@@ -159,6 +162,9 @@ include shared.mak
 #
 # Define NO_FAST_WORKING_DIRECTORY if accessing objects in pack files is
 # generally faster on your platform than accessing the working directory.
+# It only chooses the default for core.fastWorkingDirectory, which says the
+# same thing for one repository, and is slated for removal; see Documentation/
+# BreakingChanges.adoc.
 #
 # Define NO_TRUSTABLE_FILEMODE if your filesystem may claim to support
 # the executable mode bit, but doesn't really do so.
@@ -212,6 +218,9 @@ include shared.mak
 #
 # Define USE_STDEV below if you want git to care about the underlying device
 # change being considered an inode change from the update-index perspective.
+# It only chooses the default for core.trustStdev, which says the same thing
+# for one repository, and is slated for removal; see Documentation/
+# BreakingChanges.adoc.
 #
 # Define NO_ST_BLOCKS_IN_STRUCT_STAT if your platform does not have st_blocks
 # field that counts the on-disk footprint in 512-byte blocks.
