@@ -693,11 +693,13 @@ enum ref_transaction_error refs_verify_refnames_available(struct ref_store *refs
  * 'refdir' and 'ref_common_dir'. The former is where references should be
  * stored for the current worktree, the latter is the common reference
  * directory if working with a linked worktree. If working with the main
- * worktree, both values will be the same.
+ * worktree, both values will be the same. A relative payload is relative to
+ * the common directory of the repository.
  *
  * This is used by backends that store references in the repository directly.
  */
-void refs_compute_filesystem_location(const char *gitdir, const char *payload,
+void refs_compute_filesystem_location(struct repository *repo,
+				      const char *gitdir, const char *payload,
 				      bool *is_worktree, struct strbuf *refdir,
 				      struct strbuf *ref_common_dir);
 
