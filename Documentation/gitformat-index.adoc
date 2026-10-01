@@ -419,6 +419,29 @@ The remaining data of each directory block is grouped by type:
   tools should avoid interacting with a sparse index unless they understand
   this extension.
 
+== System
+
+  The system that wrote the index, where the owner and inode numbers its
+  entries record were assigned. They mean nothing elsewhere: the owner is
+  the operating system's number, and an inode number names one file only
+  within one mounted filesystem during one boot.
+
+  The signature for this extension is { 'S', 'Y', 'S', 'T' }.
+
+  The extension consists of:
+
+  - The name of that system, not NUL-terminated: the operating system as
+    uname(2) reports its sysname, followed on Linux by ", boot " and the
+    boot ID, and by ", mount " and the ID statx(2) reports for the mount
+    holding the worktree, where each is available.
+
+  A reader whose own name is different does not compare the owner, inode,
+  ctime or sub-second mtime of an entry with the file, and a refresh that
+  finds the entry unchanged records this system's. So does a reader of an
+  index without this extension: a Git that does not know it drops it when
+  it rewrites the index, and that cannot be told apart from an index this
+  system has not written yet.
+
 GIT
 ---
 Part of the linkgit:git[1] suite
