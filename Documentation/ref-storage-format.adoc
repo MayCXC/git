@@ -6,3 +6,6 @@ endif::with-breaking-changes[]
 ifdef::with-breaking-changes[]
 	This is the default.
 endif::with-breaking-changes[]
+`helper`;; for references served by a `git-local-<name>` helper program,
+	named by the payload as in `helper://<name>` (see
+	linkgit:gitlocal-helpers[7]).

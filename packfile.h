@@ -34,7 +34,8 @@ struct packed_git {
 		 do_not_close:1,
 		 pack_promisor:1,
 		 multi_pack_index:1,
-		 is_cruft:1;
+		 is_cruft:1,
+		 in_memory:1;
 	unsigned char hash[GIT_MAX_RAWSZ];
 	struct revindex_entry *revindex;
 	const uint32_t *revindex_data;
@@ -78,8 +79,12 @@ static inline struct repo_for_each_pack_data repo_for_eack_pack_data_init(struct
 	struct repo_for_each_pack_data data = { 0 };
 
 	for (struct odb_source *source = repo->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packfile_list_entry *entry = packfile_store_get_packs(files->packed);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		struct packfile_list_entry *entry;
+
+		if (!files)
+			continue;
+		entry = packfile_store_get_packs(files->packed);
 		if (!entry)
 			continue;
 		data.source = source;
@@ -99,8 +104,12 @@ static inline void repo_for_each_pack_data_next(struct repo_for_each_pack_data *
 		return;
 
 	for (source = data->source->next; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packfile_list_entry *entry = packfile_store_get_packs(files->packed);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		struct packfile_list_entry *entry;
+
+		if (!files)
+			continue;
+		entry = packfile_store_get_packs(files->packed);
 		if (!entry)
 			continue;
 		data->source = source;
@@ -185,6 +194,23 @@ const char *pack_basename(struct packed_git *p);
  */
 struct packed_git *parse_pack_index(struct repository *r, unsigned char *sha1,
 				    const char *idx_path);
+
+/*
+ * Set up a pack of which only the index is at hand, in the `index_size`
+ * bytes at `index` laid out as an '.idx' file is, as a source keeping its
+ * objects elsewhere may store the index of the pack it once kept them in,
+ * for the reachability bitmap of that pack. `pack_size` is the size the
+ * pack had. The objects cannot be read from the pack, which is not added
+ * to the internal list of packs either.
+ *
+ * The pack takes the memory over when it is set up, which close_pack()
+ * frees, and the caller frees the pack after closing it. Returns NULL when
+ * the data is not a pack index.
+ */
+struct packed_git *packed_git_from_index(struct repository *r,
+					 const char *pack_name,
+					 void *index, size_t index_size,
+					 off_t pack_size);
 
 typedef void each_file_in_pack_dir_fn(const char *full_path, size_t full_path_len,
 				      const char *file_name, void *data);
@@ -306,6 +332,30 @@ int unpack_object_header(struct packed_git *, struct pack_window **, off_t *, si
 off_t get_delta_base(struct packed_git *p, struct pack_window **w_curs,
 		     off_t *curpos, enum object_type type,
 		     off_t delta_obj_offset);
+
+/*
+ * The entry of an object in a packfile, as the packfile stores it: the
+ * compressed contents of the object, or a compressed delta against another.
+ */
+struct packed_raw_entry {
+	unsigned char *data;
+	size_t data_len;
+	/* The size of what the compressed bytes inflate to. */
+	size_t size;
+	/* The type of the object, resolved through a delta. */
+	enum object_type type;
+	/* The base of a delta, or the null object ID for a whole object. */
+	struct object_id delta_base;
+};
+
+/*
+ * Read the entry of the object at `offset` in `p` without inflating it, as
+ * pack-objects copies an entry it reuses, and check its CRC if the index of
+ * the packfile records one. Returns 0 on success, in which case the caller
+ * frees `entry->data`, and -1 on error.
+ */
+int packed_object_raw_entry(struct packed_git *p, off_t offset,
+			    struct packed_raw_entry *entry);
 
 int packfile_read_object_stream(struct odb_stream **out,
 				const struct object_id *oid,

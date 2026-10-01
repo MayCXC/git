@@ -118,6 +118,7 @@
 /git-mv
 /git-name-rev
 /git-notes
+/git-odb
 /git-p4
 /git-pack-redundant
 /git-pack-objects

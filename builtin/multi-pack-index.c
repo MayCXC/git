@@ -92,7 +92,7 @@ static struct odb_source_files *handle_object_dir_option(struct repository *repo
 	if (!source)
 		die(_("object directory is not an alternate of the current repository: '%s'"),
 		    opts.object_dir);
-	return odb_source_files_downcast(source);
+	return odb_source_files_store(source);
 }
 
 static struct option common_opts[] = {

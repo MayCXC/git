@@ -663,7 +663,8 @@ static int git_sparse_checkout_init(const char *repo)
 static int checkout(int submodule_progress,
 		    struct list_objects_filter_options *filter_options,
 		    int filter_submodules,
-		    enum ref_storage_format ref_storage_format)
+		    const char *submodule_ref_storage,
+		    const char *object_storage)
 {
 	struct object_id oid;
 	char *head;
@@ -749,9 +750,13 @@ static int checkout(int submodule_progress,
 			strvec_push(&cmd.args, "--no-fetch");
 		}
 
-		if (ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
+		if (submodule_ref_storage)
 			strvec_pushf(&cmd.args, "--ref-storage-format=%s",
-				     ref_storage_format_to_name(ref_storage_format));
+				     submodule_ref_storage);
+
+		if (object_storage)
+			strvec_pushf(&cmd.args, "--object-storage=%s",
+				     object_storage);
 
 		if (filter_submodules && filter_options->choice)
 			strvec_pushf(&cmd.args, "--filter=%s",
@@ -901,6 +906,7 @@ int cmd_clone(int argc,
 	const char *repo_name, *repo, *work_tree, *git_dir;
 	char *repo_to_free = NULL;
 	char *path = NULL, *dir, *display_repo = NULL;
+	char *source_storage = NULL;
 	int dest_exists, real_dest_exists = 0;
 	const struct ref *refs, *remote_head;
 	struct ref *remote_head_points_at = NULL;
@@ -918,7 +924,7 @@ int cmd_clone(int argc,
 	int submodule_progress;
 	int filter_submodules = 0;
 	int hash_algo;
-	enum ref_storage_format ref_storage_format = REF_STORAGE_FORMAT_UNKNOWN;
+	char *submodule_ref_storage = NULL;
 	const int do_not_override_repo_unix_permissions = -1;
 	int option_reject_shallow = -1; /* unspecified */
 	int deepen = 0;
@@ -927,6 +933,7 @@ int cmd_clone(int argc,
 	struct string_list option_not = STRING_LIST_INIT_NODUP;
 	const char *real_git_dir = NULL;
 	const char *ref_storage_format_uri = NULL;
+	const char *object_storage_uri = NULL;
 	const char *option_upload_pack = "git-upload-pack";
 	int option_progress = -1;
 	int option_sparse_checkout = 0;
@@ -1009,6 +1016,8 @@ int cmd_clone(int argc,
 		OPT_STRING(0, "ref-storage-format", &ref_storage_format_uri, N_("format"),
 			   N_("specify the reference storage format to use")),
 		OPT_ALIAS_F(0, "ref-format", "ref-storage-format", PARSE_OPT_HIDDEN),
+		OPT_STRING(0, "object-storage", &object_storage_uri, N_("storage"),
+			   N_("specify the object storage to use")),
 		OPT_STRING_LIST('c', "config", &option_config, N_("key=value"),
 				N_("set config inside the new repository")),
 		OPT_STRING_LIST(0, "server-option", &server_options,
@@ -1055,9 +1064,23 @@ int cmd_clone(int argc,
 		option_single_branch = deepen ? 1 : 0;
 
 	if (ref_storage_format_uri) {
-		ref_storage_format = ref_storage_format_by_uri(ref_storage_format_uri, NULL);
+		enum ref_storage_format ref_storage_format =
+			ref_storage_format_by_uri(ref_storage_format_uri, NULL);
+
 		if (ref_storage_format == REF_STORAGE_FORMAT_UNKNOWN)
 			die(_("unknown ref storage format '%s'"), ref_storage_format_uri);
+
+		/*
+		 * Submodules take the ref storage format of the superproject
+		 * without the payload locating its references, but a helper
+		 * named by the payload keeps the references of each repository
+		 * it serves apart.
+		 */
+		if (ref_storage_format == REF_STORAGE_FORMAT_HELPER)
+			submodule_ref_storage = xstrdup(ref_storage_format_uri);
+		else
+			submodule_ref_storage =
+				xstrdup(ref_storage_format_to_name(ref_storage_format));
 	}
 
 	if (option_mirror) {
@@ -1214,7 +1237,8 @@ int cmd_clone(int argc,
 	 */
 	create_repository(the_repository, git_dir, real_git_dir, work_tree,
 			  option_template, GIT_HASH_UNKNOWN, ref_storage_format_uri,
-			  do_not_override_repo_unix_permissions, NULL);
+			  object_storage_uri, do_not_override_repo_unix_permissions,
+			  NULL);
 
 	if (real_git_dir) {
 		free((char *)git_dir);
@@ -1359,6 +1383,15 @@ int cmd_clone(int argc,
 				die(_("source repository is shallow, reject to clone."));
 			if (option_local > 0)
 				warning(_("source repository is shallow, ignoring --local"));
+			is_local = 0;
+		}
+		/* Its objects directory lacks the objects its helper keeps. */
+		source_storage = read_object_storage(path);
+		if (source_storage) {
+			if (option_shared)
+				die(_("cannot share the objects of a source repository that stores them in a helper"));
+			if (option_local > 0)
+				warning(_("source repository stores its objects in a helper, ignoring --local"));
 			is_local = 0;
 		}
 	}
@@ -1657,7 +1690,8 @@ int cmd_clone(int argc,
 	err = checkout(submodule_progress,
 		       &filter_options,
 		       filter_submodules,
-		       ref_storage_format);
+		       submodule_ref_storage,
+		       object_storage_uri);
 
 	list_objects_filter_release(&filter_options);
 
@@ -1676,6 +1710,8 @@ int cmd_clone(int argc,
 	free(unborn_head);
 	free(dir);
 	free(path);
+	free(source_storage);
+	free(submodule_ref_storage);
 	free(repo_to_free);
 	junk_mode = JUNK_LEAVE_ALL;
 

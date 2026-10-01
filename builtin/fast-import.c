@@ -895,7 +895,7 @@ static void end_packfile(void)
 	running = 1;
 	clear_delta_base_cache();
 	if (object_count) {
-		struct odb_source_files *files = odb_source_files_downcast(pack_data->repo->objects->sources);
+		struct odb_source_files *files = odb_source_files_store(pack_data->repo->objects->sources);
 		struct packed_git *new_p;
 		struct object_id cur_pack_oid;
 		char *idx_name;
@@ -1003,9 +1003,10 @@ static int store_object(
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
-		if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
+		if (!files ||
+		    !packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
 			continue;
 		e->type = type;
 		e->pack_id = MAX_PACK_ID;
@@ -1213,9 +1214,10 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
-		if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
+		if (!files ||
+		    !packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
 			continue;
 		e->type = OBJ_BLOB;
 		e->pack_id = MAX_PACK_ID;

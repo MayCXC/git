@@ -37,6 +37,26 @@ Note that this setting should only be set by linkgit:git-init[1] or
 linkgit:git-clone[1].  Trying to change it after initialization will not
 work and will produce hard-to-diagnose issues.
 
+objectStorage:::
+	Specify where the repository stores its objects. The value is one
+	of:
++
+--
+include::../object-storage.adoc[]
+--
++
+A repository whose objects are stored by a helper keeps its objects
+directory. Objects arriving as packfiles or loose objects, such as those
+received by linkgit:git-fetch[1] or linkgit:git-receive-pack[1], land
+there and are read from there until linkgit:git-gc[1] moves them into the
+helper. Packfiles kept by a `.keep` file stay where they are, and so do all
+of them in a repository with `extensions.preciousObjects` set, whose
+objects other repositories may borrow.
++
+Note that this setting should only be set by linkgit:git-init[1] or
+linkgit:git-clone[1]. Trying to change it after initialization will not
+work and will produce hard-to-diagnose issues.
+
 partialClone:::
 	When enabled, indicates that the repo was created with a partial clone
 	(or later performed a partial fetch) and that the remote may have
@@ -66,6 +86,10 @@ refStorage:::
 * A URI format `<format>://<payload>` explicitly specifies both the
   format and payload (e.g., `reftable:///foo/bar`).
 
+* Any other name, spelled like a URL scheme, stands for `helper://<name>`:
+  it selects the `git-local-<name>` helper program, the way an unknown URL
+  scheme selects a `git-remote-<name>` remote helper.
+
 Supported format names are:
 
 include::../ref-storage-format.adoc[]
@@ -73,8 +97,10 @@ include::../ref-storage-format.adoc[]
 The payload is passed directly to the reference backend. For the files and
 reftable backends, this must be a filesystem path where the references will
 be stored. Defaulting to the commondir when no payload is provided. Relative
-paths are resolved relative to the `$GIT_DIR`. Future backends may support
-other payload schemes, e.g., postgres://127.0.0.1:5432?database=myrepo.
+paths are resolved relative to the `$GIT_DIR`. For the helper backend, it is
+the `<name>` of the `git-local-<name>` program serving the references, which
+it requires. Future backends may support other payload schemes, e.g.,
+postgres://127.0.0.1:5432?database=myrepo.
 --
 +
 Note that this setting should only be set by linkgit:git-init[1] or

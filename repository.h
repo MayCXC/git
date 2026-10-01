@@ -20,6 +20,7 @@ enum ref_storage_format {
 	REF_STORAGE_FORMAT_UNKNOWN,
 	REF_STORAGE_FORMAT_FILES,
 	REF_STORAGE_FORMAT_REFTABLE,
+	REF_STORAGE_FORMAT_HELPER,
 };
 
 #ifdef WITH_BREAKING_CHANGES /* Git 3.0 */
@@ -37,6 +38,8 @@ struct repo_path_cache {
 	char *fetch_head;
 	char *shallow;
 };
+
+struct helper_process;
 
 struct repository {
 	/* Environment */
@@ -64,6 +67,9 @@ struct repository {
 	 * Holds any information related to accessing the raw object content.
 	 */
 	struct object_database *objects;
+
+	/* The helper process serving refs when the ref backend is the helper. */
+	struct helper_process *ref_local_helper;
 
 	/*
 	 * All objects in this repository that have been parsed. This structure
@@ -178,6 +184,12 @@ struct repository {
 	 */
 	char *ref_storage_payload;
 
+	/*
+	 * The object storage of the repository as a canonical URI, like
+	 * "helper://<name>", or NULL for the files backend.
+	 */
+	char *object_storage;
+
 	/* A unique-id for tracing purposes. */
 	int trace2_repo_id;
 
@@ -255,6 +267,7 @@ void repo_set_compat_hash_algo(struct repository *repo, uint32_t compat_algo);
 void repo_set_ref_storage_format(struct repository *repo,
 				 enum ref_storage_format format,
 				 const char *payload);
+void repo_set_object_storage(struct repository *repo, const char *uri);
 void initialize_repository(struct repository *repo);
 RESULT_MUST_BE_USED
 int repo_init(struct repository *r, const char *gitdir, const char *worktree);

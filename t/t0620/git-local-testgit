@@ -1,0 +1,488 @@
+#!/bin/sh
+#
+# Minimal "git-local-testgit" storage helper for exercising the local helper
+# backends end to end. Speaks the line protocol on stdin/stdout (see
+# gitlocal-helpers(7)), for objects and refs alike, like a real helper does.
+# State is kept as plain files under the directory the helper is spawned
+# with: objects in helper-objects/ (each with a .meta file holding
+# "<type> <size>", followed by " <delta-base> <delta-size>" for an object
+# that arrived as a delta, a .raw file holding the compressed bytes of an
+# object that arrived by "put-raw", and a .promisor marker for promisor
+# objects), the reachability bitmap in helper-bitmap/, refs in
+# helper-refs/, reflogs in helper-reflogs/ (refnames encode '/' as '_').
+
+OBJDIR="$1/helper-objects"
+BITMAPDIR="$1/helper-bitmap"
+REFDIR="$1/helper-refs"
+REFLOGDIR="$1/helper-reflogs"
+mkdir -p "$OBJDIR" "$REFDIR" "$REFLOGDIR"
+
+TXUPDATES=
+
+# When set, append every received command line here so a test can assert the
+# wire behavior.
+LOG="${GIT_LOCAL_TESTGIT_LOG:-}"
+
+# When set, evaluated for every received command line, as $line, before the
+# command is handled, so a test can act at a point of an exchange.
+ON_COMMAND="${GIT_LOCAL_TESTGIT_ON_COMMAND:-}"
+
+# When set, the capabilities to advertise instead of all of them, so a test
+# can exercise what git does without one.
+CAPABILITIES="${GIT_LOCAL_TESTGIT_CAPABILITIES:-get info put put-raw \
+replace get-raw put-stream have freshen list-objects promisor refresh \
+optimize prune verify bitmap read list transaction create remove reflog \
+reflog-read-reverse}"
+
+while IFS= read -r line
+do
+	test -n "$LOG" && printf '%s\n' "$line" >>"$LOG"
+	test -n "$ON_COMMAND" && eval "$ON_COMMAND"
+	case "$line" in
+	capabilities)
+		printf '%s\n' $CAPABILITIES ""
+		;;
+	info\ *)
+		oid="${line#info }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			cat "$OBJDIR/$oid.meta"
+		else
+			echo missing
+		fi
+		;;
+	get\ *)
+		oid="${line#get }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			cat "$OBJDIR/$oid.meta" "$OBJDIR/$oid"
+		else
+			echo missing
+		fi
+		;;
+	put\ *)
+		# put <oid> <type> <size>, then <size> bytes of content. git
+		# waits for the reply, so nothing follows the content yet.
+		set -- $line
+		oid="$2" type="$3" size="$4"
+		head -c "$size" >"$OBJDIR/$oid"
+		rm -f "$OBJDIR/$oid.raw"
+		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		echo "$oid"
+		;;
+	put-stream\ *)
+		# put-stream <type> <size>, then the content and a line with the
+		# object ID git computed. git sends the ID without waiting, so
+		# read the content a byte at a time to leave the ID in the pipe.
+		set -- $line
+		type="$2" size="$3"
+		tmp=$(mktemp "$OBJDIR/tmp.XXXXXX")
+		dd bs=1 count="$size" of="$tmp" 2>/dev/null
+		IFS= read -r oid
+		mv "$tmp" "$OBJDIR/$oid"
+		rm -f "$OBJDIR/$oid.raw"
+		printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		echo "$oid"
+		;;
+	put-raw\ *)
+		# put-raw <oid> <type> <size> <delta-base> <compressed-size>
+		# [<replace>], then the compressed content, or a compressed delta
+		# against a stored <delta-base>. Keep the object resolved, the
+		# compressed bytes for get-raw, and the base and size of a delta
+		# to report; an object stored already stays as it is unless
+		# <replace> is 1.
+		set -- $line
+		oid="$2" type="$3" rsize="$4" base="$5" clen="$6" replace="$7"
+		tmp=$(mktemp "$OBJDIR/tmp.XXXXXX")
+		head -c "$clen" >"$tmp.raw"
+		test-tool zlib inflate <"$tmp.raw" >"$tmp"
+		if test -f "$OBJDIR/$oid.meta" && test "$replace" != 1
+		then
+			rm -f "$tmp" "$tmp.raw"
+		elif test "$base" = 0
+		then
+			mv "$tmp" "$OBJDIR/$oid"
+			mv "$tmp.raw" "$OBJDIR/$oid.raw"
+			size=$(wc -c <"$OBJDIR/$oid")
+			printf '%s %d\n' "$type" "$size" >"$OBJDIR/$oid.meta"
+		else
+			test-tool delta -p "$OBJDIR/$base" "$tmp" "$OBJDIR/$oid"
+			rm -f "$tmp"
+			mv "$tmp.raw" "$OBJDIR/$oid.raw"
+			size=$(wc -c <"$OBJDIR/$oid")
+			printf '%s %d %s %d\n' "$type" "$size" "$base" "$rsize" \
+				>"$OBJDIR/$oid.meta"
+		fi
+		echo "$oid"
+		;;
+	get-raw\ *)
+		# The object as put-raw gave it, or compressed whole for an
+		# object that came otherwise.
+		oid="${line#get-raw }"
+		if ! test -f "$OBJDIR/$oid.meta"
+		then
+			echo missing
+			continue
+		fi
+		read -r type size base dsize <"$OBJDIR/$oid.meta"
+		raw="$OBJDIR/$oid.raw"
+		if ! test -f "$raw"
+		then
+			raw=$(mktemp "$OBJDIR/tmp.XXXXXX")
+			test-tool zlib deflate <"$OBJDIR/$oid" >"$raw"
+		fi
+		if test -n "$base"
+		then
+			printf '%s %d %s %d\n' "$type" "$dsize" "$base" \
+				"$(wc -c <"$raw")"
+		else
+			printf '%s %d 0 %d\n' "$type" "$size" "$(wc -c <"$raw")"
+		fi
+		cat "$raw"
+		test "$raw" = "$OBJDIR/$oid.raw" || rm -f "$raw"
+		;;
+	have\ *)
+		oid="${line#have }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			echo true
+		else
+			echo false
+		fi
+		;;
+	freshen\ *)
+		# The time an object was last written, which pruning goes by, is
+		# the modification time of its .meta file.
+		oid="${line#freshen }"
+		if test -f "$OBJDIR/$oid.meta"
+		then
+			touch "$OBJDIR/$oid.meta"
+			echo true
+		else
+			echo false
+		fi
+		;;
+	prune | prune\ *)
+		# prune [--dry-run] [<expire>], then the unreachable objects, one
+		# per line up to a blank line. Remove those last written at or
+		# before <expire>, or all of them without one, naming each.
+		set -- ${line#prune}
+		dry_run=
+		if test "$1" = --dry-run
+		then
+			dry_run=t
+			shift
+		fi
+		expire="$1"
+		while IFS= read -r oid
+		do
+			test -n "$oid" || break
+			test -f "$OBJDIR/$oid.meta" || continue
+			if test -n "$expire" &&
+			   test "$(test-tool chmtime --get "$OBJDIR/$oid.meta")" -gt "$expire"
+			then
+				continue
+			fi
+			test -n "$dry_run" ||
+				rm -f "$OBJDIR/$oid" "$OBJDIR/$oid.meta" \
+				      "$OBJDIR/$oid.raw" "$OBJDIR/$oid.promisor"
+			echo "$oid"
+		done
+		echo ok
+		;;
+	list-objects | list-objects\ *)
+		# An optional "--promisor-only" restricts the listing to the
+		# objects marked by "promisor"; an optional hex prefix scopes it
+		# to the objects whose IDs start with it.
+		promisor_only=
+		prefix=
+		for arg in ${line#list-objects}
+		do
+			case "$arg" in
+			--promisor-only) promisor_only=t ;;
+			*) prefix=$arg ;;
+			esac
+		done
+		for meta in "$OBJDIR"/*.meta
+		do
+			test -f "$meta" || continue
+			oid=$(basename "$meta" .meta)
+			case "$oid" in
+			"$prefix"*) ;;
+			*) continue ;;
+			esac
+			if test -n "$promisor_only" && ! test -f "$OBJDIR/$oid.promisor"
+			then
+				continue
+			fi
+			read -r type size base <"$meta"
+			printf '%s %s %s\n' "$oid" "$type" "$size"
+		done
+		echo ""
+		;;
+	promisor)
+		# Mark each listed object, one ID per line up to a blank line,
+		# as a promisor object.
+		while IFS= read -r oid
+		do
+			test -n "$oid" || break
+			: >"$OBJDIR/$oid.promisor"
+		done
+		echo ok
+		;;
+	refresh)
+		# Every read goes to the files, so there is no view to reload;
+		# per the protocol there is no reply.
+		;;
+	optimize)
+		# Nothing to compact in plain files; a test asserts the command
+		# arrives through the log.
+		echo ok
+		;;
+	verify)
+		# Every stored object must still hash to its name.
+		rc=ok
+		for meta in "$OBJDIR"/*.meta
+		do
+			test -f "$meta" || continue
+			oid=$(basename "$meta" .meta)
+			read -r type size base <"$meta"
+			got=$(git hash-object -t "$type" --stdin <"$OBJDIR/$oid")
+			if test "$got" != "$oid"
+			then
+				rc="error object $oid is corrupt"
+				break
+			fi
+		done
+		echo "$rc"
+		;;
+	put-bitmap\ *)
+		# put-bitmap <pack-size> <index-size> <reverse-index-size>
+		# <bitmap-size>, then the three one after another. git waits for
+		# the reply, so read them at once and split them up.
+		set -- $line
+		isize="$3" rsize="$4" bsize="$5"
+		rm -rf "$BITMAPDIR"
+		mkdir "$BITMAPDIR"
+		head -c $(($isize + $rsize + $bsize)) >"$BITMAPDIR/all"
+		if head -c "$isize" "$BITMAPDIR/all" >"$BITMAPDIR/idx" &&
+		   tail -c +$(($isize + 1)) "$BITMAPDIR/all" |
+		   head -c "$rsize" >"$BITMAPDIR/rev" &&
+		   tail -c +$(($isize + $rsize + 1)) "$BITMAPDIR/all" \
+			>"$BITMAPDIR/bitmap" &&
+		   rm "$BITMAPDIR/all" &&
+		   echo "$2" >"$BITMAPDIR/size"
+		then
+			echo ok
+		else
+			rm -rf "$BITMAPDIR"
+			echo "error cannot store the bitmap"
+		fi
+		;;
+	get-bitmap)
+		if test -f "$BITMAPDIR/size"
+		then
+			printf '%s %d %d %d\n' "$(cat "$BITMAPDIR/size")" \
+				"$(wc -c <"$BITMAPDIR/idx")" \
+				"$(wc -c <"$BITMAPDIR/rev")" \
+				"$(wc -c <"$BITMAPDIR/bitmap")"
+			cat "$BITMAPDIR/idx" "$BITMAPDIR/rev" "$BITMAPDIR/bitmap"
+		else
+			echo missing
+		fi
+		;;
+	remove-bitmap)
+		rm -rf "$BITMAPDIR"
+		echo ok
+		;;
+	read\ *)
+		refname="${line#read }"
+		file="$REFDIR/$(echo "$refname" | tr / _)"
+		if test -f "$file"
+		then
+			cat "$file"
+		else
+			echo missing
+		fi
+		;;
+	list|list\ *)
+		prefix="${line#list}"
+		prefix="${prefix# }"
+		for f in "$REFDIR"/*
+		do
+			test -f "$f" || continue
+			refname=$(basename "$f" | tr _ /)
+			case "$refname" in
+			"$prefix"*)
+				val=$(cat "$f")
+				case "$val" in
+				symref\ *)
+					echo "$refname symref ${val#symref }" ;;
+				*)
+					echo "$refname $val" ;;
+				esac
+				;;
+			esac
+		done | LC_ALL=C sort
+		echo ""
+		;;
+	create)
+		echo ok
+		;;
+	remove)
+		# Delete this helper's ref and reflog store on disk, the step
+		# where a ref storage migration removes the old store.
+		rm -rf "$REFDIR" "$REFLOGDIR"
+		echo ok
+		;;
+	transaction-begin)
+		TXUPDATES=
+		echo ok
+		;;
+	transaction-update\ *|transaction-create\ *|\
+	transaction-delete\ *|transaction-create-symref\ *)
+		TXUPDATES="$TXUPDATES
+$line"
+		echo ok
+		;;
+	transaction-prepare)
+		# Enforce the old-value preconditions the backend forwards (see
+		# gitlocal-helpers(7)): an update or a non-zero-old delete must
+		# match the ref's current value; create force-sets.
+		# This is the race-free point to check, standing in for a real
+		# helper's lock. A here-doc keeps the loop in this shell so the
+		# error flag survives.
+		tx_err=
+		while IFS= read -r upd
+		do
+			test -z "$upd" && continue
+			set -- $upd
+			pcmd="$1" pref="$2"
+			pfile="$REFDIR/$(echo "$pref" | tr / _)"
+			pcur=
+			test -f "$pfile" && pcur=$(cat "$pfile")
+			case "$pcmd" in
+			transaction-update)
+				# An all-zero old value means "must not exist"
+				# (create); otherwise the ref must equal it.
+				case "$4" in
+				*[!0]*) test "$pcur" = "$4" ||
+					tx_err="ref '$pref' is at '$pcur', expected '$4'" ;;
+				*) test -z "$pcur" ||
+					tx_err="ref '$pref' already exists at '$pcur'" ;;
+				esac ;;
+			transaction-delete)
+				# A non-zero old value must match; all-zero is a force
+				# delete (no precondition).
+				case "$3" in
+				*[!0]*) test "$pcur" = "$3" ||
+					tx_err="ref '$pref' is at '$pcur', expected '$3'" ;;
+				esac ;;
+			esac
+		done <<EOF
+$TXUPDATES
+EOF
+		if test -n "$tx_err"
+		then
+			TXUPDATES=
+			printf 'error %s\n' "$tx_err"
+		else
+			echo ok
+		fi
+		;;
+	transaction-finish)
+		echo "$TXUPDATES" | while IFS= read -r upd
+		do
+			test -z "$upd" && continue
+			set -- $upd
+			cmd="$1" refname="$2"
+			file="$REFDIR/$(echo "$refname" | tr / _)"
+			case "$cmd" in
+			transaction-update|transaction-create)
+				echo "$3" >"$file" ;;
+			transaction-delete)
+				rm -f "$file" ;;
+			transaction-create-symref)
+				echo "symref $3" >"$file" ;;
+			esac
+		done
+		echo ok
+		;;
+	transaction-abort)
+		TXUPDATES=
+		echo ok
+		;;
+	reflog-read\ *)
+		refname="${line#reflog-read }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		test -f "$file" && cat "$file"
+		echo ""
+		;;
+	reflog-read-reverse\ *)
+		refname="${line#reflog-read-reverse }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		test -f "$file" && sed -n '1!G;h;$p' "$file"
+		echo ""
+		;;
+	reflog-append\ *)
+		rest="${line#reflog-append }"
+		refname="${rest%% *}"
+		entry="${rest#* }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		echo "$entry" >>"$file"
+		echo ok
+		;;
+	reflog-exists\ *)
+		refname="${line#reflog-exists }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		if test -f "$file"
+		then
+			echo true
+		else
+			echo false
+		fi
+		;;
+	reflog-create\ *)
+		refname="${line#reflog-create }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		: >>"$file"
+		echo ok
+		;;
+	reflog-delete\ *)
+		refname="${line#reflog-delete }"
+		file="$REFLOGDIR/$(echo "$refname" | tr / _)"
+		rm -f "$file"
+		echo ok
+		;;
+	reflog-list)
+		for f in "$REFLOGDIR"/*
+		do
+			test -f "$f" || continue
+			basename "$f" | tr _ /
+		done
+		echo ""
+		;;
+	reflog-copy\ *)
+		# Carry a ref's reflog across on rename/copy. delete_old=1 moves it
+		# (rename), 0 duplicates it (copy). The new name has no reflog yet
+		# here, so appending old's entries keeps them ahead of the rename
+		# entry the backend appends next.
+		rest="${line#reflog-copy }"
+		set -- $rest
+		old="$1" new="$2" delete_old="$3"
+		oldfile="$REFLOGDIR/$(echo "$old" | tr / _)"
+		newfile="$REFLOGDIR/$(echo "$new" | tr / _)"
+		if test -f "$oldfile"
+		then
+			cat "$oldfile" >>"$newfile"
+			if test "$delete_old" = 1
+			then
+				rm -f "$oldfile"
+			fi
+		fi
+		echo ok
+		;;
+	"")
+		;;
+	esac
+done

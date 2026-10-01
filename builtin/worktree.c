@@ -433,9 +433,9 @@ static int make_worktree_orphan(const char * ref, const struct add_opts *opts,
 static void setup_alternate_ref_dir(struct worktree *wt, const char *wt_git_path)
 {
 	struct strbuf sb = STRBUF_INIT;
-	char *path;
+	const char *path;
 
-	path = wt->repo->ref_storage_payload;
+	path = repo_alternate_refdir(wt->repo);
 	if (!path)
 		return;
 

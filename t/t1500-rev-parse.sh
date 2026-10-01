@@ -247,14 +247,16 @@ test_expect_success 'rev-parse --show-ref-storage-format' '
 	test_cmp expect actual
 '
 
-test_expect_success 'rev-parse --show-ref-storage-format with invalid storage' '
+test_expect_success 'rev-parse --show-ref-storage-format with a ref helper' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
 	(
 		cd repo &&
+		git config core.repositoryformatversion 1 &&
 		git config extensions.refstorage broken &&
-		test_must_fail git rev-parse --show-ref-storage-format 2>err &&
-		test_grep "error: invalid value for ${SQ}extensions.refstorage${SQ}: ${SQ}broken${SQ}" err
+		echo helper >expect &&
+		git rev-parse --show-ref-storage-format >actual &&
+		test_cmp expect actual
 	)
 '
 

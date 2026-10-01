@@ -356,9 +356,22 @@ require additional configuration accept a payload in the form
 database that shall store the references. The valid values are:
 +
 include::ref-storage-format.adoc[]
++
+Submodules cloned with `--recurse-submodules` use the same format. They
+take the payload along only when it names a helper, which keeps the
+references of each repository apart.
 
 `--ref-format=<format>`::
 Deprecated alias of `--ref-storage-format=<format>`.
+
+`--object-storage=<storage>`::
+Specify the given object _<storage>_ for the new repository. The valid
+values are:
++
+include::object-storage.adoc[]
++
+Submodules cloned with `--recurse-submodules` store their objects the same
+way.
 
 `-j<n>`::
 `--jobs=<n>`::

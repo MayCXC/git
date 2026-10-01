@@ -86,11 +86,40 @@ test_expect_success "unknown ref storage format" '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
 	test_must_fail git -C repo refs migrate \
-		--ref-storage-format=unknown 2>err &&
+		--ref-storage-format=unknown://payload 2>err &&
 	cat >expect <<-EOF &&
-	error: unknown ref storage format ${SQ}unknown${SQ}
+	error: unknown ref storage format ${SQ}unknown://payload${SQ}
 	EOF
 	test_cmp expect err
+'
+
+test_expect_success "unknown ref storage name selects a ref helper" '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	# An unknown name selects the git-local-<name> ref helper, so the
+	# migration fails once that helper cannot be started.
+	test_must_fail git -C repo refs migrate \
+		--ref-storage-format=unknown 2>err &&
+	cat >expect <<-EOF &&
+	fatal: unable to start helper ${SQ}unknown${SQ}
+	EOF
+	test_cmp expect err &&
+	test_detect_ref_format >expect &&
+	git -C repo rev-parse --show-ref-storage-format >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success "migration to an alternate reference directory fails" '
+	test_when_finished "rm -rf repo refdir" &&
+	git init repo &&
+	mkdir refdir &&
+	test_must_fail git -C repo refs migrate \
+		--ref-storage-format="reftable://$(pwd)/refdir" 2>err &&
+	cat >expect <<-EOF &&
+	error: migrating to an alternate reference directory is not supported
+	EOF
+	test_cmp expect err &&
+	test_dir_is_empty refdir
 '
 
 ref_formats="files reftable"

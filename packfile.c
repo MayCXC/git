@@ -252,6 +252,28 @@ struct packed_git *parse_pack_index(struct repository *r, unsigned char *sha1,
 	return p;
 }
 
+struct packed_git *packed_git_from_index(struct repository *r,
+					 const char *pack_name,
+					 void *index, size_t index_size,
+					 off_t pack_size)
+{
+	const unsigned int hashsz = r->hash_algo->rawsz;
+	size_t alloc = st_add(strlen(pack_name), 1);
+	struct packed_git *p = alloc_packed_git(r, alloc);
+
+	memcpy(p->pack_name, pack_name, alloc); /* includes NUL */
+	if (load_idx(pack_name, hashsz, index, index_size, p)) {
+		free(p);
+		return NULL;
+	}
+	/* The index ends with the checksum of the pack and its own. */
+	hashcpy(p->hash, (unsigned char *)index + index_size - 2 * hashsz,
+		r->hash_algo);
+	p->pack_size = pack_size;
+	p->in_memory = 1;
+	return p;
+}
+
 static void scan_windows(struct packed_git *p,
 	struct packed_git **lru_p,
 	struct pack_window **lru_w,
@@ -279,7 +301,9 @@ static int unuse_one_window(struct object_database *odb)
 	struct pack_window *lru_w = NULL, *lru_l = NULL;
 
 	for (source = odb->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		if (!files)
+			continue;
 		for (e = files->packed->packs.head; e; e = e->next)
 			scan_windows(e->pack, &lru_p, &lru_w, &lru_l);
 	}
@@ -329,7 +353,10 @@ int close_pack_fd(struct packed_git *p)
 void close_pack_index(struct packed_git *p)
 {
 	if (p->index_data) {
-		munmap((void *)p->index_data, p->index_size);
+		if (p->in_memory)
+			free((void *)p->index_data);
+		else
+			munmap((void *)p->index_data, p->index_size);
 		p->index_data = NULL;
 	}
 }
@@ -341,7 +368,10 @@ static void close_pack_revindex(struct packed_git *p)
 	if (!p->revindex_map)
 		return;
 
-	munmap((void *)p->revindex_map, p->revindex_size);
+	if (p->in_memory)
+		free((void *)p->revindex_map);
+	else
+		munmap((void *)p->revindex_map, p->revindex_size);
 	p->revindex_map = NULL;
 	p->revindex_data = NULL;
 }
@@ -457,7 +487,9 @@ static int close_one_pack(struct repository *r)
 	int accept_windows_inuse = 1;
 
 	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		if (!files)
+			continue;
 		for (e = files->packed->packs.head; e; e = e->next) {
 			if (e->pack->pack_fd == -1)
 				continue;
@@ -1145,6 +1177,74 @@ unwind:
 	goto out;
 }
 
+int packed_object_raw_entry(struct packed_git *p, off_t offset,
+			    struct packed_raw_entry *entry)
+{
+	struct pack_window *w_curs = NULL;
+	off_t curpos = offset, next;
+	enum object_type type;
+	unsigned char *dst;
+	uint32_t pos;
+	size_t left;
+	int ret = -1;
+
+	memset(entry, 0, sizeof(*entry));
+
+	/* The entry runs up to the next one, as write_reuse_object() finds. */
+	if (offset_to_pack_pos(p, offset, &pos) < 0)
+		goto out;
+	next = pack_pos_to_offset(p, pos + 1);
+	if (p->index_version > 1 &&
+	    check_pack_crc(p, &w_curs, offset, next - offset,
+			   pack_pos_to_index(p, pos))) {
+		error(_("bad packed object CRC at offset %"PRIuMAX" in %s"),
+		      (uintmax_t)offset, p->pack_name);
+		goto out;
+	}
+
+	type = unpack_object_header(p, &w_curs, &curpos, &entry->size);
+	entry->type = packed_to_object_type(p->repo, p, offset, type,
+					    &w_curs, curpos);
+	if (entry->type <= OBJ_NONE)
+		goto out;
+
+	switch (type) {
+	case OBJ_OFS_DELTA:
+	case OBJ_REF_DELTA:
+		if (get_delta_base_oid(p, &w_curs, curpos, &entry->delta_base,
+				       type, offset) < 0 ||
+		    !get_delta_base(p, &w_curs, &curpos, type, offset))
+			goto out;
+		break;
+	default:
+		oidclr(&entry->delta_base, p->repo->hash_algo);
+		break;
+	}
+	if (next <= curpos)
+		goto out;
+
+	entry->data_len = next - curpos;
+	entry->data = xmalloc(entry->data_len);
+	for (dst = entry->data, left = entry->data_len; left; ) {
+		size_t avail;
+		unsigned char *src = use_pack(p, &w_curs, curpos, &avail);
+
+		if (avail > left)
+			avail = left;
+		memcpy(dst, src, avail);
+		dst += avail;
+		curpos += avail;
+		left -= avail;
+	}
+	ret = 0;
+
+out:
+	unuse_pack(&w_curs);
+	if (ret)
+		FREE_AND_NULL(entry->data);
+	return ret;
+}
+
 static struct hashmap delta_base_cache;
 static size_t delta_base_cached;
 
@@ -1327,6 +1427,22 @@ int packed_object_info_with_index_pos(struct odb_source_packed *source,
 			type = OBJ_BAD;
 	} else if (oi->sizep || oi->typep || oi->delta_base_oid) {
 		type = unpack_object_header(p, &w_curs, &curpos, &size);
+	}
+
+	if (oi->delta_sizep) {
+		off_t pos = obj_offset;
+		size_t in_pack_size;
+		enum object_type in_pack_type =
+			unpack_object_header(p, &w_curs, &pos, &in_pack_size);
+
+		if (in_pack_type == OBJ_OFS_DELTA || in_pack_type == OBJ_REF_DELTA)
+			*oi->delta_sizep = in_pack_size;
+		else if (in_pack_type > OBJ_NONE)
+			*oi->delta_sizep = 0;
+		else {
+			ret = -1;
+			goto out;
+		}
 	}
 
 	if (!oi->contentp && oi->sizep) {
@@ -1924,7 +2040,9 @@ int has_object_pack(struct repository *r, const struct object_id *oid)
 	struct odb_source *source;
 
 	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		if (!files)
+			continue;
 		if (!odb_source_read_object_info(&files->packed->base, oid, NULL, 0, NULL))
 			return 1;
 	}
@@ -1939,9 +2057,11 @@ int has_object_kept_pack(struct repository *r, const struct object_id *oid,
 	struct pack_entry e;
 
 	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 		struct packed_git **cache;
 
+		if (!files)
+			continue;
 		cache = packfile_store_get_kept_pack_cache(files->packed, flags);
 
 		for (; *cache; cache++) {

@@ -49,4 +49,19 @@ static inline struct odb_source_files *odb_source_files_downcast(struct odb_sour
 	return container_of(source, struct odb_source_files, base);
 }
 
+/*
+ * The files store of the given source, which keeps the packfiles and loose
+ * objects of the files backend: the source itself in case it uses that
+ * backend, or a NULL pointer for a source that has none. Code handling that
+ * data reaches it through here rather than by downcasting the source, and
+ * skips the sources without a store while it walks all of them.
+ */
+struct odb_source_files *odb_source_files_store_gently(struct odb_source *source);
+
+/*
+ * Same as `odb_source_files_store_gently()`, but causes a BUG in case the
+ * source has no files store.
+ */
+struct odb_source_files *odb_source_files_store(struct odb_source *source);
+
 #endif

@@ -4084,6 +4084,7 @@ static int files_fsck(struct ref_store *ref_store,
 
 struct ref_storage_be refs_be_files = {
 	.name = "files",
+	.uses_refdir = true,
 	.init = files_ref_store_init,
 	.release = files_ref_store_release,
 	.create_on_disk = files_ref_store_create_on_disk,

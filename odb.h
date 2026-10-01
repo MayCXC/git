@@ -13,6 +13,7 @@ struct cached_object_entry;
 struct list_objects_filter_options;
 struct odb_source_inmemory;
 struct packed_git;
+struct packed_raw_entry;
 struct repository;
 struct strbuf;
 struct strvec;
@@ -166,6 +167,40 @@ int odb_optimize(struct object_database *odb,
  */
 bool odb_optimize_required(struct object_database *odb,
 			   const struct odb_optimize_options *opts);
+
+enum odb_prune_flags {
+	/* Report the objects to prune without removing them. */
+	ODB_PRUNE_DRY_RUN = (1 << 0),
+};
+
+struct odb_prune_options {
+	enum odb_prune_flags flags;
+	/* Objects last written after this time stay. */
+	timestamp_t expire;
+	/* Tell whether an object is reachable, which then stays. */
+	bool (*is_reachable)(const struct object_id *oid, void *data);
+	/* Called with each object pruned. */
+	void (*pruned)(const struct object_id *oid, enum object_type type,
+		       void *data);
+	void *data;
+};
+
+/*
+ * Prune the unreachable objects that the object database keeps other than as
+ * loose objects and packfiles, which git-prune(1) and git-repack(1) remove.
+ * Returns 0 on success, a negative error code otherwise.
+ */
+int odb_prune(struct object_database *odb,
+	      const struct odb_prune_options *opts);
+
+/*
+ * Move the objects of the repository into the object storage `uri` names,
+ * as extensions.objectStorage takes it, and have the repository use it,
+ * with an object database made anew. Returns 0 on success and -1 with a
+ * message in `err` otherwise.
+ */
+int repo_migrate_object_storage(struct repository *repo, const char *uri,
+				struct strbuf *err);
 
 /*
  * Close the object database and all of its sources so that any held resources
@@ -372,6 +407,12 @@ struct object_info {
 	 */
 	struct object_id *delta_base_oid;
 
+	/*
+	 * The size of the delta the object is stored as, in case it is stored
+	 * as a delta, and zero otherwise.
+	 */
+	size_t *delta_sizep;
+
 	/* The object contents. Ownership of memory goes over to the caller. */
 	void **contentp;
 
@@ -472,6 +513,18 @@ enum odb_read_status odb_read_object_info_extended(struct object_database *odb,
 int odb_read_object_info(struct object_database *odb,
 			 const struct object_id *oid,
 			 size_t *sizep);
+
+/*
+ * Read the given object as the source storing it keeps it, the way a
+ * packfile entry keeps an object (see `struct packed_raw_entry`), so that it
+ * can be handed on without inflating and compressing it again. Returns 0 on
+ * success, in which case the caller frees `entry->data`, a positive value in
+ * case no source stores the object this way outside of its packfiles, and a
+ * negative error code otherwise.
+ */
+int odb_read_object_raw(struct object_database *odb,
+			const struct object_id *oid,
+			struct packed_raw_entry *entry);
 
 enum odb_has_object_flags {
 	/* Retry packed storage after checking packed and loose storage */

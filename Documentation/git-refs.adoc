@@ -101,6 +101,11 @@ The following options are specific to `git refs migrate`:
 	The ref storage format to migrate the ref store to. Can be one of:
 +
 include::ref-storage-format.adoc[]
++
+A destination in the `helper` format names its helper, as in
+`helper://<name>` or by its name alone. No other destination takes a
+payload: references kept in an alternate directory stay there when
+migrating between the formats that store them as files.
 
 `--ref-format=<format>`::
 Deprecated alias of `--ref-storage-format=<format>`.

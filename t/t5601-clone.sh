@@ -172,12 +172,11 @@ test_expect_success 'clone with files ref format' '
 	test_cmp expect actual
 '
 
-test_expect_success 'clone with garbage ref format' '
-	cat >expect <<-EOF &&
-	fatal: unknown ref storage format ${SQ}garbage${SQ}
-	EOF
+test_expect_success 'clone with an unknown ref format selects a ref helper' '
+	# An unknown name selects the git-local-<name> ref helper, so the clone
+	# fails once that helper cannot be started, and cleans up after itself.
 	test_must_fail git clone --ref-storage-format=garbage --mirror src ref-storage 2>err &&
-	test_cmp expect err &&
+	test_grep "unable to start helper ${SQ}garbage${SQ}" err &&
 	test_path_is_missing ref-storage
 '
 

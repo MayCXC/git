@@ -49,6 +49,8 @@ static void populate_object_info(struct odb_source_inmemory *source,
 		*(oi->disk_sizep) = 0;
 	if (oi->delta_base_oid)
 		oidclr(oi->delta_base_oid, source->base.odb->repo->hash_algo);
+	if (oi->delta_sizep)
+		*oi->delta_sizep = 0;
 	if (oi->contentp)
 		*oi->contentp = xmemdupz(object->buf, object->size);
 	if (oi->mtimep)

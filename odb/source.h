@@ -5,6 +5,7 @@
 #include "object.h"
 #include "odb.h"
 #include "odb/transaction.h"
+#include "strbuf.h"
 
 enum odb_source_type {
 	/*
@@ -24,6 +25,9 @@ enum odb_source_type {
 
 	/* The "in-memory" backend that stores objects in memory. */
 	ODB_SOURCE_INMEMORY,
+
+	/* The "helper" backend that stores objects in a helper program. */
+	ODB_SOURCE_HELPER,
 };
 
 /*
@@ -33,8 +37,8 @@ enum odb_source_type {
 const char *odb_source_type_to_name(enum odb_source_type type);
 
 struct object_id;
+struct odb_pack_bitmap;
 struct odb_stream;
-struct strbuf;
 struct strvec;
 
 struct odb_create_on_disk_options {
@@ -168,6 +172,24 @@ struct odb_source {
 	int (*read_object_stream)(struct odb_stream **out,
 				  struct odb_source *source,
 				  const struct object_id *oid);
+
+	/*
+	 * This callback is expected to read the object identified by the
+	 * given ID as the source stores it, the way a packfile entry keeps an
+	 * object: its compressed contents, or a compressed delta against
+	 * another object. This lets the object be handed on as it is stored,
+	 * without inflating and compressing it again.
+	 *
+	 * This callback is optional. Sources whose objects git-pack-objects(1)
+	 * reads from their packfiles itself shall leave it unset.
+	 *
+	 * The callback is expected to return 0 on success, in which case the
+	 * caller frees `entry->data`, a positive value in case the source does
+	 * not store the object, and a negative error code otherwise.
+	 */
+	int (*read_object_raw)(struct odb_source *source,
+			       const struct object_id *oid,
+			       struct packed_raw_entry *entry);
 
 	/*
 	 * This callback is expected to iterate over all objects stored in this
@@ -333,16 +355,89 @@ struct odb_source {
 	 */
 	int (*fsck)(struct odb_source *source,
 		    struct odb_fsck_options *options);
+
+	/*
+	 * This callback is expected to remove the objects of the source that
+	 * are unreachable and were last written before the expiry of the
+	 * options, as git-prune(1) removes loose objects.
+	 *
+	 * This callback is optional. Sources that keep their objects as loose
+	 * objects and packfiles, which git-prune(1) and git-repack(1) remove,
+	 * shall leave it unset.
+	 *
+	 * The callback is expected to return 0 on success, a negative error
+	 * code otherwise.
+	 */
+	int (*prune)(struct odb_source *source,
+		     const struct odb_prune_options *opts);
+
+	/*
+	 * This callback is expected to read the reachability bitmap the source
+	 * stores for its objects, as git-pack-objects(1) wrote it for a pack
+	 * holding them, along with the index and the reverse index of that
+	 * pack, which relate the bits to the objects, and the size the pack
+	 * had.
+	 *
+	 * This callback is optional. Sources that keep their bitmaps beside
+	 * their packs shall leave it unset.
+	 *
+	 * The callback is expected to return 0 when it read a bitmap, a
+	 * positive value when the source stores none, and a negative error code
+	 * otherwise.
+	 */
+	int (*read_pack_bitmap)(struct odb_source *source,
+				struct odb_pack_bitmap *out);
 };
+
+/*
+ * The reachability bitmap of a pack, which a source keeping its objects
+ * elsewhere than in that pack may store for them. The buffers hold what the
+ * '.bitmap', '.idx' and '.rev' files of the pack held; the reverse index is
+ * empty when the pack had none.
+ */
+struct odb_pack_bitmap {
+	struct strbuf bitmap;
+	struct strbuf index;
+	struct strbuf rev_index;
+	off_t pack_size;
+};
+
+#define ODB_PACK_BITMAP_INIT { \
+	.bitmap = STRBUF_INIT, \
+	.index = STRBUF_INIT, \
+	.rev_index = STRBUF_INIT, \
+}
+
+static inline void odb_pack_bitmap_release(struct odb_pack_bitmap *bitmap)
+{
+	strbuf_release(&bitmap->bitmap);
+	strbuf_release(&bitmap->index);
+	strbuf_release(&bitmap->rev_index);
+}
 
 /*
  * Allocate and initialize a new source for the given object database located
  * at `path`. `local` indicates whether or not the source is the local and thus
  * primary object source of the object database.
+ *
+ * The objects directory of the repository is opened with the object storage
+ * the repository is configured with, be it the primary source or not, as when
+ * a child process writes into a quarantine. Any other directory, like that of
+ * an alternate, is opened with the files backend.
  */
 struct odb_source *odb_source_new(struct object_database *odb,
 				  const char *path,
 				  bool local);
+
+/*
+ * Parse the URI of an object storage, "<format>[://<payload>]": "files" for the
+ * files backend, which is the default, or "helper://<name>" for the objects
+ * that the git-local-<name> helper keeps, which a bare name spelled like a URL
+ * scheme also stands for. On success, set `canonical` to the URI in its
+ * canonical form, or to a NULL pointer for the files backend, and return 0.
+ * Return -1 in case the URI names no object storage.
+ */
+int odb_object_storage_parse(const char *uri, char **canonical);
 
 /*
  * Initialize the source for the given object database located at `path`.
@@ -431,6 +526,21 @@ static inline int odb_source_read_object_stream(struct odb_stream **out,
 						const struct object_id *oid)
 {
 	return source->read_object_stream(out, source, oid);
+}
+
+/*
+ * Read the given object as the source stores it, the way a packfile entry
+ * keeps an object. Returns 0 on success, in which case the caller frees
+ * `entry->data`, a positive value in case the source does not store the
+ * object this way, and a negative error code otherwise.
+ */
+static inline int odb_source_read_object_raw(struct odb_source *source,
+					     const struct object_id *oid,
+					     struct packed_raw_entry *entry)
+{
+	if (!source->read_object_raw)
+		return 1;
+	return source->read_object_raw(source, oid, entry);
 }
 
 /*
@@ -602,6 +712,31 @@ static inline int odb_source_fsck(struct odb_source *source,
 				  struct odb_fsck_options *opts)
 {
 	return source->fsck(source, opts);
+}
+
+/*
+ * Prune the unreachable objects of the source that git-prune(1) does not
+ * remove itself. Returns 0 on success, a negative error code otherwise.
+ */
+static inline int odb_source_prune(struct odb_source *source,
+				   const struct odb_prune_options *opts)
+{
+	if (!source->prune)
+		return 0;
+	return source->prune(source, opts);
+}
+
+/*
+ * Read the reachability bitmap the source stores for its objects. Returns 0
+ * when it read one, a positive value when the source stores none, and a
+ * negative error code otherwise.
+ */
+static inline int odb_source_read_pack_bitmap(struct odb_source *source,
+					      struct odb_pack_bitmap *out)
+{
+	if (!source->read_pack_bitmap)
+		return 1;
+	return source->read_pack_bitmap(source, out);
 }
 
 #endif

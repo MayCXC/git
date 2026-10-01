@@ -21,6 +21,14 @@ const char *ref_storage_format_to_name(enum ref_storage_format ref_storage_forma
 enum ref_storage_format ref_storage_format_by_uri(const char *uri,
 						  char **payload);
 
+/*
+ * The alternate directory the repository stores its references in, as its
+ * reference storage payload names it, relative to the common directory
+ * unless absolute. NULL when the references are in the common directory
+ * itself, or when the payload means something else to the backend.
+ */
+const char *repo_alternate_refdir(struct repository *repo);
+
 enum ref_transaction_error {
 	/* Default error code */
 	REF_TRANSACTION_ERROR_GENERIC = -1,
@@ -1337,10 +1345,14 @@ int is_pseudo_ref(const char *refname);
 
 /*
  * Migrate the ref storage format used by the repository to the
- * specified one.
+ * specified one. The payload is the one of the new format's reference
+ * storage URI, like the name of a helper; a format that keeps references
+ * as files in a directory takes none, and keeps the alternate directory
+ * the repository uses, if any.
  */
 int repo_migrate_ref_storage_format(struct repository *repo,
 				    enum ref_storage_format format,
+				    const char *payload,
 				    unsigned int flags,
 				    struct strbuf *err);
 

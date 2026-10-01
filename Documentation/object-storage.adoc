@@ -1,0 +1,5 @@
+`files`;; for loose objects and packfiles in the objects directory.
+	This is the default.
+`helper://<name>`;; for objects stored by the `git-local-<name>` helper
+	program (see linkgit:gitlocal-helpers[7]). A _<name>_ alone, spelled
+	like a URL scheme, is short for `helper://<name>`.

@@ -352,6 +352,16 @@ static void index_commit_for_bitmap(struct commit *commit)
 	indexed_commits[indexed_commits_nr++] = commit;
 }
 
+/*
+ * Whether check_object() took the delta of the entry from the source storing
+ * the object outside of any packfile, which it records as it records the
+ * delta type of an object in a packfile.
+ */
+static int delta_from_source(const struct object_entry *entry)
+{
+	return !IN_PACK(entry) && entry->in_pack_type == OBJ_REF_DELTA;
+}
+
 static void *get_delta(struct object_entry *entry)
 {
 	unsigned long size, base_size;
@@ -377,10 +387,14 @@ static void *get_delta(struct object_entry *entry)
 	/*
 	 * We successfully computed this delta once but dropped it for
 	 * memory reasons. Something is very wrong if this time we
-	 * recompute and create a different delta.
+	 * recompute and create a different delta. A delta taken from the
+	 * source storing the object was never computed here, and computing
+	 * it need not give the delta the source stores.
 	 */
-	if (!delta_buf || delta_size != DELTA_SIZE(entry))
+	if (!delta_buf ||
+	    (delta_size != DELTA_SIZE(entry) && !delta_from_source(entry)))
 		BUG("delta size changed");
+	SET_DELTA_SIZE(entry, delta_size);
 	free(buf);
 	free(base_buf);
 	return delta_buf;
@@ -512,6 +526,25 @@ static inline int oe_size_greater_than(struct packing_data *pack,
 	return oe_get_size_slow(pack, lhs) > rhs;
 }
 
+/*
+ * Read the object of `entry` as the source storing it outside of any
+ * packfile keeps it, provided it keeps it as the pack is to have it: whole
+ * when `base` is NULL, and as a delta against `base` otherwise. Returns 0
+ * then, in which case the caller frees `raw->data`, and -1 otherwise.
+ */
+static int read_stored_object(const struct object_entry *entry,
+			      const struct object_id *base,
+			      struct packed_raw_entry *raw)
+{
+	if (IN_PACK(entry) ||
+	    odb_read_object_raw(the_repository->objects, &entry->idx.oid, raw))
+		return -1;
+	if (base ? oideq(&raw->delta_base, base) : is_null_oid(&raw->delta_base))
+		return 0;
+	FREE_AND_NULL(raw->data);
+	return -1;
+}
+
 /* Return 0 if we will bust the pack-size limit */
 static unsigned long write_no_reuse_object(struct hashfile *f, struct object_entry *entry,
 					   unsigned long limit, int usable_delta)
@@ -523,6 +556,8 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 	enum object_type type;
 	void *buf;
 	struct odb_stream *st = NULL;
+	struct packed_raw_entry stored;
+	int compressed = 0;
 	const unsigned hashsz = the_hash_algo->rawsz;
 
 	if (!usable_delta) {
@@ -534,6 +569,12 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 			buf = NULL;
 			type = st->type;
 			size = st->size;
+		} else if (reuse_object &&
+			   !read_stored_object(entry, NULL, &stored)) {
+			buf = stored.data;
+			type = stored.type;
+			size = cast_size_t_to_ulong(stored.size);
+			compressed = 1;
 		} else {
 			size_t size_st = 0;
 			buf = odb_read_object(the_repository->objects,
@@ -556,6 +597,13 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 		entry->delta_data = NULL;
 		type = (allow_ofs_delta && DELTA(entry)->idx.offset) ?
 			OBJ_OFS_DELTA : OBJ_REF_DELTA;
+	} else if (reuse_delta &&
+		   !read_stored_object(entry, &DELTA(entry)->idx.oid, &stored)) {
+		buf = stored.data;
+		size = cast_size_t_to_ulong(stored.size);
+		compressed = 1;
+		type = (allow_ofs_delta && DELTA(entry)->idx.offset) ?
+			OBJ_OFS_DELTA : OBJ_REF_DELTA;
 	} else {
 		buf = get_delta(entry);
 		size = DELTA_SIZE(entry);
@@ -565,6 +613,8 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 
 	if (st)	/* large blob case, just assume we don't compress well */
 		datalen = size;
+	else if (compressed)
+		datalen = cast_size_t_to_ulong(stored.data_len);
 	else if (entry->z_delta_size)
 		datalen = entry->z_delta_size;
 	else
@@ -1562,6 +1612,20 @@ static int have_duplicate_entry(const struct object_id *oid,
 	return 1;
 }
 
+/*
+ * Whether the source holds the object other than in one of its packfiles: as a
+ * loose object of its files store, or in a store of any other kind.
+ */
+static int has_object_outside_packs(struct odb_source *source,
+				    const struct object_id *oid)
+{
+	struct odb_source *outside_packs = source;
+
+	if (source->type == ODB_SOURCE_FILES)
+		outside_packs = &odb_source_files_downcast(source)->loose->base;
+	return !odb_source_read_object_info(outside_packs, oid, NULL, 0, NULL);
+}
+
 static int want_cruft_object_mtime(struct repository *r,
 				   const struct object_id *oid,
 				   unsigned flags, uint32_t mtime)
@@ -1569,8 +1633,12 @@ static int want_cruft_object_mtime(struct repository *r,
 	struct odb_source *source;
 
 	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packed_git **cache = packfile_store_get_kept_pack_cache(files->packed, flags);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		struct packed_git **cache;
+
+		if (!files)
+			continue;
+		cache = packfile_store_get_kept_pack_cache(files->packed, flags);
 
 		for (; *cache; cache++) {
 			struct packed_git *p = *cache;
@@ -1763,11 +1831,9 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 		 * skip the local object source.
 		 */
 		struct odb_source *source = the_repository->objects->sources->next;
-		for (; source; source = source->next) {
-			struct odb_source_files *files = odb_source_files_downcast(source);
-			if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0, NULL))
+		for (; source; source = source->next)
+			if (has_object_outside_packs(source, oid))
 				return 0;
-		}
 	}
 
 	/*
@@ -1786,10 +1852,13 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct multi_pack_index *m = get_multi_pack_index(files->packed);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
+		struct multi_pack_index *m;
 		struct pack_entry e;
 
+		if (!files)
+			continue;
+		m = get_multi_pack_index(files->packed);
 		if (m && midx_fill_entry(m, oid, &e, NULL) == MIDX_FILL_HIT) {
 			want = want_object_in_pack_one(e.p, oid, exclude, found_pack, found_offset, found_mtime);
 			if (want != -1)
@@ -1798,8 +1867,10 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
+		if (!files)
+			continue;
 		for (e = files->packed->packs.head; e; e = e->next) {
 			struct packed_git *p = e->pack;
 			want = want_object_in_pack_one(p, oid, exclude, found_pack, found_offset, found_mtime);
@@ -2256,6 +2327,8 @@ static void check_object(struct object_entry *entry, uint32_t object_index)
 	size_t canonical_size;
 	enum object_type type;
 	struct object_info oi = {.typep = &type, .sizep = &canonical_size};
+	struct object_id delta_base;
+	size_t delta_size = 0;
 
 	if (IN_PACK(entry)) {
 		struct packed_git *p = IN_PACK(entry);
@@ -2390,6 +2463,16 @@ static void check_object(struct object_entry *entry, uint32_t object_index)
 		unuse_pack(&w_curs);
 	}
 
+	/*
+	 * An object outside of any packfile may still be stored as a delta,
+	 * by a source keeping its objects the way packfiles do; find out to
+	 * reuse the delta as one stored in a packfile.
+	 */
+	if (!IN_PACK(entry) && reuse_delta && !entry->preferred_base) {
+		oi.delta_base_oid = &delta_base;
+		oi.delta_sizep = &delta_size;
+	}
+
 	if (odb_read_object_info_extended(the_repository->objects, &entry->idx.oid, &oi,
 					  OBJECT_INFO_SKIP_FETCH_OBJECT | OBJECT_INFO_LOOKUP_REPLACE) < 0) {
 		if (repo_has_promisor_remote(the_repository)) {
@@ -2403,7 +2486,21 @@ static void check_object(struct object_entry *entry, uint32_t object_index)
 	}
 	oe_set_type(entry, type);
 	if (entry->type_valid) {
+		struct object_entry *base_entry;
+
 		SET_SIZE(entry, canonical_size);
+		if (delta_size &&
+		    can_reuse_delta(&delta_base, entry, &base_entry)) {
+			entry->in_pack_type = OBJ_REF_DELTA;
+			SET_DELTA_SIZE(entry, delta_size);
+			if (base_entry) {
+				SET_DELTA(entry, base_entry);
+				entry->delta_sibling_idx = base_entry->delta_child_idx;
+				SET_DELTA_CHILD(base_entry, entry);
+			} else {
+				SET_DELTA_EXT(entry, &delta_base);
+			}
+		}
 	} else {
 		/*
 		 * Bad object type is checked in prepare_pack().  This is
@@ -2463,6 +2560,12 @@ static void drop_reused_delta(struct object_entry *entry)
 	}
 	SET_DELTA(entry, NULL);
 	entry->depth = 0;
+
+	/* check_object() kept the type and size of the object itself. */
+	if (delta_from_source(entry)) {
+		entry->in_pack_type = OBJ_NONE;
+		return;
+	}
 
 	oi.sizep = &size;
 	oi.typep = &type;
@@ -4173,11 +4276,9 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 			struct odb_source *source = the_repository->objects->sources;
 			int found = 0;
 
-			for (; !found && source; source = source->next) {
-				struct odb_source_files *files = odb_source_files_downcast(source);
-				if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0, NULL))
+			for (; !found && source; source = source->next)
+				if (has_object_outside_packs(source, oid))
 					found = 1;
-			}
 
 			/*
 			 * If a traversed tree has a missing blob then we want
@@ -4527,9 +4628,9 @@ static void add_objects_in_unpacked_packs(void)
 	};
 
 	for (source = to_pack.repo->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+		struct odb_source_files *files = odb_source_files_store_gently(source);
 
-		if (!source->local)
+		if (!files || !source->local)
 			continue;
 
 		if (odb_source_for_each_object(&files->packed->base, &oi,
@@ -4631,7 +4732,7 @@ static int force_object_loose(struct odb_source *source,
 			      const struct object_id *oid,
 			      const time_t *mtime)
 {
-	struct odb_source_files *files = odb_source_files_downcast(source);
+	struct odb_source_files *files = odb_source_files_store(source);
 	const struct git_hash_algo *compat = source->odb->repo->compat_hash_algo;
 	struct object_info oi = OBJECT_INFO_INIT;
 	struct object_id compat_oid, *compat_oid_p = NULL;
@@ -4640,11 +4741,9 @@ static int force_object_loose(struct odb_source *source,
 	size_t len;
 	int ret;
 
-	for (struct odb_source *s = source->odb->sources; s; s = s->next) {
-		struct odb_source_files *files = odb_source_files_downcast(s);
-		if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0, NULL))
+	for (struct odb_source *s = source->odb->sources; s; s = s->next)
+		if (has_object_outside_packs(s, oid))
 			return 0;
-	}
 
 	oi.typep = &type;
 	oi.sizep = &len;

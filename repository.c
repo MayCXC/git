@@ -4,6 +4,7 @@
 #include "hook.h"
 #include "odb.h"
 #include "odb/source.h"
+#include "helper.h"
 #include "config.h"
 #include "gettext.h"
 #include "object.h"
@@ -217,6 +218,12 @@ void repo_set_ref_storage_format(struct repository *repo,
 	repo->ref_storage_payload = xstrdup_or_null(payload);
 }
 
+void repo_set_object_storage(struct repository *repo, const char *uri)
+{
+	free(repo->object_storage);
+	repo->object_storage = xstrdup_or_null(uri);
+}
+
 /*
  * Attempt to resolve and set the provided 'gitdir' for repository 'repo'.
  * Return 0 upon success and a non-zero value upon failure.
@@ -384,6 +391,7 @@ void repo_clear(struct repository *repo)
 	free(repo->ref_storage_payload);
 
 	odb_free(repo->objects);
+	free(repo->object_storage);
 
 	if (repo->parsed_objects)
 		parsed_object_pool_clear(repo->parsed_objects);
@@ -434,6 +442,15 @@ void repo_clear(struct repository *repo)
 	strmap_for_each_entry(&repo->worktree_ref_stores, &iter, e)
 		ref_store_release(e->value);
 	strmap_clear(&repo->worktree_ref_stores, 1);
+
+	/*
+	 * The ref stores borrow repo->ref_local_helper, so release it only
+	 * once they have been torn down above.
+	 */
+	if (repo->ref_local_helper) {
+		helper_process_release(repo->ref_local_helper);
+		free(repo->ref_local_helper);
+	}
 
 	repo_clear_path_cache(&repo->cached_paths);
 

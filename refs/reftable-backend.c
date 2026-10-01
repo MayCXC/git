@@ -2860,6 +2860,7 @@ out:
 
 struct ref_storage_be refs_be_reftable = {
 	.name = "reftable",
+	.uses_refdir = true,
 	.init = reftable_be_init,
 	.release = reftable_be_release,
 	.create_on_disk = reftable_be_create_on_disk,

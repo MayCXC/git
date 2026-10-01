@@ -190,6 +190,7 @@ struct repository_format {
 	int compat_hash_algo;
 	enum ref_storage_format ref_storage_format;
 	char *ref_storage_payload;
+	char *object_storage; /* canonical extensions.objectstorage, or NULL */
 	int sparse_index;
 	char *work_tree;
 	struct string_list unknown_extensions;
@@ -220,6 +221,13 @@ struct repository_format {
  * REPOSITORY_FORMAT_INIT before calling this function.
  */
 int read_repository_format(struct repository_format *format, const char *path);
+
+/*
+ * Return the object storage the repository at `gitdir` uses, as its
+ * extensions.objectStorage names it, or a NULL pointer for the files
+ * backend. The caller frees the result.
+ */
+char *read_object_storage(const char *gitdir);
 
 /*
  * Free the memory held onto by `format`, but not the struct itself.
@@ -274,6 +282,7 @@ void create_repository(struct repository *repo,
 		       const char *template_dir,
 		       int hash_algo,
 		       const char *ref_storage_format_uri,
+		       const char *object_storage_uri,
 		       int init_shared_repository,
 		       int *reinit_ok);
 

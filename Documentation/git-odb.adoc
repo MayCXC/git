@@ -1,0 +1,49 @@
+git-odb(1)
+==========
+
+NAME
+----
+git-odb - Low-level access to the object database
+
+
+SYNOPSIS
+--------
+[synopsis]
+git odb migrate --object-storage=<storage>
+
+DESCRIPTION
+-----------
+
+This command provides low-level access to the object database.
+
+COMMANDS
+--------
+
+`migrate`::
+	Move the objects of the repository into another object storage, and
+	have the repository use it. A packfile kept by a `.keep` file stays
+	in the objects directory when the objects move into a helper, which
+	leaves those as it does the objects directory of any repository whose
+	objects are stored in a helper (see `extensions.objectStorage` in
+	linkgit:git-config[1]).
+
+OPTIONS
+-------
+
+The following options are specific to `git odb migrate`:
+
+`--object-storage=<storage>`::
+	The object storage to migrate to. The valid values are:
++
+include::object-storage.adoc[]
+
+KNOWN LIMITATIONS
+-----------------
+
+The migration does not lock the object database. Objects that another
+process writes into a helper while the objects move out of it are left
+behind in that helper.
+
+GIT
+---
+Part of the linkgit:git[1] suite
