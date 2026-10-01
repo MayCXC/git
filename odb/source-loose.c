@@ -26,6 +26,26 @@ static int append_loose_object(const struct object_id *oid,
 	return 0;
 }
 
+/*
+ * Record an object this source has just written, so that it is visible to the
+ * quick existence check, which answers from the cache alone. Subdirectories
+ * that have not been scanned yet pick the object up when they are, so only a
+ * live one needs updating.
+ */
+static void odb_source_loose_cache_add(struct odb_source_loose *loose,
+				       const struct object_id *oid)
+{
+	int subdir_nr = oid->hash[0];
+	size_t word_bits = bitsizeof(loose->subdir_seen[0]);
+	size_t word_index = subdir_nr / word_bits;
+	size_t mask = (size_t)1u << (subdir_nr % word_bits);
+
+	if (!loose->cache || !(loose->subdir_seen[word_index] & mask))
+		return;
+
+	oidtree_insert(loose->cache, oid, NULL);
+}
+
 static struct oidtree *odb_source_loose_cache(struct odb_source_loose *loose,
 					      const struct object_id *oid)
 {
@@ -224,13 +244,13 @@ static enum odb_read_status odb_source_loose_read_object_info(struct odb_source 
 	static struct strbuf buf = STRBUF_INIT;
 
 	/*
-	 * The second read shouldn't cause new loose objects to show up, unless
-	 * there was a race condition with a secondary process. We don't care
-	 * about this case though, so we simply skip reading loose objects a
-	 * second time.
+	 * In case the first read didn't surface the object, we have to drop
+	 * what we know about the object directory. This may cause us to
+	 * discover objects that have been written since the last time we have
+	 * prepared the loose object store.
 	 */
 	if (flags & OBJECT_INFO_SECOND_READ)
-		return ODB_READ_NOT_FOUND;
+		odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
 
 	odb_loose_path(loose, &buf, oid);
 	return read_object_info_from_path(loose, buf.buf, oid, oi, flags, errmsg);
@@ -846,6 +866,8 @@ static int odb_source_loose_write_object(struct odb_source *source,
 
 	if (write_loose_object(loose, oid, hdr, hdrlen, buf, len, mtime, flags))
 		return -1;
+
+	odb_source_loose_cache_add(loose, oid);
 
 	if (compat_oid)
 		return repo_add_loose_object_map(loose, oid, compat_oid);
