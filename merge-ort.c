@@ -4571,8 +4571,14 @@ static int process_entries(struct merge_options *opt,
 				ret = -1;
 				goto cleanup;
 			};
-			if (!ci->merged.clean && opt->mergeability_only &&
-			    !opt->priv->call_depth) {
+			/*
+			 * Stop at the first conflict process_entry() recorded.
+			 * A directory leaves it with merged.clean unset, as its
+			 * contents are merged as entries of their own, so that
+			 * flag says nothing about whether the merge conflicts.
+			 */
+			if (opt->mergeability_only && !opt->priv->call_depth &&
+			    !strmap_empty(&opt->priv->conflicted)) {
 				ret = 0;
 				goto cleanup;
 			}

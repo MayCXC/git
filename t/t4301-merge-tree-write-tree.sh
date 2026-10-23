@@ -110,6 +110,40 @@ test_expect_success  '--quiet on conflicted merge' '
 	test_cmp expect actual
 '
 
+test_expect_success '--quiet on conflict after a directory changed on both sides' '
+	git init quiet-dir &&
+	(
+		cd quiet-dir &&
+		mkdir subdir &&
+		echo base >greeting &&
+		echo a >subdir/a &&
+		git add greeting subdir/a &&
+		test_tick &&
+		git commit -m base &&
+		git branch side1 &&
+		git branch side2 &&
+
+		# Both sides change subdir without conflicting there, and
+		# greeting, which conflicts, is merged after subdir
+		git checkout side1 &&
+		echo side1 >greeting &&
+		echo a2 >>subdir/a &&
+		test_tick &&
+		git commit -a -m side1 &&
+
+		git checkout side2 &&
+		echo side2 >greeting &&
+		echo b >subdir/b &&
+		git add greeting subdir/b &&
+		test_tick &&
+		git commit -m side2 &&
+
+		test_expect_code 1 git merge-tree --write-tree side1 side2 >output &&
+		test_expect_code 1 git merge-tree --write-tree --quiet side1 side2 >output &&
+		test_must_be_empty output
+	)
+'
+
 test_expect_success 'Content merge and a few conflicts' '
 	git checkout side1^0 &&
 	test_must_fail git merge side2 &&
