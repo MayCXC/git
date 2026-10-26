@@ -940,6 +940,24 @@ test_expect_success 'reflog-expire task --auto only packs when exceeding limits'
 	test_subcommand git reflog expire --all <reflog-expire-auto.txt
 '
 
+test_expect_success 'reflog-expire task --auto skips reachable entries' '
+	test_when_finished "rm -rf reflog-reachable" &&
+	git init reflog-reachable &&
+	(
+		cd reflog-reachable &&
+		git config set gc.reflogExpire 90.days &&
+		git config set gc.reflogExpireUnreachable 30.days &&
+		timestamp=$(test-tool date timestamp "40.days.ago") &&
+		timestamp=${timestamp#* -> } &&
+		test_commit --no-tag --date "$timestamp +0000" one &&
+		test_commit --no-tag --date "$timestamp +0000" two &&
+		git reflog expire --all --dry-run --verbose >expire &&
+		test_grep ! "would prune" expire &&
+		! git -c maintenance.reflog-expire.auto=1 \
+			maintenance is-needed --auto --task=reflog-expire
+	)
+'
+
 test_expect_worktree_prune () {
 	negate=
 	if test "$1" = "!"
