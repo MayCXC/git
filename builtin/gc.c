@@ -298,6 +298,25 @@ static int count_reflog_entries(const char *refname UNUSED,
 	return data->count >= data->limit;
 }
 
+/*
+ * Count the entries old enough to be expired. With neither "stalefix"
+ * nor "recno" set, should_expire_reflog_ent() expires no entry younger
+ * than both "expire_total" and "expire_unreachable".
+ */
+static int count_old_reflog_entries(const char *refname UNUSED,
+				    struct object_id *old_oid UNUSED,
+				    struct object_id *new_oid UNUSED,
+				    const char *committer UNUSED,
+				    timestamp_t timestamp, int tz UNUSED,
+				    const char *msg UNUSED, void *cb_data)
+{
+	struct count_reflog_entries_data *data = cb_data;
+	if (timestamp < data->policy.opts.expire_total ||
+	    timestamp < data->policy.opts.expire_unreachable)
+		data->count++;
+	return data->count >= data->limit;
+}
+
 static int reflog_expire_condition(struct gc_config *cfg UNUSED)
 {
 	timestamp_t now = time(NULL);
@@ -306,6 +325,8 @@ static int reflog_expire_condition(struct gc_config *cfg UNUSED)
 			.opts = REFLOG_EXPIRE_OPTIONS_INIT(now),
 		},
 	};
+	struct ref_store *refs = get_main_ref_store(the_repository);
+	struct object_id oid;
 	int limit = 100;
 
 	repo_config_get_int(the_repository, "maintenance.reflog-expire.auto", &limit);
@@ -318,10 +339,27 @@ static int reflog_expire_condition(struct gc_config *cfg UNUSED)
 	repo_config(the_repository, reflog_expire_config, &data.policy.opts);
 
 	reflog_expire_options_set_refname(&data.policy.opts, "HEAD");
-	refs_for_each_reflog_ent(get_main_ref_store(the_repository), "HEAD",
-				 count_reflog_entries, &data);
 
-	reflog_expiry_cleanup(&data.policy);
+	/*
+	 * Whether an entry younger than "expire_total" expires depends on
+	 * whether its commits are still reachable, and finding that out
+	 * walks the history, as "git reflog expire" does before it asks
+	 * should_expire_reflog_ent(). Counting the entries old enough to be
+	 * expired needs no walk, so walk only once there are enough of them.
+	 */
+	refs_for_each_reflog_ent(refs, "HEAD", count_old_reflog_entries, &data);
+	if (data.count >= data.limit) {
+		data.count = 0;
+
+		if (!refs_resolve_ref_unsafe(refs, "HEAD", RESOLVE_REF_READING,
+					     &oid, NULL))
+			oidclr(&oid, the_repository->hash_algo);
+		reflog_expiry_prepare("HEAD", &oid, &data.policy);
+		refs_for_each_reflog_ent(refs, "HEAD", count_reflog_entries,
+					 &data);
+		reflog_expiry_cleanup(&data.policy);
+	}
+
 	reflog_clear_expire_config(&data.policy.opts);
 	return data.count >= data.limit;
 }
